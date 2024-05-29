@@ -73,6 +73,7 @@ class LayerStacks(nn.Module):
     self.output.weight = nn.Parameter(output_weight)
     self.output.bias = nn.Parameter(output_bias)
 
+  @torch.compile
   def forward(self, x, ls_indices):
     # Precompute and cache the offset for gathers
     if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
@@ -262,6 +263,7 @@ class NNUE(pl.LightningModule):
     else:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
+  @torch.compile
   def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices):
     wp, bp = self.input(white_indices, white_values, black_indices, black_values)
     w, wpsqt = torch.split(wp, L1, dim=1)
@@ -285,6 +287,7 @@ class NNUE(pl.LightningModule):
 
     return x
 
+  @torch.compile
   def step_(self, batch, batch_idx, loss_type):
     # We clip weights at the start of each step. This means that after
     # the last step the weights might be outside of the desired range.
