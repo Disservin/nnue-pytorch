@@ -6,8 +6,11 @@ import pytorch_lightning as pl
 import copy
 from feature_transformer import DoubleFeatureTransformerSlice
 
+
+torch.set_float32_matmul_precision("high")
+
 # 3 layer fully connected network
-L1 = 3072
+L1 = 128
 L2 = 15
 L3 = 32
 
@@ -73,6 +76,7 @@ class LayerStacks(nn.Module):
     self.output.weight = nn.Parameter(output_weight)
     self.output.bias = nn.Parameter(output_bias)
 
+  @torch.compile
   def forward(self, x, ls_indices):
     # Precompute and cache the offset for gathers
     if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
@@ -198,6 +202,7 @@ class NNUE(pl.LightningModule):
   Clips the weights of the model based on the min/max values allowed
   by the quantization scheme.
   '''
+  @torch.compile
   def _clip_weights(self):
     for group in self.weight_clipping:
       for p in group['params']:
@@ -262,8 +267,8 @@ class NNUE(pl.LightningModule):
     else:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices):
-    wp, bp = self.input(white_indices, white_values, black_indices, black_values)
+  @torch.compile
+  def _forward_inner(self, us, them, wp, bp, psqt_indices, layer_stack_indices):
     w, wpsqt = torch.split(wp, L1, dim=1)
     b, bpsqt = torch.split(bp, L1, dim=1)
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
@@ -285,13 +290,22 @@ class NNUE(pl.LightningModule):
 
     return x
 
+  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices):
+    wp, bp = self.input(white_indices, white_values, black_indices, black_values)
+    return self._forward_inner(us, them, wp, bp, psqt_indices, layer_stack_indices)
+
   def step_(self, batch, batch_idx, loss_type):
     # We clip weights at the start of each step. This means that after
     # the last step the weights might be outside of the desired range.
     # They should be also clipped accordingly in the serializer.
     self._clip_weights()
-
     us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices = batch
+    scorenet = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * self.nnue2score
+    loss = self.calc_loss(scorenet, outcome, score)
+    self.log(loss_type, loss)
+    return loss
+
+  def calc_loss(self, scorenet, outcome, score):
 
     # convert the network and search scores to an estimate match result
     # based on the win_rate_model, with scalings and offsets optimized
@@ -299,7 +313,6 @@ class NNUE(pl.LightningModule):
     out_scaling = 380
     offset = 270
 
-    scorenet = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * self.nnue2score
     q  = ( scorenet - offset) / in_scaling  # used to compute the chance of a win
     qm = (-scorenet - offset) / in_scaling  # used to compute the chance of a loss
     qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())  # estimated match result (using win, loss and draw probs).
@@ -313,8 +326,6 @@ class NNUE(pl.LightningModule):
     pt = pf * actual_lambda + t * (1.0 - actual_lambda)
 
     loss = torch.pow(torch.abs(pt - qf), 2.5).mean()
-
-    self.log(loss_type, loss)
 
     return loss
 

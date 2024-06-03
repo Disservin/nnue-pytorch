@@ -886,6 +886,9 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
             if (wld_filtered && do_wld_skip())
                 return true;
 
+            if (e.pos.simple_eval() < 950)
+                return true;
+
             constexpr bool do_debug_print = false;
             if (do_debug_print) {
                 if (uint64_t(piece_count_history_all_total) % 10000 == 0) {
@@ -1079,12 +1082,14 @@ extern "C" {
 
 }
 
-/* benches */ /*
+
+/* benches */ 
 #include <chrono>
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKP", 4, { "10m_d3_q_2.binpack" }, 8192, true, false, 0, false, -1, 0);
+    auto filename = "/media/max/DEV/stockfish-data/test60-julaugsep2020-2tb7p.min.binpack";
+    auto stream = create_sparse_batch_stream("HalfKP", 4, 1, &filename, 8192, true, false, 0, false, -1, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i)
     {
@@ -1093,5 +1098,6 @@ int main()
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     std::cout << (t1 - t0).count() / 1e9 << "s\n";
+
+    // std::cout << chess::nthSetBitIndex(16,0) << std::endl;
 }
-//*/
