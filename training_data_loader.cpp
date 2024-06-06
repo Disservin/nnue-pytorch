@@ -1084,20 +1084,20 @@ extern "C" {
 
 
 /* benches */ 
-#include <chrono>
+// #include <chrono>
 
-int main()
-{
-    auto filename = "/media/max/DEV/stockfish-data/test60-julaugsep2020-2tb7p.min.binpack";
-    auto stream = create_sparse_batch_stream("HalfKP", 4, 1, &filename, 8192, true, false, 0, false, -1, 0);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 1000; ++i)
-    {
-        if (i % 100 == 0) std::cout << i << '\n';
-        destroy_sparse_batch(stream->next());
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    std::cout << (t1 - t0).count() / 1e9 << "s\n";
+// int main()
+// {
+//     auto filename = "/media/max/DEV/stockfish-data/test60-julaugsep2020-2tb7p.min.binpack";
+//     auto stream = create_sparse_batch_stream("HalfKP", 4, 1, &filename, 8192, true, false, 0, false, -1, 0);
+//     auto t0 = std::chrono::high_resolution_clock::now();
+//     for (int i = 0; i < 1000; ++i)
+//     {
+//         if (i % 100 == 0) std::cout << i << '\n';
+//         destroy_sparse_batch(stream->next());
+//     }
+//     auto t1 = std::chrono::high_resolution_clock::now();
+//     std::cout << (t1 - t0).count() / 1e9 << "s\n";
 
-    // std::cout << chess::nthSetBitIndex(16,0) << std::endl;
-}
+//     // std::cout << chess::nthSetBitIndex(16,0) << std::endl;
+// }
