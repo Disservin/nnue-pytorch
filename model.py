@@ -76,7 +76,6 @@ class LayerStacks(nn.Module):
     self.output.weight = nn.Parameter(output_weight)
     self.output.bias = nn.Parameter(output_bias)
 
-  @torch.compile
   def forward(self, x, ls_indices):
     # Precompute and cache the offset for gathers
     if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
@@ -202,7 +201,6 @@ class NNUE(pl.LightningModule):
   Clips the weights of the model based on the min/max values allowed
   by the quantization scheme.
   '''
-  @torch.compile
   def _clip_weights(self):
     for group in self.weight_clipping:
       for p in group['params']:
@@ -267,7 +265,6 @@ class NNUE(pl.LightningModule):
     else:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-  @torch.compile
   def _forward_inner(self, us, them, wp, bp, psqt_indices, layer_stack_indices):
     w, wpsqt = torch.split(wp, L1, dim=1)
     b, bpsqt = torch.split(bp, L1, dim=1)
