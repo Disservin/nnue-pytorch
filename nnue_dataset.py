@@ -6,7 +6,7 @@ import sys
 import glob
 from torch.utils.data import Dataset
 
-local_dllpath = [n for n in glob.glob('./*training_data_loader.*') if n.endswith('.so') or n.endswith('.dll') or n.endswith('.dylib')]
+local_dllpath = [n for n in glob.glob('./build/*training_data_loader.*') if n.endswith('.so') or n.endswith('.dll') or n.endswith('.dylib')]
 if not local_dllpath:
     print('Cannot find data_loader shared library.')
     sys.exit(1)

@@ -61,5 +61,6 @@ target_link_libraries(training_data_loader Threads::Threads)
 
 install(
   TARGETS training_data_loader
-  RUNTIME DESTINATION .
-  LIBRARY DESTINATION .)
+  RUNTIME DESTINATION bin
+  LIBRARY DESTINATION lib
+)
