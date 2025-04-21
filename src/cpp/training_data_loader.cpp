@@ -9,9 +9,9 @@
 #include <deque>
 #include <random>
 
-#include "lib/nnue_training_data_formats.h"
-#include "lib/nnue_training_data_stream.h"
-#include "lib/rng.h"
+#include "../../lib/nnue_training_data_formats.h"
+#include "../../lib/nnue_training_data_stream.h"
+#include "../../lib/rng.h"
 
 #if defined (__x86_64__)
 #define EXPORT

@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 
 local_dllpath = [
     n
-    for n in glob.glob("./build/*training_data_loader.*")
+    for n in glob.glob("../build/*training_data_loader.*")
     if n.endswith(".so") or n.endswith(".dll") or n.endswith(".dylib")
 ]
 if not local_dllpath:

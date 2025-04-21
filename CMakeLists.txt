@@ -53,7 +53,7 @@ else()
     message(STATUS "No BMI2 support")
 endif()
 
-add_library(training_data_loader SHARED training_data_loader.cpp)
+add_library(training_data_loader SHARED ./src/cpp/training_data_loader.cpp)
 
 find_package(Threads REQUIRED)
 
