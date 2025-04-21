@@ -93,7 +93,28 @@ def main():
         nargs="+",
         help="Training datasets (.binpack). Interleaved at chunk level if multiple specified. Same data is used for training and validation if not validation data is specified.",
     )
-    parser = pl.Trainer.add_argparse_args(parser)
+    # parser = pl.Trainer.add_argparse_args(parser)
+    parser.add_argument(
+        "--default-root-dir",
+        default=1.0,
+        type=str,
+        dest="default_root_dir",
+        help="Root directory of an experiment.",
+    )
+    parser.add_argument(
+        "--num-epochs",
+        default=800,
+        type=int,
+        dest="num_epochs",
+        help="Number of epochs to train for.",
+    )
+    parser.add_argument(
+        "--gpus",
+        default="0",
+        type=str,
+        dest="gpus",
+        help="A single GPU ID or a list of GPU IDs to use for training. Note that a single run still uses a single GPU.",
+    )
     parser.add_argument(
         "--validation-data",
         type=str,
@@ -260,7 +281,7 @@ def main():
 
     start_lambda = args.start_lambda or args.lambda_
     end_lambda = args.end_lambda or args.lambda_
-    max_epoch = args.max_epochs or 800
+    max_epoch = args.num_epochs or 800
     if args.resume_from_model is None:
         nnue = M.NNUE(
             feature_set=feature_set,
@@ -318,8 +339,11 @@ def main():
         every_n_epochs=args.network_save_period,
         save_top_k=-1,
     )
-    trainer = pl.Trainer.from_argparse_args(
-        args, callbacks=[checkpoint_callback], logger=tb_logger
+    trainer = pl.Trainer(
+        logger=tb_logger,
+        callbacks=[checkpoint_callback],
+        max_epochs=args.num_epochs,
+        default_root_dir=args.default_root_dir,
     )
 
     main_device = (
