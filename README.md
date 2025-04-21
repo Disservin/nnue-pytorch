@@ -4,19 +4,23 @@
 
 #### Python
 
-If using easy_train.py then at least 3.7 is required.
-
-Otherwise versions around 3.6 should also work, but updating is recommended.
-
-Python 3.11 was also tested and works well.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run
+```
+uv sync
+```
 
 #### A C++ compiler
 
-If you're using easy_train.py then at least GCC 9.2 is required for compiling the data loader, Stockfish, and c-chess-cli. This a defensive version requirement as older versions were known to cause problems with Stockfish.
+If you're using easy_train.py then at least GCC 9.2 is required for compiling
+the data loader, Stockfish, and c-chess-cli. This a defensive version
+requirement as older versions were known to cause problems with Stockfish.
 
-If you're not using easy_train.py then no automatic compilation will take place; use what you wish.
+If you're not using easy_train.py then no automatic compilation will take place;
+use what you wish.
 
-If you're on Windows the best way is to probably use [MSYS2](https://www.msys2.org/). It would also make it easy to install Make (next step).
+If you're on Windows the best way is to probably use
+[MSYS2](https://www.msys2.org/). It would also make it easy to install Make
+(next step).
 
 #### Make
 
@@ -27,15 +31,6 @@ For compiling Stockfish and c-chess-cli. Not strictly necessary if you're not us
 Necessary for compiling the data loader.
 
 https://cmake.org/install/
-
-### Package dependencies
-
-```
-python -m venv trainer
-pip install -r requirements.txt
-```
-
-PyTorch with CUDA 11.8 will be automatically installed, along with the matching CuPy version.
 
 ### The data loader (if not using easy_train.py)
 
@@ -48,7 +43,7 @@ compile_data_loader.bat
 
 Linux/Mac:
 ```
-sh compile_data_loader.bat
+sh ./compile_data_loader.bat
 ```
 
 # Network training and management
