@@ -517,8 +517,6 @@ class DoubleFeatureTransformerSlice(nn.Module):
 
 if __name__ == '__main__':
     import time
-    import sys
-    import os
 
     def FeatureTransformerSliceFunctionEmulate(feature_indices, feature_values, weight, bias):
         batch_size = feature_indices.shape[0]

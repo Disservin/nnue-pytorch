@@ -25,7 +25,7 @@
 
 import math
 import torch
-from torch.optim.optimizer import Optimizer, required
+from torch.optim.optimizer import Optimizer
 
 # If dim is None it will be chosen automatically
 def centralized_gradient(x, use_gc=True, gc_conv_only=False, dim=None):
@@ -88,9 +88,9 @@ class Ranger(Optimizer):
         print(
             f"Ranger optimizer loaded. \nGradient Centralization usage = {self.use_gc}")
         if (self.use_gc and self.gc_conv_only == False):
-            print(f"GC applied to both conv and fc layers")
+            print("GC applied to both conv and fc layers")
         elif (self.use_gc and self.gc_conv_only == True):
-            print(f"GC applied to conv layers only")
+            print("GC applied to conv layers only")
 
     def __setstate__(self, state):
         print("set state called")

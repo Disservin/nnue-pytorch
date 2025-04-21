@@ -261,7 +261,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):
     super(FixedNumBatchesDataset, self).__init__()
-    self.dataset = dataset;
+    self.dataset = dataset
     self.iter = iter(self.dataset)
     self.num_batches = num_batches
 
