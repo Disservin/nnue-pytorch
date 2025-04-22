@@ -4,7 +4,11 @@ from torch.utils.data import Dataset
 import nnue_pytorch._core as _core
 
 
-class SparseBatch(_core.SparseBatch): ...
+class SparseBatch(_core.SparseBatch): 
+    def get_tensors(self, device):
+        tensors = super().get_tensors(device)
+        print(tensors)
+        return tensors
 
 
 class FenBatchProvider:

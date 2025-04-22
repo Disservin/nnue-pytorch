@@ -806,7 +806,7 @@ class TrainingRun(Thread):
         args = [
             f"--num-workers={self._num_data_loader_threads}",
             f"--threads={self._num_pytorch_threads}",
-            f"--max_epoch={self._num_epochs}",
+            f"--num-epochs={self._num_epochs}",
             f"--batch-size={self._batch_size}",
             f"--random-fen-skipping={self._random_fen_skipping}",
             f"--early-fen-skipping={self._early_fen_skipping}",
@@ -820,7 +820,7 @@ class TrainingRun(Thread):
             f"--seed={self._seed}",
             f"--epoch-size={self._epoch_size}",
             f"--validation-size={self._validation_size}",
-            f"--default_root_dir={self._root_dir}",
+            f"--default-root-dir={self._root_dir}",
         ]
 
         if self._smart_fen_skipping:
@@ -869,7 +869,7 @@ class TrainingRun(Thread):
 
         self._running = True
 
-        cmd = [sys.executable, "train.py"] + self._get_stringified_args()
+        cmd = [sys.executable, "./src/nnue_pytorch/train.py"] + self._get_stringified_args()
         LOGGER.info(f"Running training with command: {cmd}")
         LOGGER.info(f"Also known as: {' '.join(cmd)}")
         LOGGER.info(f"Running in working directory: {self._nnue_pytorch_directory}")
@@ -1224,27 +1224,27 @@ def is_nnue_pytorch_setup(directory):
 
 
 def setup_nnue_pytorch(directory, repo, branch_or_commit):
-    if is_nnue_pytorch_setup(directory):
-        LOGGER.info(f"nnue-pytorch already setup in {directory}")
-        return
+    # if is_nnue_pytorch_setup(directory):
+    #     LOGGER.info(f"nnue-pytorch already setup in {directory}")
+    #     return
 
     LOGGER.info(f"Setting up nnue-pytorch in {directory}")
     git_download_branch_or_commit(directory, repo, branch_or_commit)
 
-    command = []
-    if sys.platform == "linux":
-        command += ["sh"]
-    # It's a .bat file made for windows but works on linux too.
-    # Just needs to be called with sh.
-    command += [os.path.join(directory, "compile_data_loader.bat")]
-    with subprocess.Popen(command, cwd=directory) as process:
-        if process.wait():
-            raise Exception(
-                f"nnue-pytorch {repo}/{branch_or_commit} data loader compilation failed"
-            )
+    # command = []
+    # if sys.platform == "linux":
+    #     command += ["sh"]
+    # # It's a .bat file made for windows but works on linux too.
+    # # Just needs to be called with sh.
+    # command += [os.path.join(directory, "compile_data_loader.bat")]
+    # with subprocess.Popen(command, cwd=directory) as process:
+    #     if process.wait():
+    #         raise Exception(
+    #             f"nnue-pytorch {repo}/{branch_or_commit} data loader compilation failed"
+    #         )
 
-    if not is_nnue_pytorch_setup(directory):
-        raise Exception("Incorrect nnue-pytorch setup or timeout.")
+    # if not is_nnue_pytorch_setup(directory):
+    #     raise Exception("Incorrect nnue-pytorch setup or timeout.")
 
 
 class CChessCliRunningTestEntry:
@@ -1450,7 +1450,7 @@ class NetworkTesting(Thread):
 
         self._running = True
 
-        cmd = [sys.executable, "run_games.py"] + self._get_stringified_args()
+        cmd = [sys.executable, "./src/nnue_pytorch/run_games.py"] + self._get_stringified_args()
         LOGGER.info(f"Running network testing with command: {cmd}")
         LOGGER.info(f"Also known as: {' '.join(cmd)}")
         LOGGER.info(f"Running in working directory: {self._nnue_pytorch_directory}")
@@ -2542,7 +2542,7 @@ def prepare_start_model(
         with subprocess.Popen(
             [
                 sys.executable,
-                "serialize.py",
+                "./src/nnue_pytorch/serialize.py",
                 os.path.abspath(model_path),
                 destination_model_path,
                 f"--features={features}",
