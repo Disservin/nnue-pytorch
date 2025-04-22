@@ -217,6 +217,3 @@ class FixedNumBatchesDataset(Dataset):
 
 def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
     return _core.get_sparse_batch_from_fens(feature_set, fens, scores, plies, results)
-
-
-print(SparseBatch())
