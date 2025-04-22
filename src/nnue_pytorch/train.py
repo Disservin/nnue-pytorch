@@ -345,7 +345,7 @@ def main():
         max_epochs=args.num_epochs,
         default_root_dir=args.default_root_dir,
         accelerator='gpu',
-        devices=0
+        devices=1
     )
 
     main_device = (
