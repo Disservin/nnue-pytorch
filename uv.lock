@@ -2340,7 +2340,7 @@ wheels = [
 [[package]]
 name = "nnue-pytorch"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "asciimatics" },
     { name = "cupy-cuda11x", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },

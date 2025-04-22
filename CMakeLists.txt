@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 
-project(training_data_loader CXX)
+project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 if(NOT DEFINED CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -53,14 +53,19 @@ else()
     message(STATUS "No BMI2 support")
 endif()
 
-add_library(training_data_loader SHARED ./src/main.cpp)
 
 find_package(Threads REQUIRED)
 
-target_link_libraries(training_data_loader Threads::Threads)
+# target_link_libraries(data_loader_ext PRIVATE Threads::Threads)
 
-install(
-  TARGETS training_data_loader
-  RUNTIME DESTINATION bin
-  LIBRARY DESTINATION lib
-)
+# set_target_properties(data_loader_ext PROPERTIES
+#     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+# )
+
+# Find Python and pybind11
+# find_package(Python COMPONENTS Interpreter Development REQUIRED)
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 CONFIG REQUIRED)
+
+pybind11_add_module(_core MODULE ./src/main.cpp)
+install(TARGETS _core DESTINATION ${SKBUILD_PROJECT_NAME})

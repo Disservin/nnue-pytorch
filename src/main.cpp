@@ -9,22 +9,14 @@
 #include <deque>
 #include <random>
 
-#include "../../lib/nnue_training_data_formats.h"
-#include "../../lib/nnue_training_data_stream.h"
-#include "../../lib/rng.h"
+#include "../lib/nnue_training_data_formats.h"
+#include "../lib/nnue_training_data_stream.h"
+#include "../lib/rng.h"
 
-#if defined (__x86_64__)
-#define EXPORT
-#define CDECL
-#else
-#if defined (_MSC_VER)
-#define EXPORT __declspec(dllexport)
-#define CDECL __cdecl
-#else
-#define EXPORT
-#define CDECL __attribute__ ((__cdecl__))
-#endif
-#endif
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include <pybind11/cast.h>
 
 using namespace binpack;
 using namespace chess;
@@ -658,7 +650,6 @@ struct Fen
         delete[] m_fen;
     }
 
-private:
     int m_size;
     char* m_fen;
 };
@@ -680,7 +671,6 @@ struct FenBatch
         delete[] m_fens;
     }
 
-private:
     int m_size;
     Fen* m_fens;
 };
@@ -934,149 +924,357 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
     return nullptr;
 }
 
-extern "C" {
+namespace py = pybind11;
+using namespace py::literals;
 
-    EXPORT SparseBatch* get_sparse_batch_from_fens(
-        const char* feature_set_c,
-        int num_fens,
-        const char* const* fens,
-        int* scores,
-        int* plies,
-        int* results
-    )
-    {
-        std::vector<TrainingDataEntry> entries;
-        entries.reserve(num_fens);
-        for (int i = 0; i < num_fens; ++i)
-        {
-            auto& e = entries.emplace_back();
-            e.pos = Position::fromFen(fens[i]);
-            movegen::forEachLegalMove(e.pos, [&](Move m){e.move = m;});
-            e.score = scores[i];
-            e.ply = plies[i];
-            e.result = results[i];
-        }
+PYBIND11_MODULE(_core, m) {
+    m.doc() = "NNUE dataset Python bindings using pybind11";
 
-        std::string_view feature_set(feature_set_c);
-        if (feature_set == "HalfKP")
-        {
-            return new SparseBatch(FeatureSet<HalfKP>{}, entries);
-        }
-        else if (feature_set == "HalfKP^")
-        {
-            return new SparseBatch(FeatureSet<HalfKPFactorized>{}, entries);
-        }
-        else if (feature_set == "HalfKA")
-        {
-            return new SparseBatch(FeatureSet<HalfKA>{}, entries);
-        }
-        else if (feature_set == "HalfKA^")
-        {
-            return new SparseBatch(FeatureSet<HalfKAFactorized>{}, entries);
-        }
-        else if (feature_set == "HalfKAv2")
-        {
-            return new SparseBatch(FeatureSet<HalfKAv2>{}, entries);
-        }
-        else if (feature_set == "HalfKAv2^")
-        {
-            return new SparseBatch(FeatureSet<HalfKAv2Factorized>{}, entries);
-        }
-        else if (feature_set == "HalfKAv2_hm")
-        {
-            return new SparseBatch(FeatureSet<HalfKAv2_hm>{}, entries);
-        }
-        else if (feature_set == "HalfKAv2_hm^")
-        {
-            return new SparseBatch(FeatureSet<HalfKAv2_hmFactorized>{}, entries);
-        }
-        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
-        return nullptr;
-    }
+    py::class_<Stream<FenBatch>>(m, "FenBatchStreamBase")
+        .def("next", &Stream<FenBatch>::next,
+             py::return_value_policy::reference);
 
-    // changing the signature needs matching changes in nnue_dataset.py
-    EXPORT FenBatchStream* CDECL create_fen_batch_stream(int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, bool filtered, int random_fen_skipping, bool wld_filtered, int early_fen_skipping, int param_index)
-    {
-        auto skipPredicate = make_skip_predicate(filtered, random_fen_skipping, wld_filtered, early_fen_skipping, param_index);
-        auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
+             py::class_<SparseBatch>(m, "SparseBatch")
+             .def_readonly("num_inputs", &SparseBatch::num_inputs)
+             .def_readonly("size", &SparseBatch::size)
+             .def_readonly("num_active_white_features", &SparseBatch::num_active_white_features)
+             .def_readonly("num_active_black_features", &SparseBatch::num_active_black_features)
+             .def_readonly("max_active_features", &SparseBatch::max_active_features)
+             .def_property_readonly("is_white", [](const SparseBatch& self) {
+                 return py::array_t<float>(
+                     {self.size},                   // shape
+                     {sizeof(float)},               // strides
+                     self.is_white,                 // data pointer
+                     py::capsule([]() {})           // no ownership (data managed by SparseBatch)
+                 );
+             })
+             .def_property_readonly("outcome", [](const SparseBatch& self) {
+                 return py::array_t<float>(
+                     {self.size},
+                     {sizeof(float)},
+                     self.outcome,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("score", [](const SparseBatch& self) {
+                 return py::array_t<float>(
+                     {self.size},
+                     {sizeof(float)},
+                     self.score,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("white", [](const SparseBatch& self) {
+                 return py::array_t<int>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(int), sizeof(int)},
+                     self.white,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("black", [](const SparseBatch& self) {
+                 return py::array_t<int>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(int), sizeof(int)},
+                     self.black,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("white_values", [](const SparseBatch& self) {
+                 return py::array_t<float>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(float), sizeof(float)},
+                     self.white_values,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("black_values", [](const SparseBatch& self) {
+                 return py::array_t<float>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(float), sizeof(float)},
+                     self.black_values,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("psqt_indices", [](const SparseBatch& self) {
+                 return py::array_t<int>(
+                     {self.size},
+                     {sizeof(int)},
+                     self.psqt_indices,
+                     py::capsule([]() {})
+                 );
+             })
+             .def_property_readonly("layer_stack_indices", [](const SparseBatch& self) {
+                 return py::array_t<int>(
+                     {self.size},
+                     {sizeof(int)},
+                     self.layer_stack_indices,
+                     py::capsule([]() {})
+                 );
+             })
+             .def("get_tensors", [](const SparseBatch& self, py::object device) {
+                 py::module torch = py::module::import("torch");
+                 
+                 auto white_values_arr = py::array_t<float>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(float), sizeof(float)},
+                     self.white_values
+                 );
+                 
+                 auto black_values_arr = py::array_t<float>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(float), sizeof(float)},
+                     self.black_values
+                 );
+                 
+                 auto white_indices_arr = py::array_t<int>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(int), sizeof(int)},
+                     self.white
+                 );
+                 
+                 auto black_indices_arr = py::array_t<int>(
+                     {self.size, self.max_active_features},
+                     {static_cast<size_t>(self.max_active_features) * sizeof(int), sizeof(int)},
+                     self.black
+                 );
+                 
+                 auto is_white_arr = py::array_t<float>(
+                     {self.size, 1},
+                     {sizeof(float), sizeof(float)},
+                     self.is_white
+                 );
+                 
+                 auto outcome_arr = py::array_t<float>(
+                     {self.size, 1},
+                     {sizeof(float), sizeof(float)},
+                     self.outcome
+                 );
+                 
+                 auto score_arr = py::array_t<float>(
+                     {self.size, 1},
+                     {sizeof(float), sizeof(float)},
+                     self.score
+                 );
+                 
+                 auto psqt_indices_arr = py::array_t<int>(
+                     {self.size},
+                     {sizeof(int)},
+                     self.psqt_indices
+                 );
+                 
+                 auto layer_stack_indices_arr = py::array_t<int>(
+                     {self.size},
+                     {sizeof(int)},
+                     self.layer_stack_indices
+                 );
+                 
+                 // Convert numpy arrays to torch tensors
+                 py::object white_values = torch.attr("from_numpy")(white_values_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object black_values = torch.attr("from_numpy")(black_values_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object white_indices = torch.attr("from_numpy")(white_indices_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object black_indices = torch.attr("from_numpy")(black_indices_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object us = torch.attr("from_numpy")(is_white_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object them = torch.attr("tensor")(1.0).attr("sub")(us);
+                 py::object outcome = torch.attr("from_numpy")(outcome_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object score = torch.attr("from_numpy")(score_arr).attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object psqt_indices = torch.attr("from_numpy")(psqt_indices_arr).attr("long")().attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
+                 py::object layer_stack_indices = torch.attr("from_numpy")(layer_stack_indices_arr).attr("long")().attr("pin_memory")().attr("to")(device, "non_blocking"_a=true);
 
-        return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-    }
+                 return py::make_tuple(us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices);
+             });
 
-    EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
-    {
-        delete stream;
-    }
+    py::class_<FenBatch>(m, "FenBatch")
+        .def("__repr__", [](const FenBatch &self) { return "FenBatch object"; })
+        .def_readonly("size", &FenBatch::m_size)
+        .def("get_fens", [](const FenBatch &self) {
+            std::vector<std::string> fens;
+            for (int i = 0; i < self.m_size; i++) {
+                fens.push_back(self.m_fens[i].m_fen);
+            }
+            return fens;
+        });
 
-    // changing the signature needs matching changes in nnue_dataset.py
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic,
-                                                                 bool filtered, int random_fen_skipping, bool wld_filtered, int early_fen_skipping, int param_index)
-    {
-        auto skipPredicate = make_skip_predicate(filtered, random_fen_skipping, wld_filtered, early_fen_skipping, param_index);
-        auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
+    py::class_<Stream<SparseBatch>>(m, "SparseBatchStream")
+        .def("next", &Stream<SparseBatch>::next,
+             py::return_value_policy::reference);
 
-        std::string_view feature_set(feature_set_c);
-        if (feature_set == "HalfKP")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKP^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKA")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKA^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2_hm")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hm>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKAv2_hm^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hmFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
-        }
-        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
-        return nullptr;
-    }
+    py::class_<FenBatchStream, Stream<FenBatch>>(m, "FenBatchStream")
+        .def("next", &FenBatchStream::next, py::return_value_policy::reference);
 
-    EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
-    {
-        delete stream;
-    }
+    m.def(
+        "get_sparse_batch_from_fens",
+        [](const std::string &feature_set, const std::vector<std::string> &fens,
+           std::vector<int> &scores, std::vector<int> &plies,
+           std::vector<int> &results) -> SparseBatch * {
+            if (fens.size() != scores.size() || fens.size() != plies.size() ||
+                fens.size() != results.size()) {
+                throw std::runtime_error(
+                    "Inconsistent input sizes for fens, scores, plies, and "
+                    "results");
+            }
 
-    EXPORT SparseBatch* CDECL fetch_next_sparse_batch(Stream<SparseBatch>* stream)
-    {
-        return stream->next();
-    }
+            std::vector<TrainingDataEntry> entries;
+            entries.reserve(fens.size());
 
-    EXPORT FenBatch* CDECL fetch_next_fen_batch(Stream<FenBatch>* stream)
-    {
-        return stream->next();
-    }
+            for (size_t i = 0; i < fens.size(); ++i) {
+                auto &e = entries.emplace_back();
+                e.pos = Position::fromFen(fens[i].c_str());
+                movegen::forEachLegalMove(e.pos, [&](Move m) { e.move = m; });
+                e.score = scores[i];
+                e.ply = plies[i];
+                e.result = results[i];
+            }
 
-    EXPORT void CDECL destroy_sparse_batch(SparseBatch* e)
-    {
-        delete e;
-    }
+            SparseBatch *batch = nullptr;
 
-    EXPORT void CDECL destroy_fen_batch(FenBatch* e)
-    {
-        delete e;
-    }
+            if (feature_set == "HalfKP") {
+                batch = new SparseBatch(FeatureSet<HalfKP>{}, entries);
+            } else if (feature_set == "HalfKP^") {
+                batch =
+                    new SparseBatch(FeatureSet<HalfKPFactorized>{}, entries);
+            } else if (feature_set == "HalfKA") {
+                batch = new SparseBatch(FeatureSet<HalfKA>{}, entries);
+            } else if (feature_set == "HalfKA^") {
+                batch =
+                    new SparseBatch(FeatureSet<HalfKAFactorized>{}, entries);
+            } else if (feature_set == "HalfKAv2") {
+                batch = new SparseBatch(FeatureSet<HalfKAv2>{}, entries);
+            } else if (feature_set == "HalfKAv2^") {
+                batch =
+                    new SparseBatch(FeatureSet<HalfKAv2Factorized>{}, entries);
+            } else if (feature_set == "HalfKAv2_hm") {
+                batch = new SparseBatch(FeatureSet<HalfKAv2_hm>{}, entries);
+            } else if (feature_set == "HalfKAv2_hm^") {
+                batch = new SparseBatch(FeatureSet<HalfKAv2_hmFactorized>{},
+                                        entries);
+            } else {
+                throw std::runtime_error("Unknown feature_set: " + feature_set);
+            }
 
+            return batch;
+        },
+        py::arg("feature_set"), py::arg("fens"), py::arg("scores"),
+        py::arg("plies"), py::arg("results"),
+        py::return_value_policy::take_ownership,
+        "Create a SparseBatch from a list of FENs with associated scores, "
+        "plies, "
+        "and results");
+
+    m.def(
+        "create_fen_batch_stream",
+        [](int concurrency, const std::vector<std::string> &filenames,
+           int batch_size, bool cyclic, bool filtered = false,
+           int random_fen_skipping = 0, bool wld_filtered = false,
+           int early_fen_skipping = 0,
+           int param_index = 0) -> FenBatchStream * {
+            auto skipPredicate =
+                make_skip_predicate(filtered, random_fen_skipping, wld_filtered,
+                                    early_fen_skipping, param_index);
+            return new FenBatchStream(concurrency, filenames, batch_size,
+                                      cyclic, skipPredicate);
+        },
+        py::arg("concurrency"), py::arg("filenames"), py::arg("batch_size"),
+        py::arg("cyclic"), py::arg("filtered") = false,
+        py::arg("random_fen_skipping") = 0, py::arg("wld_filtered") = false,
+        py::arg("early_fen_skipping") = 0, py::arg("param_index") = 0,
+        py::return_value_policy::take_ownership,
+        "Create a FenBatchStream from a list of filenames");
+
+    m.def(
+        "create_sparse_batch_stream",
+        [](const std::string &feature_set, int concurrency,
+           const std::vector<std::string> &filenames, int batch_size,
+           bool cyclic, bool filtered = false, int random_fen_skipping = 0,
+           bool wld_filtered = false, int early_fen_skipping = 0,
+           int param_index = 0) -> Stream<SparseBatch> * {
+            auto skipPredicate =
+                make_skip_predicate(filtered, random_fen_skipping, wld_filtered,
+                                    early_fen_skipping, param_index);
+
+            Stream<SparseBatch> *stream = nullptr;
+
+            if (feature_set == "HalfKP") {
+                stream =
+                    new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(
+                        concurrency, filenames, batch_size, cyclic,
+                        skipPredicate);
+            } else if (feature_set == "HalfKP^") {
+                stream = new FeaturedBatchStream<FeatureSet<HalfKPFactorized>,
+                                                 SparseBatch>(
+                    concurrency, filenames, batch_size, cyclic, skipPredicate);
+            } else if (feature_set == "HalfKA") {
+                stream =
+                    new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(
+                        concurrency, filenames, batch_size, cyclic,
+                        skipPredicate);
+            } else if (feature_set == "HalfKA^") {
+                stream = new FeaturedBatchStream<FeatureSet<HalfKAFactorized>,
+                                                 SparseBatch>(
+                    concurrency, filenames, batch_size, cyclic, skipPredicate);
+            } else if (feature_set == "HalfKAv2") {
+                stream =
+                    new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(
+                        concurrency, filenames, batch_size, cyclic,
+                        skipPredicate);
+            } else if (feature_set == "HalfKAv2^") {
+                stream = new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>,
+                                                 SparseBatch>(
+                    concurrency, filenames, batch_size, cyclic, skipPredicate);
+            } else if (feature_set == "HalfKAv2_hm") {
+                stream = new FeaturedBatchStream<FeatureSet<HalfKAv2_hm>,
+                                                 SparseBatch>(
+                    concurrency, filenames, batch_size, cyclic, skipPredicate);
+            } else if (feature_set == "HalfKAv2_hm^") {
+                stream =
+                    new FeaturedBatchStream<FeatureSet<HalfKAv2_hmFactorized>,
+                                            SparseBatch>(concurrency, filenames,
+                                                         batch_size, cyclic,
+                                                         skipPredicate);
+            } else {
+                throw std::runtime_error("Unknown feature_set: " + feature_set);
+            }
+
+            return stream;
+        },
+        py::arg("feature_set"), py::arg("concurrency"), py::arg("filenames"),
+        py::arg("batch_size"), py::arg("cyclic"), py::arg("filtered") = false,
+        py::arg("random_fen_skipping") = 0, py::arg("wld_filtered") = false,
+        py::arg("early_fen_skipping") = 0, py::arg("param_index") = 0,
+        py::return_value_policy::take_ownership,
+        "Create a SparseBatchStream from a list of filenames");
+
+    m.def(
+        "destroy_sparse_batch", [](SparseBatch *batch) { delete batch; },
+        "Destroy a SparseBatch object");
+
+    m.def(
+        "destroy_fen_batch", [](FenBatch *batch) { delete batch; },
+        "Destroy a FenBatch object");
+
+    m.def(
+        "destroy_sparse_batch_stream",
+        [](Stream<SparseBatch> *stream) { delete stream; },
+        "Destroy a SparseBatchStream object");
+
+    m.def(
+        "destroy_fen_batch_stream",
+        [](FenBatchStream *stream) { delete stream; },
+        "Destroy a FenBatchStream object");
+
+    m.def(
+        "fetch_next_sparse_batch",
+        [](Stream<SparseBatch> *stream) -> SparseBatch * {
+            return stream->next();
+        },
+        py::return_value_policy::reference,
+        "Fetch the next SparseBatch from a stream");
+
+    m.def(
+        "fetch_next_fen_batch",
+        [](Stream<FenBatch> *stream) -> FenBatch * { return stream->next(); },
+        py::return_value_policy::reference,
+        "Fetch the next FenBatch from a stream");
 }
 
 /* benches */ /*
