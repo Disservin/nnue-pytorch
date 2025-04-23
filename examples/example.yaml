@@ -9,7 +9,7 @@ end-lambda: 0.7
 network-testing-games-per-round: 1000
 network-testing-threads: 24
 num-workers: 6
-start-from-engine-test-net: True
+start-from-engine-test-net: False
 
 lr: 4.375e-4
 gamma: 0.995
@@ -20,4 +20,3 @@ gpus: 0
 # nnue_pytorch_directory: ./src/nnue_pytorch
 features: HalfKAv2_hm^
 do-network-testing: False
-start-from-engine-test-net: False
