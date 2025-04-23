@@ -20,3 +20,4 @@ gpus: 0
 # nnue_pytorch_directory: ./src/nnue_pytorch
 features: HalfKAv2_hm^
 do-network-testing: False
+start-from-engine-test-net: False
