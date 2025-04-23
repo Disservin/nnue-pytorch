@@ -3,7 +3,7 @@ name = "nnue-pytorch"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "asciimatics>=1.15.0",
     "cupy-cuda12x>=12.3.0",
@@ -15,13 +15,21 @@ dependencies = [
     "pytorch-lightning==1.9.5",
     "requests>=2.32.3",
     "tensorboard>=2.14.0",
-    "torch==2.4.1",
+    "torch>=2.6.0",
 ]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [dependency-groups]
 dev = [
@@ -35,3 +43,4 @@ build-backend = "scikit_build_core.build"
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
+
