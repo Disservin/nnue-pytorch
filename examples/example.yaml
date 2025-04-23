@@ -19,3 +19,4 @@ workspace-path: ./testing
 gpus: 0
 # nnue_pytorch_directory: ./src/nnue_pytorch
 features: HalfKAv2_hm^
+do-network-testing: False
