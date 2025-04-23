@@ -623,6 +623,13 @@ class DoubleFeatureTransformerSlice(nn.Module):
 if __name__ == "__main__":
     import time
 
+    print(f"CUDA available: {torch.cuda.is_available()}")
+
+    print(f"CUDA version: {torch.version.cuda}")
+
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    print(f"CUDA device name: {torch.cuda.current_device()}")
+
     def FeatureTransformerSliceFunctionEmulate(
         feature_indices, feature_values, weight, bias
     ):

@@ -3,23 +3,24 @@ name = "nnue-pytorch"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "asciimatics>=1.15.0",
-    "cupy-cuda11x>=12.3.0",
+    "cupy-cuda12x>=12.3.0",
     "gputil>=1.4.0",
     "matplotlib>=3.7.5",
     "numba>=0.58.1",
     "psutil>=7.0.0",
     "python-chess==0.31.4",
     "pytorch-lightning==1.9.5",
+    "requests>=2.32.3",
     "tensorboard>=2.14.0",
-    "torch==2.0.1",
+    "torch==2.4.1",
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [dependency-groups]

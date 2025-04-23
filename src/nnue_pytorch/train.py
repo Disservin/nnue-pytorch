@@ -344,7 +344,8 @@ def main():
         callbacks=[checkpoint_callback],
         max_epochs=args.num_epochs,
         default_root_dir=args.default_root_dir,
-        gpus=args.gpus,
+        accelerator="gpu",
+        devices=args.gpus,
     )
 
     main_device = (
