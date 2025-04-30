@@ -2,3 +2,6 @@ __pycache__/
 env/
 build/
 logs/
+testing
+.venv
+libtraining_data_loader.*
