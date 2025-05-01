@@ -7,7 +7,7 @@ matplotlib
 # torch==2.2.1+cu118
 pytorch-lightning==1.9.5
 tensorboard
-cupy-cuda11x
+cupy-cuda12x
 numba
 numpy<2.0
 requests
