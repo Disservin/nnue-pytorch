@@ -2,6 +2,12 @@
 
 docker build -t nnue-pytorch .
 
+echo "Enter the path to your data directory to mount into the container: "
+read DATA_PATH
+
+DATA_PATH=${DATA_PATH}
+echo "Using data path: $DATA_PATH"
+
 if [ "$(docker ps -aq -f name=nnue-container)" ]; then
   if [ ! "$(docker ps -q -f name=nnue-container)" ]; then
     echo "Starting existing container 'nnue-container'..."
@@ -14,8 +20,8 @@ else
   echo "Creating new container 'nnue-container'..."
   docker run -it --name nnue-container \
     --gpus all \
-    -v .:/workspace/nnue-pytorch \
-    -v /mnt/g/stockfish-data:/workspace/data \
+    -v "$(pwd)":/workspace/nnue-pytorch \
+    -v "$DATA_PATH":/workspace/data \
     --ipc=host \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
