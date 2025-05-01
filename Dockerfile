@@ -10,4 +10,6 @@ RUN mkdir -p /workspace/nnue-pytorch
 
 WORKDIR /workspace/nnue-pytorch
 
-CMD ["/bin/bash"]
+COPY setup_script.sh .
+
+CMD ["setup_script.sh"]
