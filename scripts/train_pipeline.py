@@ -82,6 +82,9 @@ def find_latest_model_checkpoint(stage_config):
         d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("version_")
     ]
 
+    # append checkpoints to version directories
+    version_dirs = [d / Path("checkpoints") for d in version_dirs]
+
     if not version_dirs:
         print(f"Warning: No version directories found in {output_dir}")
         return None
