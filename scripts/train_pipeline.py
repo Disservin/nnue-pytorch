@@ -74,7 +74,30 @@ def get_output_dir(config):
     return Path("lightning_logs")
 
 
-def run_training(config_file):
+def find_latest_model_checkpoint(stage_config):
+    """Find the latest model checkpoint for a given stage configuration."""
+    output_dir = get_output_dir(stage_config)
+
+    version_dirs = [
+        d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("version_")
+    ]
+
+    if not version_dirs:
+        print(f"Warning: No version directories found in {output_dir}")
+        return None
+
+    latest_version = max(version_dirs, key=lambda x: int(x.name.split("_")[1]))
+    checkpoint = find_latest_checkpoint(latest_version / "checkpoints")
+
+    if checkpoint:
+        print(f"Found checkpoint: {checkpoint}")
+        return str(checkpoint)
+    else:
+        print(f"Warning: No checkpoint found in {latest_version / 'checkpoints'}")
+        return None
+
+
+def run_training(config_file, start_stage):
     """Run training based on the YAML configuration."""
     with open(config_file, "r") as file:
         config = yaml.safe_load(file)
@@ -91,7 +114,25 @@ def run_training(config_file):
         print("Error: No training stages defined")
         sys.exit(1)
 
+    stage_names = list(stages.keys())
+
+    if start_stage < 0 or start_stage >= len(stage_names):
+        print(
+            f"Error: Invalid start stage {start_stage}. Must be between 0 and {len(stage_names)-1}"
+        )
+        sys.exit(1)
+
     previous_model = None
+
+    if start_stage > 0:
+        previous_stage_name = stage_names[start_stage - 1]
+        previous_model = find_latest_model_checkpoint(stages[previous_stage_name])
+
+        if previous_model:
+            print(f"Starting from stage {start_stage}: {stage_names[start_stage]}")
+            print(f"Using checkpoint from previous stage: {previous_model}")
+        else:
+            print(f"Starting from stage {start_stage} without a checkpoint")
 
     # Run each stage in sequence
     for stage_name, stage_config in stages.items():
@@ -109,26 +150,12 @@ def run_training(config_file):
             )
             sys.exit(result.returncode)
 
-        output_dir = get_output_dir(stage_config)
-        version_dirs = [
-            d
-            for d in output_dir.iterdir()
-            if d.is_dir() and d.name.startswith("version_")
-        ]
-        print(f"{output_dir}")
-
-        if version_dirs:
-            latest_version = max(version_dirs, key=lambda x: int(x.name.split("_")[1]))
-            checkpoint = find_latest_checkpoint(latest_version / "checkpoints")
-            if checkpoint:
-                previous_model = str(checkpoint)
-                print(f"Found checkpoint for next stage: {previous_model}")
-            else:
-                print(
-                    f"Warning: No checkpoint found in {latest_version / 'checkpoints'}"
-                )
+        previous_model = find_latest_model_checkpoint(stage_config)
+        if previous_model:
+            print(f"Found checkpoint for next stage: {previous_model}")
         else:
-            print(f"Warning: No version directories found in {output_dir}")
+            print(f"No checkpoint found for next stage")
+            sys.exit(1)
 
     print("\nAll training stages completed successfully.")
 
@@ -138,6 +165,7 @@ if __name__ == "__main__":
         description="Run multi-stage training using a YAML configuration"
     )
     parser.add_argument("config", help="YAML configuration file")
+    parser.add_argument("--start-stage", type=int, default=0, help="Start stage index")
     args = parser.parse_args()
 
-    run_training(args.config)
+    run_training(args.config, args.start_stage)
