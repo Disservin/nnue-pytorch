@@ -72,7 +72,7 @@ def find_latest_checkpoint(directory):
 def prepare_checkpoint(checkpoint_path, features=None):
     _, filename = tempfile.mkstemp(suffix=".pt")
 
-    with subprocess.Popen(
+    subprocess.run(
         [
             sys.executable,
             "serialize.py",
@@ -80,11 +80,8 @@ def prepare_checkpoint(checkpoint_path, features=None):
             filename,
             f"--features={features}",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    ) as process:
-        if process.wait():
-            raise Exception("Failed to run serialize.py for start model.")
+    )
+
     return filename
 
 
