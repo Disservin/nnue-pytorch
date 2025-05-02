@@ -69,8 +69,11 @@ def find_latest_checkpoint(directory):
     return checkpoints[-1]
 
 
-def prepare_checkpoint(checkpoint_path, features="HalfKAv2_hm^"):
+def prepare_checkpoint(checkpoint_path, features):
     _, filename = tempfile.mkstemp(suffix=".pt")
+
+    if features is None:
+        features = "HalfKAv2_hm^"
 
     subprocess.run(
         [
