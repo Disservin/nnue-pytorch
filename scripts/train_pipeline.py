@@ -94,7 +94,7 @@ def find_latest_model_checkpoint(stage_config):
         if checkpoints:
             latest_checkpoint = max(checkpoints, key=os.path.getctime)
             print(f"Found checkpoint: {latest_checkpoint}")
-            return str(latest_checkpoint)
+            return str(latest_checkpoint.resolve)
 
 
 def run_training(config_file, start_stage):
