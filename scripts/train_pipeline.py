@@ -135,7 +135,9 @@ def run_training(config_file, start_stage):
             print(f"Starting from stage {start_stage} without a checkpoint")
 
     # Run each stage in sequence
-    for stage_name, stage_config in stages.items():
+    for i, stage_name in enumerate(stage_names[start_stage:], start=start_stage):
+        stage_config = stages[stage_name]
+
         print(f"\n{'='*30}")
         print(f"Starting training stage: {stage_name}")
         print(f"{'='*30}")
