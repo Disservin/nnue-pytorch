@@ -5,7 +5,7 @@ import subprocess
 import sys
 import yaml
 from pathlib import Path
-import re
+import tempfile
 
 
 def convert_arg_name(name):
@@ -28,7 +28,9 @@ def build_command(script_path, config, previous_model=None):
 
     # Add resume-from-model if we have a previous model
     if previous_model and "resume-from-model" not in config:
-        config["resume-from-model"] = previous_model
+        features = config.get("features", None)
+        converted_model = prepare_checkpoint(previous_model, features)
+        config["resume-from-model"] = converted_model
 
     # Convert config to command-line arguments
     for key, value in config.items():
@@ -65,6 +67,25 @@ def find_latest_checkpoint(directory):
     # latest = max(checkpoints, key=lambda x: x[0])
     # return last
     return checkpoints[-1]
+
+
+def prepare_checkpoint(checkpoint_path, features=None):
+    _, filename = tempfile.mkstemp(suffix=".pt")
+
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "serialize.py",
+            checkpoint_path,
+            filename,
+            f"--features={features}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ) as process:
+        if process.wait():
+            raise Exception("Failed to run serialize.py for start model.")
+    return filename
 
 
 def get_output_dir(config):
