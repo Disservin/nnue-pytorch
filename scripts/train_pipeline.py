@@ -85,16 +85,13 @@ def find_latest_model_checkpoint(stage_config):
     if not version_dirs:
         print(f"Warning: No version directories found in {output_dir}")
         return None
-
-    latest_version = max(version_dirs, key=lambda x: int(x.name.split("_")[1]))
-    checkpoint = find_latest_checkpoint(latest_version / "checkpoints")
-
-    if checkpoint:
-        print(f"Found checkpoint: {checkpoint}")
-        return str(checkpoint)
-    else:
-        print(f"Warning: No checkpoint found in {latest_version / 'checkpoints'}")
-        return None
+    # iterate through all version directories in reverse order
+    for version_dir in sorted(version_dirs, reverse=True):
+        checkpoints = list(version_dir.glob("*.ckpt"))
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=os.path.getctime)
+            print(f"Found checkpoint: {latest_checkpoint}")
+            return str(latest_checkpoint)
 
 
 def run_training(config_file, start_stage):
