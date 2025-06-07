@@ -10,6 +10,8 @@ from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
+torch.set_float32_matmul_precision('medium' | 'high')
+
 def make_data_loaders(train_filenames, val_filenames, feature_set, num_workers, batch_size, filtered, random_fen_skipping, wld_filtered, early_fen_skipping, param_index, main_device, epoch_size, val_size):
   # Epoch and validation sizes are arbitrary
   features_name = feature_set.name
