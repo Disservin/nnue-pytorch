@@ -44,6 +44,8 @@ def build_command(script_path, config, previous_model=None):
         elif value is not None:
             cmd.append(convert_arg_name(key))
             cmd.append(str(value))
+        elif value is None:
+            cmd.append(convert_arg_name(key))
 
     return cmd
 
