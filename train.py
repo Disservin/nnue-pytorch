@@ -181,6 +181,7 @@ def main():
     args.epoch_size,
     args.validation_size)
 
+  nnue = torch.compile(nnue)
   trainer.fit(nnue, train, val)
 
   with open(os.path.join(logdir, 'training_finished'), 'w'):

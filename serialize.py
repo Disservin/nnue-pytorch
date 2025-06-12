@@ -188,7 +188,7 @@ class NNUEReader():
   def __init__(self, f, feature_set):
     self.f = f
     self.feature_set = feature_set
-    self.model = M.NNUE(feature_set)
+    self.model = M.NNUE(feature_set).cpu()
     fc_hash = NNUEWriter.fc_hash(self.model)
 
     self.read_header(feature_set, fc_hash)
@@ -310,7 +310,7 @@ def main():
   print('Converting %s to %s' % (args.source, args.target))
 
   if args.source.endswith('.ckpt'):
-    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
+    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, map_location=torch.device("cpu") )
     nnue.eval()
   elif args.source.endswith('.pt'):
     nnue = torch.load(args.source)
