@@ -5,6 +5,7 @@ import os
 import sys
 import glob
 from torch.utils.data import Dataset
+from typing import Dict, Tuple, Optional
 
 local_dllpath = [n for n in glob.glob('./*training_data_loader.*') if n.endswith('.so') or n.endswith('.dll') or n.endswith('.dylib')]
 if not local_dllpath:
@@ -31,18 +32,67 @@ class SparseBatch(ctypes.Structure):
         ('layer_stack_indices', ctypes.POINTER(ctypes.c_int)),
     ]
 
+    _pinned_buffers = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pinned_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self._last_shape = None
+
     def get_tensors(self, device):
-        white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
-        black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
-        white_indices = torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
-        black_indices = torch.from_numpy(np.ctypeslib.as_array(self.black, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
-        us = torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
+        current_shape = (self.size, self.max_active_features)
+
+        if self._pinned_buffers is None or self._last_shape != current_shape:
+            self._init_pinned_buffers(current_shape)
+            self._last_shape = current_shape
+
+        buffers = self._pinned_buffers
+
+        buffers['white_values'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.white_values, shape=current_shape)))
+        buffers['black_values'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.black_values, shape=current_shape)))
+        buffers['white_indices'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.white, shape=current_shape)))
+        buffers['black_indices'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.black, shape=current_shape)))
+        buffers['us'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.is_white, shape=(self.size, 1))))
+        buffers['outcome'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.outcome, shape=(self.size, 1))))
+        buffers['score'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.score, shape=(self.size, 1))))
+        buffers['psqt_indices'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))))
+        buffers['layer_stack_indices'].copy_(torch.from_numpy(
+            np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))))
+
+        white_values = buffers['white_values'].to(device=device, non_blocking=True)
+        black_values = buffers['black_values'].to(device=device, non_blocking=True)
+        white_indices = buffers['white_indices'].to(device=device, non_blocking=True)
+        black_indices = buffers['black_indices'].to(device=device, non_blocking=True)
+        us = buffers['us'].to(device=device, non_blocking=True)
         them = 1.0 - us
-        outcome = torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
-        score = torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
-        psqt_indices = torch.from_numpy(np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
-        layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
+        outcome = buffers['outcome'].to(device=device, non_blocking=True)
+        score = buffers['score'].to(device=device, non_blocking=True)
+        psqt_indices = buffers['psqt_indices'].to(device=device, non_blocking=True)
+        layer_stack_indices = buffers['layer_stack_indices'].to(device=device, non_blocking=True)
+
         return us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices
+
+    def _init_pinned_buffers(self, shape):
+        size, max_active_features = shape
+        self._pinned_buffers = {
+            'white_values': torch.empty((size, max_active_features), dtype=torch.float32, pin_memory=True),
+            'black_values': torch.empty((size, max_active_features), dtype=torch.float32, pin_memory=True),
+            'white_indices': torch.empty((size, max_active_features), dtype=torch.int32, pin_memory=True),
+            'black_indices': torch.empty((size, max_active_features), dtype=torch.int32, pin_memory=True),
+            'us': torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
+            'outcome': torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
+            'score': torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
+            'psqt_indices': torch.empty((size,), dtype=torch.int64, pin_memory=True),
+            'layer_stack_indices': torch.empty((size,), dtype=torch.int64, pin_memory=True),
+        }
 
 SparseBatchPtr = ctypes.POINTER(SparseBatch)
 
@@ -258,15 +308,65 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     return SparseBatchProvider(self.feature_set, self.filenames, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers,
                                filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, wld_filtered=self.wld_filtered, early_fen_skipping = self.early_fen_skipping, param_index=self.param_index, device=self.device)
 
+import threading
+import queue
+from torch.utils.data import Dataset
+
 class FixedNumBatchesDataset(Dataset):
-  def __init__(self, dataset, num_batches):
-    super(FixedNumBatchesDataset, self).__init__()
-    self.dataset = dataset;
-    self.iter = iter(self.dataset)
-    self.num_batches = num_batches
+    def __init__(self, dataset, num_batches):
+        super(FixedNumBatchesDataset, self).__init__()
+        self.dataset = dataset
+        self.iter = iter(self.dataset)
+        self.num_batches = num_batches
 
-  def __len__(self):
-    return self.num_batches
+        self._prefetch_queue = queue.Queue(maxsize=100)
+        self._prefetch_thread = None
+        self._stop_prefetching = threading.Event()
+        self._prefetch_started = False
+        self._lock = threading.Lock()
 
-  def __getitem__(self, idx):
-    return next(self.iter)
+    def _prefetch_worker(self):
+        try:
+            while not self._stop_prefetching.is_set():
+                try:
+                    item = next(self.iter)
+                    self._prefetch_queue.put(item)
+                except StopIteration:
+                    self._prefetch_queue.put(None)
+                    break
+                except queue.Full:
+                    continue
+        except Exception as e:
+            self._prefetch_queue.put(e)
+
+    def _start_prefetching(self):
+        with self._lock:
+            if not self._prefetch_started:
+                self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+                self._prefetch_thread.start()
+                self._prefetch_started = True
+
+    def __len__(self):
+        return self.num_batches
+
+    def __getitem__(self, idx):
+        self._start_prefetching()
+
+        try:
+            item = self._prefetch_queue.get(timeout=30.0)  # 30 second timeout
+
+            if item is None:
+                raise StopIteration("End of dataset reached")
+            elif isinstance(item, Exception):
+                raise item
+
+            return item
+
+        except queue.Empty:
+            raise RuntimeError("Prefetch timeout - no data available")
+
+    def __del__(self):
+        if hasattr(self, '_stop_prefetching'):
+            self._stop_prefetching.set()
+        if hasattr(self, '_prefetch_thread') and self._prefetch_thread:
+            self._prefetch_thread.join(timeout=1.0)

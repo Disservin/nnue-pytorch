@@ -8,7 +8,9 @@ import sys
 import torch
 from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning.profilers import PyTorchProfiler
 from torch.utils.data import DataLoader, Dataset
+from pytorch_lightning.callbacks import TQDMProgressBar
 
 import warnings
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
@@ -149,16 +151,37 @@ def main():
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
   checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=args.save_last_network, every_n_epochs=args.network_save_period, save_top_k=-1)
+  profiler = PyTorchProfiler(
+      activities=[
+          torch.profiler.ProfilerActivity.CPU,
+          torch.profiler.ProfilerActivity.CUDA,
+      ],
+      schedule=torch.profiler.schedule(
+          wait=1,
+          warmup=1,
+          active=3,
+          repeat=2
+      ),
+      on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs'),
+      record_shapes=True,
+      profile_memory=True,
+      with_stack=True,  # This enables stack traces
+      with_flops=True,
+      row_limit=100,
+  )
 
   trainer = pl.Trainer(
     default_root_dir=logdir,
     max_epochs=args.max_epochs,
     devices=[int(x) for x in args.gpus.rstrip(',').split(",") if x] if args.gpus else "auto",
     logger=tb_logger,
+    # callbacks=[checkpoint_callback],
     callbacks=[checkpoint_callback],
     enable_progress_bar=True,
     enable_checkpointing=True,
     benchmark=True,
+    # profiler=profiler,
+    limit_val_batches=0
   )
 
   main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
