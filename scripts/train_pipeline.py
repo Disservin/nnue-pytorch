@@ -16,13 +16,13 @@ def convert_arg_name(name: str) -> str:
     return f"--{name.replace('-', '-')}"
 
 
-def get_datasets(config) -> List[str]:
+def get_datasets(config, key) -> List[str]:
     """Extract datasets from the config."""
-    if "datasets" in config:
-        if isinstance(config["datasets"], list):
-            return config["datasets"]
+    if key in config:
+        if isinstance(config[key], list):
+            return config[key]
         else:
-            return [config["datasets"]]
+            return [config[key]]
     return []
 
 
@@ -39,11 +39,11 @@ def build_command(script_path: str, config, previous_model=None):
     """Build the command to execute based on the config."""
     cmd = [sys.executable, script_path]
 
-    for dataset in validate_datasets(get_datasets(config)):
+    for dataset in validate_datasets(get_datasets(config, "datasets")):
         cmd.append(dataset)
 
     del config["datasets"]  # Remove datasets from config to avoid conflicts
-
+    
     # Add resume-from-model if we have a previous model
     if previous_model and "resume-from-model" not in config:
         features = config.get("features", None)
@@ -62,6 +62,8 @@ def build_command(script_path: str, config, previous_model=None):
         elif value is not None:
             cmd.append(convert_arg_name(key))
             cmd.append(str(value))
+        else:
+            cmd.append(convert_arg_name(key))
 
     return cmd
 
