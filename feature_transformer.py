@@ -15,18 +15,18 @@ def _find_nearest_divisor(value, target):
 _num_threads_forward_cache = dict()
 def _get_num_threads_for_forward(output_size):
     optimal_num_threads = 512
-    if output_size not in _num_threads_forward_cache:
-        _num_threads_forward_cache[output_size] = _find_nearest_divisor(output_size, optimal_num_threads)
-
-    return _num_threads_forward_cache[output_size]
+    output_size_half2 = output_size // 2
+    if output_size_half2 not in _num_threads_forward_cache:
+        _num_threads_forward_cache[output_size_half2] = _find_nearest_divisor(output_size_half2, optimal_num_threads)
+    return _num_threads_forward_cache[output_size_half2]
 
 _num_threads_backward_cache = dict()
 def _get_num_threads_for_backward(output_size):
     optimal_num_threads = 512
-    if output_size not in _num_threads_backward_cache:
-        _num_threads_backward_cache[output_size] = _find_nearest_divisor(output_size, optimal_num_threads)
-
-    return _num_threads_backward_cache[output_size]
+    output_size_half2 = output_size // 2
+    if output_size_half2 not in _num_threads_backward_cache:
+        _num_threads_backward_cache[output_size_half2] = _find_nearest_divisor(output_size_half2, optimal_num_threads)
+    return _num_threads_backward_cache[output_size_half2]
 
 def _kernel_with_threads(kernel, threads):
     def f(grid, args):
@@ -34,6 +34,7 @@ def _kernel_with_threads(kernel, threads):
     return f
 
 _feature_transformer_slice_forward_kernel_cache = dict()
+@torch.compiler.disable(recursive=False)
 def make_feature_transformer_slice_forward_kernel(max_active_features, output_size):
     '''
         @param: max_active_features
@@ -44,14 +45,18 @@ def make_feature_transformer_slice_forward_kernel(max_active_features, output_si
 
         @param: output_size
             The number of outputs. Must match the shape of weights
-            and biases.
+            and biases. Must be even for half2 operations.
             This value is of type uint32.
     '''
+    assert output_size % 2 == 0, "output_size must be even for half2 operations"
+
     num_threads = _get_num_threads_for_forward(output_size)
-    output_thread_slice_size = output_size // num_threads
+    output_thread_slice_size = (output_size // 2) // num_threads  # half2 elements per thread
     key = (max_active_features, output_size, num_threads)
+
     if key not in _feature_transformer_slice_forward_kernel_cache:
         kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
 
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -62,7 +67,8 @@ extern "C" __global__
     @assumptions:
         The blocks must have dimensionality (BATCH_SIZE,)
         The threads must have dimensionality (N,), where
-        N * output_thread_slice_size == output_size.
+        N * output_thread_slice_size * 2 == output_size.
+        output_size must be even.
 
     @param: feature_indices
         A matrix of shape (BATCH_SIZE, max_active_features)
@@ -80,41 +86,41 @@ extern "C" __global__
         A matrix of shape (BATCH_SIZE, max_active_features)
         containing the values (arity) of the corresponding
         feature index in feature_indices.
-        The type for the feature value (arity) is float32.
+        The type for the feature value (arity) is half (FP16).
 
     @param: weight
         The weight matrix of shape (NUM_INPUTS, output_size).
-        Weights must be of type float32.
+        Weights must be of type half (FP16).
 
     @param: bias
         The bias vector of shape (output_size,).
-        Bias values must be of type float32.
+        Bias values must be of type half (FP16).
 
     @param: output
         An output matrix of shape (BATCH_SIZE, output_size).
         It may not be initialized, bias is always copied
         to the output first.
-        Output values must have type float32.
+        Output values must have type half (FP16).
 */
 void feature_transformer_slice_forward(
     const int32_t* const feature_indices,
-    const float*   const feature_values,
-    const float*   const weight,
-    const float*   const bias,
-          float*   const output
+    const half*    const feature_values,
+    const half*    const weight,
+    const half*    const bias,
+          half*    const output
 ) {{
     __shared__
-          float          shared_output[{output_size}];
+          half2          shared_output[{output_size_half2}];
 
     const uint32_t       block_idx           = blockIdx.x;
     const uint32_t       slice_offset        = threadIdx.x * {output_thread_slice_size};
 
-          float*   const output_slice        = output + block_idx * {output_size} + slice_offset;
-    const float*   const bias_slice          = bias                               + slice_offset;
-          float*         shared_output_slice = shared_output                      + slice_offset;
+          half2*   const output_slice        = ((half2*)output) + block_idx * {output_size_half2} + slice_offset;
+    const half2*   const bias_slice          = ((const half2*)bias)                               + slice_offset;
+          half2*         shared_output_slice = shared_output                                       + slice_offset;
 
     const int32_t* const feature_index_row   = feature_indices + block_idx * {max_active_features};
-    const float*   const feature_value_row   = feature_values  + block_idx * {max_active_features};
+    const half*    const feature_value_row   = feature_values  + block_idx * {max_active_features};
 
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
@@ -125,14 +131,16 @@ void feature_transformer_slice_forward(
     for (uint32_t k = 0; k < {max_active_features}; ++k)
     {{
         const int32_t feature_index = feature_index_row[k];
-        const float   feature_value = feature_value_row[k];
+        const half    feature_value = feature_value_row[k];
         if (feature_index != -1)
         {{
-            const float* const weight_slice = weight + feature_index * {output_size} + slice_offset;
+            const half2* const weight_slice = ((const half2*)weight) + feature_index * {output_size_half2} + slice_offset;
+            const half2 feature_value2 = __half2half2(feature_value);
+
             #pragma unroll
             for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
             {{
-                shared_output_slice[s] += weight_slice[s] * feature_value;
+                shared_output_slice[s] = __hadd2(shared_output_slice[s], __hmul2(weight_slice[s], feature_value2));
             }}
         }} else break;
     }}
@@ -147,13 +155,14 @@ void feature_transformer_slice_forward(
 '''.format(
                 max_active_features=max_active_features,
                 output_thread_slice_size=output_thread_slice_size,
-                output_size=output_size),
+                output_size_half2=output_size // 2),
             'feature_transformer_slice_forward')
         kernel.compile()
         _feature_transformer_slice_forward_kernel_cache[key] = _kernel_with_threads(kernel, (num_threads,))
     return _feature_transformer_slice_forward_kernel_cache[key]
 
 _feature_transformer_slice_backward_kernel_cache = dict()
+@torch.compiler.disable(recursive=False)
 def make_feature_transformer_slice_backward_kernel(max_active_features, output_size):
     ''''
         @param: max_active_features
@@ -164,14 +173,18 @@ def make_feature_transformer_slice_backward_kernel(max_active_features, output_s
 
         @param: output_size
             The number of outputs. Must match the shape of weights
-            and biases.
+            and biases. Must be even for half2 operations.
             This value is of type uint32.
     '''
+    assert output_size % 2 == 0, "output_size must be even for half2 operations"
+
     num_threads = _get_num_threads_for_backward(output_size)
-    output_thread_slice_size = output_size // num_threads
+    output_thread_slice_size = (output_size // 2) // num_threads  # half2 elements per thread
     key = (max_active_features, output_size, num_threads)
+
     if key not in _feature_transformer_slice_backward_kernel_cache:
         kernel = cp.RawKernel(r'''
+#include <cuda_fp16.h>
 
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -181,7 +194,8 @@ extern "C" __global__
     @assumptions:
         The blocks must have dimensionality (BATCH_SIZE,)
         The threads must have dimensionality (N,), where
-        N * output_thread_slice_size == output_size.
+        N * output_thread_slice_size * 2 == output_size.
+        output_size must be even.
 
     @param: feature_indices
         A matrix of shape (BATCH_SIZE, max_active_features)
@@ -199,43 +213,43 @@ extern "C" __global__
         A matrix of shape (BATCH_SIZE, max_active_features)
         containing the values (arity) of the corresponding
         feature index in feature_indices.
-        The type for the feature value (arity) is float32.
+        The type for the feature value (arity) is half (FP16).
 
     @param: weight_grad
         The weight gradient matrix of shape (NUM_INPUTS, output_size).
         The gradient is accumulated, i.e. it must be zero initialized
         on the first call.
-        Weights must be of type float32.
+        Weights must be of type half (FP16).
 
     @param: bias_grad
         The bias gradient vector of shape (output_size,).
         The gradient is accumulated, i.e. it must be zero initialized
         on the first call.
-        Bias values must be of type float32.
+        Bias values must be of type half (FP16).
 
     @param: output_grad
         An output gradient matrix of shape (BATCH_SIZE, output_size).
-        Output values must have type float32.
+        Output values must have type half (FP16).
 */
 void feature_transformer_slice_backward(
     const int32_t* const feature_indices,
-    const float*   const feature_values,
-          float*   const weight_grad,
-          float*   const bias_grad,
-    const float*   const output_grad
+    const half*    const feature_values,
+          half*    const weight_grad,
+          half*    const bias_grad,
+    const half*    const output_grad
 ) {{
     __shared__
-          float          shared_output_grad[{output_size}];
+          half2          shared_output_grad[{output_size_half2}];
 
     const uint32_t       block_idx                = blockIdx.x;
     const uint32_t       slice_offset             = threadIdx.x * {output_thread_slice_size};
 
-    const float*   const output_grad_slice        = output_grad + block_idx * {output_size} + slice_offset;
-          float*   const bias_grad_slice          = bias_grad                               + slice_offset;
-          float*         shared_output_grad_slice = shared_output_grad                      + slice_offset;
+    const half2*   const output_grad_slice        = ((const half2*)output_grad) + block_idx * {output_size_half2} + slice_offset;
+          half2*   const bias_grad_slice          = ((half2*)bias_grad)                                          + slice_offset;
+          half2*         shared_output_grad_slice = shared_output_grad                                           + slice_offset;
 
     const int32_t* const feature_index_row        = feature_indices + block_idx * {max_active_features};
-    const float*   const feature_value_row        = feature_values  + block_idx * {max_active_features};
+    const half*    const feature_value_row        = feature_values  + block_idx * {max_active_features};
 
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
@@ -243,30 +257,51 @@ void feature_transformer_slice_backward(
         shared_output_grad_slice[s] = output_grad_slice[s];
     }}
 
+    // Accumulate bias gradients
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        const float sog = shared_output_grad_slice[s];
-        if (sog != 0.0f)
+        const half2 sog = shared_output_grad_slice[s];
+
+        const half sog_x = __low2half(sog);
+        const half sog_y = __high2half(sog);
+        
+        if (!__heq(sog_x, __float2half(0.0f)))
         {{
-            atomicAdd(&bias_grad_slice[s], sog);
+            atomicAdd((half*)&bias_grad_slice[s], sog_x);
+        }}
+        if (!__heq(sog_y, __float2half(0.0f)))
+        {{
+            atomicAdd(((half*)&bias_grad_slice[s]) + 1, sog_y);
         }}
     }}
 
     for (uint32_t k = 0; k < {max_active_features}; ++k)
     {{
         const int32_t feature_index = feature_index_row[k];
-        const float   feature_value = feature_value_row[k];
+        const half    feature_value = feature_value_row[k];
         if (feature_index != -1)
         {{
-            float* const weight_grad_slice = weight_grad + feature_index * {output_size} + slice_offset;
+            half2* const weight_grad_slice = ((half2*)weight_grad) + feature_index * {output_size_half2} + slice_offset;
+            const half2 feature_value2 = __half2half2(feature_value);
+
             #pragma unroll
             for (int s = 0; s < {output_thread_slice_size}; ++s)
             {{
-                const float sog = shared_output_grad_slice[s];
-                if (sog != 0.0f)
+                const half2 sog = shared_output_grad_slice[s];
+                const half2 grad_contrib = __hmul2(sog, feature_value2);
+                
+                // Check if either component is non-zero before atomic operation
+                const half grad_x = __low2half(grad_contrib);
+                const half grad_y = __high2half(grad_contrib);
+
+                if (!__heq(grad_x, __float2half(0.0f)))
                 {{
-                    atomicAdd(&weight_grad_slice[s], sog * feature_value);
+                    atomicAdd((half*)&weight_grad_slice[s], grad_x);
+                }}
+                if (!__heq(grad_y, __float2half(0.0f)))
+                {{
+                    atomicAdd(((half*)&weight_grad_slice[s]) + 1, grad_y);
                 }}
             }}
         }} else break;
@@ -276,7 +311,7 @@ void feature_transformer_slice_backward(
 '''.format(
                 max_active_features=max_active_features,
                 output_thread_slice_size=output_thread_slice_size,
-                output_size=output_size),
+                output_size_half2=output_size // 2),
             'feature_transformer_slice_backward')
         kernel.compile()
         _feature_transformer_slice_backward_kernel_cache[key] = _kernel_with_threads(kernel, (num_threads,))
@@ -293,13 +328,13 @@ class FeatureTransformerSliceFunction(autograd.Function):
         assert feature_indices.shape[0] == feature_values.shape[0]
         assert feature_indices.shape[1] == feature_values.shape[1]
         assert feature_indices.dtype == torch.int32
-        assert feature_values.dtype == torch.float32
+        assert feature_values.dtype == torch.float16
 
         assert len(weight.shape) == 2
-        assert weight.dtype == torch.float32
+        assert weight.dtype == torch.float16
 
         assert len(bias.shape) == 1
-        assert bias.dtype == torch.float32
+        assert bias.dtype == torch.float16
 
         assert feature_indices.is_cuda
         assert feature_values.is_cuda
@@ -320,7 +355,9 @@ class FeatureTransformerSliceFunction(autograd.Function):
         max_active_features = feature_indices.shape[1]
         output_size = weight.shape[1]
 
-        output = torch.empty(batch_size, output_size, dtype=torch.float32, device=device, requires_grad=True)
+        assert output_size % 2 == 0, f"output_size ({output_size}) must be even for half2 operations"
+
+        output = torch.empty(batch_size, output_size, dtype=torch.float16, device=device, requires_grad=True)
 
         kernel = make_feature_transformer_slice_forward_kernel(max_active_features, output_size)
         kernel(
@@ -350,8 +387,8 @@ class FeatureTransformerSliceFunction(autograd.Function):
         max_active_features = feature_indices.shape[1]
         output_size = weight.shape[1]
 
-        weight_grad = torch.zeros(weight.shape[0], weight.shape[1], dtype=torch.float32, device=device)
-        bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
+        weight_grad = torch.zeros(weight.shape[0], weight.shape[1], dtype=torch.float16, device=device)
+        bias_grad = torch.zeros(output_size, dtype=torch.float16, device=device)
 
         kernel = make_feature_transformer_slice_backward_kernel(max_active_features, output_size)
         kernel(
@@ -378,20 +415,20 @@ class DoubleFeatureTransformerSliceFunction(autograd.Function):
         assert feature_indices_0.shape[0] == feature_values_0.shape[0]
         assert feature_indices_0.shape[1] == feature_values_0.shape[1]
         assert feature_indices_0.dtype == torch.int32
-        assert feature_values_0.dtype == torch.float32
+        assert feature_values_0.dtype == torch.float16
 
         assert len(feature_indices_1.shape) == 2
         assert len(feature_values_1.shape) == 2
         assert feature_indices_1.shape[0] == feature_values_1.shape[0]
         assert feature_indices_1.shape[1] == feature_values_1.shape[1]
         assert feature_indices_1.dtype == torch.int32
-        assert feature_values_1.dtype == torch.float32
+        assert feature_values_1.dtype == torch.float16
 
         assert len(weight.shape) == 2
-        assert weight.dtype == torch.float32
+        assert weight.dtype == torch.float16
 
         assert len(bias.shape) == 1
-        assert bias.dtype == torch.float32
+        assert bias.dtype == torch.float16
 
         assert feature_indices_0.is_cuda
         assert feature_values_0.is_cuda
@@ -418,8 +455,10 @@ class DoubleFeatureTransformerSliceFunction(autograd.Function):
         max_active_features = feature_indices_0.shape[1]
         output_size = weight.shape[1]
 
-        output0 = torch.empty(batch_size, output_size, dtype=torch.float32, device=device, requires_grad=True)
-        output1 = torch.empty(batch_size, output_size, dtype=torch.float32, device=device, requires_grad=True)
+        assert output_size % 2 == 0, f"output_size ({output_size}) must be even for half2 operations"
+
+        output0 = torch.empty(batch_size, output_size, dtype=torch.float16, device=device, requires_grad=True)
+        output1 = torch.empty(batch_size, output_size, dtype=torch.float16, device=device, requires_grad=True)
 
         kernel = make_feature_transformer_slice_forward_kernel(max_active_features, output_size)
         kernel(
@@ -461,8 +500,8 @@ class DoubleFeatureTransformerSliceFunction(autograd.Function):
         max_active_features = feature_indices_0.shape[1]
         output_size = weight.shape[1]
 
-        weight_grad = torch.zeros(weight.shape[0], weight.shape[1], dtype=torch.float32, device=device)
-        bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
+        weight_grad = torch.zeros(weight.shape[0], weight.shape[1], dtype=torch.float16, device=device)
+        bias_grad = torch.zeros(output_size, dtype=torch.float16, device=device)
 
         kernel = make_feature_transformer_slice_backward_kernel(max_active_features, output_size)
         kernel(
@@ -495,9 +534,12 @@ class FeatureTransformerSlice(nn.Module):
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
 
+        # Ensure num_outputs is even for half2 operations
+        assert num_outputs % 2 == 0, f"num_outputs ({num_outputs}) must be even for half2 operations"
+
         sigma = math.sqrt(1/num_inputs)
-        self.weight = nn.Parameter(torch.rand(num_inputs, num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
-        self.bias = nn.Parameter(torch.rand(num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
+        self.weight = nn.Parameter(torch.rand(num_inputs, num_outputs, dtype=torch.float16) * (2 * sigma) - sigma)
+        self.bias = nn.Parameter(torch.rand(num_outputs, dtype=torch.float16) * (2 * sigma) - sigma)
 
     def forward(self, feature_indices, feature_values):
         return FeatureTransformerSliceFunction.apply(feature_indices, feature_values, self.weight, self.bias)
@@ -508,9 +550,12 @@ class DoubleFeatureTransformerSlice(nn.Module):
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
 
+        # Ensure num_outputs is even for half2 operations
+        assert num_outputs % 2 == 0, f"num_outputs ({num_outputs}) must be even for half2 operations"
+
         sigma = math.sqrt(1/num_inputs)
-        self.weight = nn.Parameter(torch.rand(num_inputs, num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
-        self.bias = nn.Parameter(torch.rand(num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
+        self.weight = nn.Parameter(torch.rand(num_inputs, num_outputs, dtype=torch.float16) * (2 * sigma) - sigma)
+        self.bias = nn.Parameter(torch.rand(num_outputs, dtype=torch.float16) * (2 * sigma) - sigma)
 
     def forward(self, feature_indices_0, feature_values_0, feature_indices_1, feature_values_1):
         return DoubleFeatureTransformerSliceFunction.apply(feature_indices_0, feature_values_0, feature_indices_1, feature_values_1, self.weight, self.bias)
@@ -524,7 +569,7 @@ if __name__ == '__main__':
         batch_size = feature_indices.shape[0]
         num_inputs = weight.shape[0]
         max_active_features = feature_indices.shape[1]
-        inputs = torch.zeros(batch_size, num_inputs, dtype=torch.float32, device=weight.device)
+        inputs = torch.zeros(batch_size, num_inputs, dtype=torch.float16, device=weight.device)
         for i in range(batch_size):
             for j in range(max_active_features):
                 feature = feature_indices[i, j]
@@ -538,18 +583,18 @@ if __name__ == '__main__':
         INPUT_SIZE = 10
         MAX_ACTIVE_FEATURES = 32
         STRIDE = 128
-        MAX_ERROR = 1e-4
+        MAX_ERROR = 1e-1
 
         torch.manual_seed(0)
-        weight0 = torch.rand(INPUT_SIZE, STRIDE, dtype=torch.float32, requires_grad=True)
-        bias0 = torch.rand(STRIDE, dtype=torch.float32, requires_grad=True)
+        weight0 = torch.rand(INPUT_SIZE, STRIDE, dtype=torch.float16, requires_grad=True)
+        bias0 = torch.rand(STRIDE, dtype=torch.float16, requires_grad=True)
         torch.manual_seed(0)
-        weight1 = torch.rand(INPUT_SIZE, STRIDE, dtype=torch.float32, requires_grad=True)
-        bias1 = torch.rand(STRIDE, dtype=torch.float32, requires_grad=True)
+        weight1 = torch.rand(INPUT_SIZE, STRIDE, dtype=torch.float16, requires_grad=True)
+        bias1 = torch.rand(STRIDE, dtype=torch.float16, requires_grad=True)
         indices0 = (torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES) * INPUT_SIZE).to(dtype=torch.int32)
         indices1 = (torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES) * INPUT_SIZE).to(dtype=torch.int32)
-        values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32)
-        values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32)
+        values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float16)
+        values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float16)
 
         output00 = FeatureTransformerSliceFunctionEmulate(indices0.clone(), values0.clone(), weight0, bias0)
         output01 = FeatureTransformerSliceFunctionEmulate(indices1.clone(), values1.clone(), weight0, bias0)
@@ -569,14 +614,14 @@ if __name__ == '__main__':
         INPUT_SIZE = 40960
         BATCH_SIZE = 8192
         ITERS = 64
-        STRIDE = 264
+        STRIDE = 264  # Must be even for half2
         MAX_ACTIVE_FEATURES = 64
 
         layer = DoubleFeatureTransformerSlice(INPUT_SIZE, STRIDE).cuda()
         indices0 = torch.cat([torch.sort((torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES * 3 // 4) * INPUT_SIZE), dim=1)[0].to(dtype=torch.int32), torch.full((BATCH_SIZE, MAX_ACTIVE_FEATURES // 4), -1, dtype=torch.int32)], dim=1).cuda()
-        values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32).cuda()
+        values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float16).cuda()
         indices1 = torch.cat([torch.sort((torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES * 3 // 4)) * INPUT_SIZE, dim=1)[0].to(dtype=torch.int32), torch.full((BATCH_SIZE, MAX_ACTIVE_FEATURES // 4), -1, dtype=torch.int32)], dim=1).cuda()
-        values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32).cuda()
+        values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float16).cuda()
 
         output0, output1 = layer(indices0, values0, indices1, values1)
 
