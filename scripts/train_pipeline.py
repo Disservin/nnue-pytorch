@@ -51,9 +51,11 @@ def get_cli_args(config: Dict[str, Any]) -> List[str]:
     return args
 
 
-def build_command(script_path: str, config: Dict[str, Any], prev_ckpt: Optional[str] = None) -> List[str]:
+def build_command(script_path: str, feature_set: str, config: Dict[str, Any], prev_ckpt: Optional[str] = None) -> List[str]:
     """Build the command to execute based on the config."""
     cmd: List[str] = [sys.executable, script_path]
+
+    cmd.append(f"--features={feature_set}")
 
     for dataset in validate_datasets(get_datasets(config, "datasets")):
         cmd.append(dataset)
@@ -72,7 +74,7 @@ def build_command(script_path: str, config: Dict[str, Any], prev_ckpt: Optional[
 
     # Add resume-from-model if we have a previous model
     if prev_ckpt and "resume-from-model" not in config:
-        config["resume-from-model"] = prepare_checkpoint_to_pt(prev_ckpt, config.get("features"))
+        config["resume-from-model"] = prepare_checkpoint_to_pt(prev_ckpt, feature_set)
 
     # Convert config to command-line arguments
     cmd.extend(get_cli_args(config))
@@ -265,7 +267,9 @@ def run_training(config_file: str, start_stage: int) -> None:
         sys.exit(1)
 
     script_path: str = config.get("script_path", "train.py")
+    feature_set: str = config.get("features", "HalfKAv2_hm^")
     print(f"Using training script: {script_path}")
+    print(f"Using features: {feature_set}")
 
     stages: Dict[str, Dict[str, Any]] = config["training"]
     if not stages:
@@ -303,7 +307,7 @@ def run_training(config_file: str, start_stage: int) -> None:
         print(f"Starting training stage: {stage_name}")
         print(f"{'=' * 30}")
 
-        cmd: List[str] = build_command(script_path, stage_config, prev_ckpt)
+        cmd: List[str] = build_command(script_path, feature_set, stage_config, prev_ckpt)
         print(f"Executing command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd)
@@ -323,7 +327,7 @@ def run_training(config_file: str, start_stage: int) -> None:
         serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
             Path(prev_ckpt),
-            stage_config.get("features", "HalfKAv2_hm^"),
+            feature_set,
         )
 
     print("\nAll training stages completed successfully.")
