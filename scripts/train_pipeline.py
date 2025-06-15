@@ -49,7 +49,7 @@ def get_cli_args(config) -> List[str]:
             args.append(convert_arg_name(key))
     return args
 
-def build_command(script_path: str, config, previous_model=None):
+def build_command(script_path: str, config, prev_ckpt=None):
     """Build the command to execute based on the config."""
     cmd = [sys.executable, script_path]
 
@@ -68,11 +68,9 @@ def build_command(script_path: str, config, previous_model=None):
 
     del config["validation-data"]  # Remove validation-data from config to avoid conflicts
 
-    # Add resume-from-model if we have a previous model
-    if previous_model and "resume-from-model" not in config:
-        features = config.get("features", None)
-        converted_model = prepare_checkpoint_to_pt(previous_model, features)
-        config["resume-from-model"] = converted_model
+    # Add resume-from-checkpoint if we have a previous model
+    if prev_ckpt and "resume-from-checkpoint" not in config:
+        config["resume-from-checkpoint"] = prev_ckpt
 
     # Convert config to command-line arguments
     cmd.extend(get_cli_args(config))
@@ -276,18 +274,18 @@ def run_training(config_file: str, start_stage: int):
         )
         sys.exit(1)
 
-    previous_model = None
+    prev_ckpt = None
 
     # Verify the configuration
     verify_config(config)
 
     if start_stage > 0:
         previous_stage_name = stage_names[start_stage - 1]
-        previous_model = find_latest_model_checkpoint(stages[previous_stage_name])
+        prev_ckpt = find_latest_model_checkpoint(stages[previous_stage_name])
 
-        if previous_model:
+        if prev_ckpt:
             print(f"Starting from stage {start_stage}: {stage_names[start_stage]}")
-            print(f"Using checkpoint from previous stage: {previous_model}")
+            print(f"Using checkpoint from previous stage: {prev_ckpt}")
         else:
             print(f"Starting from stage {start_stage} without a checkpoint")
 
@@ -299,7 +297,7 @@ def run_training(config_file: str, start_stage: int):
         print(f"Starting training stage: {stage_name}")
         print(f"{'=' * 30}")
 
-        cmd = build_command(script_path, stage_config, previous_model)
+        cmd = build_command(script_path, stage_config, prev_ckpt)
         print(f"Executing command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd)
@@ -309,16 +307,16 @@ def run_training(config_file: str, start_stage: int):
             )
             sys.exit(result.returncode)
 
-        previous_model = find_latest_model_checkpoint(stage_config)
-        if previous_model:
-            print(f"Found checkpoint for next stage: {previous_model}")
+        prev_ckpt = find_latest_model_checkpoint(stage_config)
+        if prev_ckpt:
+            print(f"Found checkpoint for next stage: {prev_ckpt}")
         else:
             print("No checkpoint found for next stage")
             sys.exit(1)
 
         serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
-            Path(previous_model),
+            Path(prev_ckpt),
             stage_config.get("features", "HalfKAv2_hm^"),
         )
 
