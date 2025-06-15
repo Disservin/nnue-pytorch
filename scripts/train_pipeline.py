@@ -70,9 +70,9 @@ def build_command(script_path: str, config: Dict[str, Any], prev_ckpt: Optional[
 
     del config["validation-data"]  # Remove validation-data from config to avoid conflicts
 
-    # Add resume-from-checkpoint if we have a previous model
-    if prev_ckpt and "resume-from-checkpoint" not in config:
-        config["resume-from-checkpoint"] = prev_ckpt
+    # Add resume-from-model if we have a previous model
+    if prev_ckpt and "resume-from-model" not in config:
+        config["resume-from-model"] = prepare_checkpoint_to_pt(prev_ckpt, config.get("features"))
 
     # Convert config to command-line arguments
     cmd.extend(get_cli_args(config))
