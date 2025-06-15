@@ -1,7 +1,6 @@
 from feature_block import *
 from feature_set import *
 
-import argparse
 
 """
 Each module that defines feature blocks must be imported here and

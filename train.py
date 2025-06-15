@@ -9,7 +9,7 @@ import torch
 from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import TQDMProgressBar
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 import warnings
 
