@@ -35,6 +35,19 @@ def validate_datasets(datasets) -> List[str]:
             sys.exit(1)
     return datasets
 
+def get_cli_args(config) -> List[str]:
+    """Convert config to command-line arguments."""
+    args = []
+    for key, value in config.items():
+        if key == "lambda":  # Special case for lambda (reserved keyword)
+            args.append("--lambda")
+            args.append(str(value))
+        elif value is not None:
+            args.append(convert_arg_name(key))
+            args.append(str(value))
+        else:
+            args.append(convert_arg_name(key))
+    return args
 
 def build_command(script_path: str, config, previous_model=None):
     """Build the command to execute based on the config."""
@@ -45,6 +58,16 @@ def build_command(script_path: str, config, previous_model=None):
 
     del config["datasets"]  # Remove datasets from config to avoid conflicts
 
+    cmd_val_datasets = ""
+    for val_dataset in validate_datasets(get_datasets(config, "validation-data")):
+        cmd_val_datasets +=val_dataset + " "
+    
+    if cmd_val_datasets:
+        cmd.append("--validation-data")
+        cmd.append(cmd_val_datasets.strip())
+
+    del config["validation-data"]  # Remove validation-data from config to avoid conflicts
+
     # Add resume-from-model if we have a previous model
     if previous_model and "resume-from-model" not in config:
         features = config.get("features", None)
@@ -52,19 +75,7 @@ def build_command(script_path: str, config, previous_model=None):
         config["resume-from-model"] = converted_model
 
     # Convert config to command-line arguments
-    for key, value in config.items():
-        if key == "lambda":  # Special case for lambda (reserved keyword)
-            cmd.append("--lambda")
-            cmd.append(str(value))
-        # elif value is True:
-        #     cmd.append(convert_arg_name(key))
-        # elif value is False:
-        #     cmd.append(f"--no-{key.replace('_', '-')}")
-        elif value is not None:
-            cmd.append(convert_arg_name(key))
-            cmd.append(str(value))
-        else:
-            cmd.append(convert_arg_name(key))
+    cmd.extend(get_cli_args(config))
 
     return cmd
 
@@ -194,6 +205,51 @@ def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path, features: str):
 
     print(f"Serialized NNUE model saved to {new_output_file}")
 
+def verify_config(config: dict):
+    # validate options, check that all other options are available in train.py --help
+    script_path = config.get("script_path", "train.py")
+    cmd = [sys.executable, script_path, "--help"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: Failed to run {script_path} --help")
+        sys.exit(result.returncode)
+
+    # loop over all stages and validate their options
+    stages = config.get("training", {})
+    for stage_name, stage_config in stages.items():
+        print(f"Validating stage: {stage_name}")
+        cmd = [sys.executable, script_path]
+        
+        # Check options exist in the help output
+        help_output = result.stdout
+
+        cmd = []
+
+        for key, _ in stage_config.items():
+            # validate datasets
+            if "datasets" == key:
+                datasets = get_datasets(stage_config, "datasets")
+                if not datasets:
+                    print("Error: No datasets specified in the configuration")
+                    sys.exit(1)
+                validate_datasets(datasets)
+                continue
+            if "validation-data" == key:
+                val_datasets = get_datasets(stage_config, "validation-data")
+                if not val_datasets:
+                    print("Error: No validation datasets specified in the configuration")
+                    sys.exit(1)
+                validate_datasets(val_datasets)
+                continue
+            if key == "lambda":
+                cmd.append("--lambda")
+            else:
+                cmd.append(convert_arg_name(key))
+
+        for arg in cmd:
+            if not arg in help_output:
+                print(f"Error: Option '{arg}' not found in {script_path} --help output")
+                sys.exit(1)
 
 def run_training(config_file: str, start_stage: int):
     """Run training based on the YAML configuration."""
@@ -221,6 +277,9 @@ def run_training(config_file: str, start_stage: int):
         sys.exit(1)
 
     previous_model = None
+
+    # Verify the configuration
+    verify_config(config)
 
     if start_stage > 0:
         previous_stage_name = stage_names[start_stage - 1]
