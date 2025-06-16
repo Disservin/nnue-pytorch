@@ -10,6 +10,21 @@ import hashlib
 import shutil
 from typing import List, Dict, Any, Optional, Union
 import re
+from dataclasses import dataclass
+
+train_help_output = ""
+
+# CONFIG = {
+#     "script_path": "train.py",
+#     "l1": 128,
+# }
+
+@dataclass
+class Config:
+    feature_set: str = "HalfKAv2_hm^"
+    l1: int = 128
+
+network_config = Config()
 
 
 def convert_arg_name(name: str) -> str:
@@ -36,10 +51,12 @@ def validate_datasets(datasets: List[str]) -> List[str]:
     return datasets
 
 
-def get_cli_args(config: Dict[str, Any]) -> List[str]:
+def get_cli_args(config: Dict[str, Any], check: Optional[callable] = None) -> List[str]:
     """Convert config to command-line arguments."""
     args: List[str] = []
     for key, value in config.items():
+        if check and check(key, value) == False:
+            continue
         if key == "lambda":  # Special case for lambda (reserved keyword)
             args.append("--lambda")
             args.append(str(value))
@@ -51,11 +68,11 @@ def get_cli_args(config: Dict[str, Any]) -> List[str]:
     return args
 
 
-def build_command(script_path: str, feature_set: str, config: Dict[str, Any], prev_ckpt: Optional[str] = None) -> List[str]:
+def get_trainer_args(config: Dict[str, Any], prev_ckpt: Optional[str] = None
+) -> List[str]:
     """Build the command to execute based on the config."""
-    cmd: List[str] = [sys.executable, script_path]
-
-    cmd.append(f"--features={feature_set}")
+    cmd: List[str] = []
+    cmd.append(f"--features={network_config.feature_set}")
 
     for dataset in validate_datasets(get_datasets(config, "datasets")):
         cmd.append(dataset)
@@ -65,16 +82,18 @@ def build_command(script_path: str, feature_set: str, config: Dict[str, Any], pr
     cmd_val_datasets = ""
     for val_dataset in validate_datasets(get_datasets(config, "validation-data")):
         cmd_val_datasets += val_dataset + " "
-    
+
     if cmd_val_datasets:
         cmd.append("--validation-data")
         cmd.append(cmd_val_datasets.strip())
 
-    del config["validation-data"]  # Remove validation-data from config to avoid conflicts
+    del config[
+        "validation-data"
+    ]  # Remove validation-data from config to avoid conflicts
 
     # Add resume-from-model if we have a previous model
     if prev_ckpt and "resume-from-model" not in config:
-        config["resume-from-model"] = prepare_checkpoint_to_pt(prev_ckpt, feature_set)
+        config["resume-from-model"] = prepare_checkpoint_to_pt(prev_ckpt)
 
     # Convert config to command-line arguments
     cmd.extend(get_cli_args(config))
@@ -103,11 +122,8 @@ def find_latest_checkpoint(directory: Path) -> Optional[Path]:
     return checkpoints[-1]
 
 
-def prepare_checkpoint_to_pt(checkpoint_path: str, features: Optional[str]) -> str:
+def prepare_checkpoint_to_pt(checkpoint_path: str) -> str:
     _, filename = tempfile.mkstemp(suffix=".pt")
-
-    if features is None:
-        features = "HalfKAv2_hm^"
 
     subprocess.run(
         [
@@ -115,21 +131,26 @@ def prepare_checkpoint_to_pt(checkpoint_path: str, features: Optional[str]) -> s
             "serialize.py",
             checkpoint_path,
             filename,
-            f"--features={features}",
+            f"--features={network_config.feature_set}",
+            f"--l1={network_config.l1}",
         ],
     )
 
     return filename
 
 
-def get_output_dir(config: Dict[str, Any]) -> Path:
+def get_output_dir(stage_name: str, config: Dict[str, Any]) -> Path:
     """Determine the output directory from config or default."""
     if "default_root_dir" in config:
-        return Path(config["default_root_dir"]) / Path("lightning_logs")
-    return Path("lightning_logs")
+        return (
+            Path(config["default_root_dir"]) / Path(stage_name) / Path("lightning_logs")
+        )
+    return Path("logs") / Path("lightning_logs")
 
 
-def find_latest_model_checkpoint(stage_config: Dict[str, Any]) -> Optional[str]:
+def find_latest_model_checkpoint(
+    stage_name: str, stage_config: Dict[str, Any]
+) -> Optional[str]:
     """Find the latest model checkpoint for a given stage configuration."""
 
     def get_version_number(dir_name: str) -> int:
@@ -137,7 +158,7 @@ def find_latest_model_checkpoint(stage_config: Dict[str, Any]) -> Optional[str]:
         match = re.search(r"version_(\d+)", dir_name)
         return int(match.group(1)) if match else -1
 
-    output_dir = get_output_dir(stage_config)
+    output_dir = get_output_dir(stage_name, stage_config)
 
     version_dirs: List[Path] = [
         d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("version_")
@@ -181,7 +202,7 @@ def get_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path, features: str) -> None:
+def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path) -> None:
     """Serialize a checkpoint to NNUE format."""
     if not net_dir.exists():
         net_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +217,8 @@ def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path, features: str) -> Non
         "serialize.py",
         str(cpkt_path),
         str(output_file),
-        f"--features={features}",
+        f"--features={network_config.feature_set}",
+        f"--l1={network_config.l1}",
     ]
 
     print(f"Serializing checkpoint to NNUE format: {' '.join(cmd)}")
@@ -211,8 +233,14 @@ def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path, features: str) -> Non
     print(f"Serialized NNUE model saved to {new_output_file}")
 
 
+def option_exists_in_help(option: str) -> bool:
+    """Check if a command-line option exists in the help output."""
+    return option in train_help_output
+
+
 def verify_config(config: Dict[str, Any]) -> None:
     """Validate options, check that all other options are available in train.py --help"""
+
     script_path: str = config.get("script_path", "train.py")
     cmd: List[str] = [sys.executable, script_path, "--help"]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -224,9 +252,11 @@ def verify_config(config: Dict[str, Any]) -> None:
     stages: Dict[str, Dict[str, Any]] = config.get("training", {})
     for stage_name, stage_config in stages.items():
         print(f"Validating stage: {stage_name}")
-        
+
+        global train_help_output
+
         # Check options exist in the help output
-        help_output: str = result.stdout
+        train_help_output = result.stdout
 
         cmd_args: List[str] = []
 
@@ -242,7 +272,9 @@ def verify_config(config: Dict[str, Any]) -> None:
             if "validation-data" == key:
                 val_datasets = get_datasets(stage_config, "validation-data")
                 if not val_datasets:
-                    print("Error: No validation datasets specified in the configuration")
+                    print(
+                        "Error: No validation datasets specified in the configuration"
+                    )
                     sys.exit(1)
                 validate_datasets(val_datasets)
                 continue
@@ -252,7 +284,7 @@ def verify_config(config: Dict[str, Any]) -> None:
                 cmd_args.append(convert_arg_name(key))
 
         for arg in cmd_args:
-            if arg not in help_output:
+            if not option_exists_in_help(arg):
                 print(f"Error: Option '{arg}' not found in {script_path} --help output")
                 sys.exit(1)
 
@@ -267,9 +299,9 @@ def run_training(config_file: str, start_stage: int) -> None:
         sys.exit(1)
 
     script_path: str = config.get("script_path", "train.py")
-    feature_set: str = config.get("features", "HalfKAv2_hm^")
-    print(f"Using training script: {script_path}")
-    print(f"Using features: {feature_set}")
+
+    config["feature_set"] = config.get("features", "HalfKAv2_hm^")
+    config["l1"] = config.get("l1", 3072)
 
     stages: Dict[str, Dict[str, Any]] = config["training"]
     if not stages:
@@ -291,7 +323,9 @@ def run_training(config_file: str, start_stage: int) -> None:
 
     if start_stage > 0:
         previous_stage_name: str = stage_names[start_stage - 1]
-        prev_ckpt = find_latest_model_checkpoint(stages[previous_stage_name])
+        prev_ckpt = find_latest_model_checkpoint(
+            previous_stage_name, stages[previous_stage_name]
+        )
 
         if prev_ckpt:
             print(f"Starting from stage {start_stage}: {stage_names[start_stage]}")
@@ -307,7 +341,19 @@ def run_training(config_file: str, start_stage: int) -> None:
         print(f"Starting training stage: {stage_name}")
         print(f"{'=' * 30}")
 
-        cmd: List[str] = build_command(script_path, feature_set, stage_config, prev_ckpt)
+        cmd: List[str] = [sys.executable, script_path]
+        cmd.extend(get_trainer_args(stage_config, prev_ckpt))
+
+        # add all options from the root level which exist as an option
+        cmd.extend(
+            [
+                arg
+                for arg in get_cli_args(
+                    config, lambda k, v: option_exists_in_help(convert_arg_name(k))
+                )
+            ]
+        )
+
         print(f"Executing command: {' '.join(cmd)}")
 
         result = subprocess.run(cmd)
@@ -317,7 +363,7 @@ def run_training(config_file: str, start_stage: int) -> None:
             )
             sys.exit(result.returncode)
 
-        prev_ckpt = find_latest_model_checkpoint(stage_config)
+        prev_ckpt = find_latest_model_checkpoint(stage_name, stage_config)
         if prev_ckpt:
             print(f"Found checkpoint for next stage: {prev_ckpt}")
         else:
@@ -327,7 +373,6 @@ def run_training(config_file: str, start_stage: int) -> None:
         serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
             Path(prev_ckpt),
-            feature_set,
         )
 
     print("\nAll training stages completed successfully.")
