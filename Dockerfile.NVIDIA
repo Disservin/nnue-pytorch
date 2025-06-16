@@ -14,5 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN chmod +x setup_script.sh
 
+EXPOSE 6006
+
 ENTRYPOINT [ "/workspace/nnue-pytorch/setup_script.sh" ]
 CMD ["/bin/bash"]
