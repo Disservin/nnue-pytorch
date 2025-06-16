@@ -42,4 +42,5 @@ docker run -it \
   --ipc=host \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
+  -p 127.0.0.1:6006:6006 \
   $IMAGE_TAG
