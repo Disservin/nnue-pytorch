@@ -14,15 +14,10 @@ from dataclasses import dataclass
 
 train_help_output = ""
 
-# CONFIG = {
-#     "script_path": "train.py",
-#     "l1": 128,
-# }
-
 @dataclass
 class Config:
     feature_set: str = "HalfKAv2_hm^"
-    l1: int = 128
+    l1: int = 3072
 
 network_config = Config()
 
@@ -300,8 +295,8 @@ def run_training(config_file: str, start_stage: int) -> None:
 
     script_path: str = config.get("script_path", "train.py")
 
-    config["feature_set"] = config.get("features", "HalfKAv2_hm^")
-    config["l1"] = config.get("l1", 3072)
+    network_config.feature_set = config.get("feature_set", "HalfKAv2_hm^")
+    network_config.l1 = config.get("l1", 3072)
 
     stages: Dict[str, Dict[str, Any]] = config["training"]
     if not stages:
