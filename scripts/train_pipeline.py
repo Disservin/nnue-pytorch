@@ -8,16 +8,18 @@ from pathlib import Path
 import tempfile
 import hashlib
 import shutil
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Callable
 import re
 from dataclasses import dataclass
 
 train_help_output = ""
 
+
 @dataclass
 class Config:
     feature_set: str = "HalfKAv2_hm^"
     l1: int = 3072
+
 
 network_config = Config()
 
@@ -46,11 +48,11 @@ def validate_datasets(datasets: List[str]) -> List[str]:
     return datasets
 
 
-def get_cli_args(config: Dict[str, Any], check: Optional[callable] = None) -> List[str]:
+def get_cli_args(config: Dict[str, Any], check: Optional[Callable] = None) -> List[str]:
     """Convert config to command-line arguments."""
     args: List[str] = []
     for key, value in config.items():
-        if check and check(key, value) == False:
+        if check and check(key, value) is False:
             continue
         if key == "lambda":  # Special case for lambda (reserved keyword)
             args.append("--lambda")
@@ -63,7 +65,8 @@ def get_cli_args(config: Dict[str, Any], check: Optional[callable] = None) -> Li
     return args
 
 
-def get_trainer_args(config: Dict[str, Any], prev_ckpt: Optional[str] = None
+def get_trainer_args(
+    config: Dict[str, Any], prev_ckpt: Optional[str] = None
 ) -> List[str]:
     """Build the command to execute based on the config."""
     cmd: List[str] = []
@@ -197,24 +200,26 @@ def get_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def serialize_cpkt_to_nnue(net_dir: Path, cpkt_path: Path) -> None:
+def serialize_cpkt_to_nnue(net_dir: Path, ckpt: Path, *args) -> None:
     """Serialize a checkpoint to NNUE format."""
     if not net_dir.exists():
         net_dir.mkdir(parents=True, exist_ok=True)
 
-    if not cpkt_path.exists():
-        print(f"Error: Checkpoint file {cpkt_path} does not exist")
+    if not ckpt.exists():
+        print(f"Error: Checkpoint file {ckpt} does not exist")
         sys.exit(1)
 
     output_file = Path(tempfile.mktemp(suffix=".nnue"))
     cmd: List[str] = [
         sys.executable,
         "serialize.py",
-        str(cpkt_path),
+        str(ckpt),
         str(output_file),
         f"--features={network_config.feature_set}",
         f"--l1={network_config.l1}",
     ]
+
+    cmd.extend(args)
 
     print(f"Serializing checkpoint to NNUE format: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
@@ -368,6 +373,19 @@ def run_training(config_file: str, start_stage: int) -> None:
         serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
             Path(prev_ckpt),
+        )
+
+    if prev_ckpt is not None and config.get("optimize-data"):
+        print(f"Final checkpoint after all stages: {prev_ckpt}")
+        gpus: str = config.get("gpus", "0,")
+        devices = [int(x) for x in gpus.rstrip(",").split(",") if x]
+        serialize_cpkt_to_nnue(
+            Path(config.get("network_dir", "networks")),
+            Path(prev_ckpt),
+            "--ft_optimize",
+            f"--ft_optimize_data={config.get('optimize-data')}",
+            "--ft_optimize_count=1000000",
+            f"--device={devices[0]}",
         )
 
     print("\nAll training stages completed successfully.")
