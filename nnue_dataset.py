@@ -6,7 +6,6 @@ import sys
 import glob
 from torch.utils.data import Dataset
 from dataloader_skip_config import DataloaderSkipConfig, CDataloaderSkipConfig
-from typing import Dict, Optional
 
 local_dllpath = [
     n
@@ -38,71 +37,75 @@ class SparseBatch(ctypes.Structure):
         ("layer_stack_indices", ctypes.POINTER(ctypes.c_int)),
     ]
 
-    _pinned_buffers = None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._pinned_buffers: Optional[Dict[str, torch.Tensor]] = None
-        self._last_shape = None
-
     def get_tensors(self, device):
-        current_shape = (self.size, self.max_active_features)
-
-        if self._pinned_buffers is None or self._last_shape != current_shape:
-            self._init_pinned_buffers(current_shape)
-            self._last_shape = current_shape
-
-        buffers = self._pinned_buffers
-
-        buffers["white_values"].copy_(
+        white_values = (
             torch.from_numpy(
-                np.ctypeslib.as_array(self.white_values, shape=current_shape)
+                np.ctypeslib.as_array(
+                    self.white_values, shape=(self.size, self.max_active_features)
+                )
             )
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["black_values"].copy_(
+        black_values = (
             torch.from_numpy(
-                np.ctypeslib.as_array(self.black_values, shape=current_shape)
+                np.ctypeslib.as_array(
+                    self.black_values, shape=(self.size, self.max_active_features)
+                )
             )
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["white_indices"].copy_(
-            torch.from_numpy(np.ctypeslib.as_array(self.white, shape=current_shape))
+        white_indices = (
+            torch.from_numpy(
+                np.ctypeslib.as_array(
+                    self.white, shape=(self.size, self.max_active_features)
+                )
+            )
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["black_indices"].copy_(
-            torch.from_numpy(np.ctypeslib.as_array(self.black, shape=current_shape))
+        black_indices = (
+            torch.from_numpy(
+                np.ctypeslib.as_array(
+                    self.black, shape=(self.size, self.max_active_features)
+                )
+            )
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["us"].copy_(
+        us = (
             torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1)))
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["outcome"].copy_(
+        them = 1.0 - us
+        outcome = (
             torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1)))
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["score"].copy_(
+        score = (
             torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1)))
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["psqt_indices"].copy_(
+        psqt_indices = (
             torch.from_numpy(
                 np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))
             )
+            .long()
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-        buffers["layer_stack_indices"].copy_(
+        layer_stack_indices = (
             torch.from_numpy(
                 np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))
             )
+            .long()
+            .pin_memory()
+            .to(device=device, non_blocking=True)
         )
-
-        white_values = buffers["white_values"].to(device=device, non_blocking=True)
-        black_values = buffers["black_values"].to(device=device, non_blocking=True)
-        white_indices = buffers["white_indices"].to(device=device, non_blocking=True)
-        black_indices = buffers["black_indices"].to(device=device, non_blocking=True)
-        us = buffers["us"].to(device=device, non_blocking=True)
-        them = 1.0 - us
-        outcome = buffers["outcome"].to(device=device, non_blocking=True)
-        score = buffers["score"].to(device=device, non_blocking=True)
-        psqt_indices = buffers["psqt_indices"].to(device=device, non_blocking=True)
-        layer_stack_indices = buffers["layer_stack_indices"].to(
-            device=device, non_blocking=True
-        )
-
         return (
             us,
             them,
@@ -115,30 +118,6 @@ class SparseBatch(ctypes.Structure):
             psqt_indices,
             layer_stack_indices,
         )
-
-    def _init_pinned_buffers(self, shape):
-        size, max_active_features = shape
-        self._pinned_buffers = {
-            "white_values": torch.empty(
-                (size, max_active_features), dtype=torch.float32, pin_memory=True
-            ),
-            "black_values": torch.empty(
-                (size, max_active_features), dtype=torch.float32, pin_memory=True
-            ),
-            "white_indices": torch.empty(
-                (size, max_active_features), dtype=torch.int32, pin_memory=True
-            ),
-            "black_indices": torch.empty(
-                (size, max_active_features), dtype=torch.int32, pin_memory=True
-            ),
-            "us": torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
-            "outcome": torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
-            "score": torch.empty((size, 1), dtype=torch.float32, pin_memory=True),
-            "psqt_indices": torch.empty((size,), dtype=torch.int64, pin_memory=True),
-            "layer_stack_indices": torch.empty(
-                (size,), dtype=torch.int64, pin_memory=True
-            ),
-        }
 
 
 SparseBatchPtr = ctypes.POINTER(SparseBatch)
