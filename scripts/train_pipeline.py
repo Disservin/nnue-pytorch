@@ -200,7 +200,7 @@ def get_sha256(file_path: Path) -> str:
     return sha256_hash.hexdigest()
 
 
-def serialize_cpkt_to_nnue(net_dir: Path, ckpt: Path, *args) -> None:
+def serialize_cpkt_to_nnue(net_dir: Path, ckpt: Path, *args) -> Path:
     """Serialize a checkpoint to NNUE format."""
     if not net_dir.exists():
         net_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +231,8 @@ def serialize_cpkt_to_nnue(net_dir: Path, ckpt: Path, *args) -> None:
     shutil.move(str(output_file), str(new_output_file))
 
     print(f"Serialized NNUE model saved to {new_output_file}")
+
+    return new_output_file
 
 
 def option_exists_in_help(option: str) -> bool:
@@ -333,6 +335,7 @@ def run_training(config_file: str, start_stage: int) -> None:
         else:
             print(f"Starting from stage {start_stage} without a checkpoint")
 
+    nnue_file: Optional[Path] = None
     # Run each stage in sequence
     for i, stage_name in enumerate(stage_names[start_stage:], start=start_stage):
         stage_config: Dict[str, Any] = stages[stage_name]
@@ -370,18 +373,18 @@ def run_training(config_file: str, start_stage: int) -> None:
             print("No checkpoint found for next stage")
             sys.exit(1)
 
-        serialize_cpkt_to_nnue(
+        nnue_file = serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
             Path(prev_ckpt),
         )
 
-    if prev_ckpt is not None and config.get("optimize-data"):
+    if nnue_file is not None and config.get("optimize-data"):
         print(f"Final checkpoint after all stages: {prev_ckpt}")
         gpus: str = config.get("gpus", "0,")
         devices = [int(x) for x in gpus.rstrip(",").split(",") if x]
         serialize_cpkt_to_nnue(
             Path(config.get("network_dir", "networks")),
-            Path(prev_ckpt),
+            nnue_file,
             "--ft_optimize",
             f"--ft_optimize_data={config.get('optimize-data')}",
             "--ft_optimize_count=1000000",
