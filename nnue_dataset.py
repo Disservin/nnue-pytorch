@@ -490,7 +490,7 @@ class FixedNumBatchesDataset(Dataset):
         self._start_prefetching()
 
         try:
-            item = self._prefetch_queue.get(timeout=30.0)  # 30 second timeout
+            item = self._prefetch_queue.get(timeout=300.0)  # 300 second timeout
 
             if item is None:
                 raise StopIteration("End of dataset reached")
