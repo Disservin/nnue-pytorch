@@ -123,7 +123,7 @@ def find_latest_checkpoint(directory: Path) -> Optional[Path]:
 def prepare_checkpoint_to_pt(checkpoint_path: str) -> str:
     _, filename = tempfile.mkstemp(suffix=".pt")
 
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             "serialize.py",
@@ -132,7 +132,14 @@ def prepare_checkpoint_to_pt(checkpoint_path: str) -> str:
             f"--features={network_config.feature_set}",
             f"--l1={network_config.l1}",
         ],
+        capture_output=True,
+        text=True,
     )
+
+    if result.returncode != 0:
+        print(f"Error: Failed to convert checkpoint {checkpoint_path} to PT format")
+        print(result.stderr)
+        sys.exit(result.returncode)
 
     return filename
 
@@ -222,7 +229,12 @@ def serialize_cpkt_to_nnue(net_dir: Path, ckpt: Path, *args) -> Path:
     cmd.extend(args)
 
     print(f"Serializing checkpoint to NNUE format: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error: Failed to serialize checkpoint {ckpt} to NNUE format")
+        print(result.stderr)
+        sys.exit(result.returncode)
 
     sha25 = get_sha256(output_file)
 
