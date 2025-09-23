@@ -6794,6 +6794,41 @@ namespace binpack
         {
             m_file.seekg(0);
         }
+        
+        // Seek to approximately the rank-th portion of the file for DDP
+        void seek_to_rank_position(int rank, int world_size)
+        {
+            if (world_size <= 1) {
+                seek_to_start();
+                return;
+            }
+            
+            // Calculate the approximate position for this rank
+            std::size_t target_position = (m_sizeBytes * rank) / world_size;
+            
+            // Seek to that position
+            m_file.seekg(target_position);
+            
+            // Find the next valid chunk header by searching for "BINP"
+            unsigned char buffer[4];
+            while (m_file.read(reinterpret_cast<char*>(buffer), 4))
+            {
+                if (buffer[0] == 'B' && buffer[1] == 'I' && buffer[2] == 'N' && buffer[3] == 'P')
+                {
+                    // Found a chunk header, seek back to the start of it
+                    m_file.seekg(-4, std::ios_base::cur);
+                    return;
+                }
+                else
+                {
+                    // Move back 3 bytes and try again (sliding window)
+                    m_file.seekg(-3, std::ios_base::cur);
+                }
+            }
+            
+            // If we couldn't find a valid chunk, fall back to start
+            seek_to_start();
+        }
 
         [[nodiscard]] std::vector<unsigned char> readNextChunk()
         {
@@ -7633,6 +7668,15 @@ namespace binpack
 
             m_inputFileDistribution = std::discrete_distribution<>(sizes.begin(), sizes.end());
 
+            // For DDP: seek each file to a different starting position based on rank
+            if (m_world_size > 1)
+            {
+                for (auto& file : m_inputFiles)
+                {
+                    file.seek_to_rank_position(m_rank, m_world_size);
+                }
+            }
+
             m_stopFlag.store(false);
 
             auto worker = [this]()
@@ -7830,34 +7874,7 @@ namespace binpack
             if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
             {
                 auto& prng = rng::get_thread_local_rng();
-                
-                // For DDP: bias file selection towards files assigned to this rank
-                // Each rank gets a different starting point in the file list
-                std::size_t fileId;
-                if (m_world_size > 1)
-                {
-                    // Create a rank-biased file selection
-                    // Rank 0 prefers files 0, world_size, 2*world_size, ...
-                    // Rank 1 prefers files 1, world_size+1, 2*world_size+1, ...
-                    static thread_local std::size_t file_round_robin_counter = 0;
-                    std::size_t preferred_file_id = (m_rank + file_round_robin_counter * m_world_size) % m_inputFiles.size();
-                    file_round_robin_counter++;
-                    
-                    // Use preferred file if it has chunks, otherwise fall back to random selection
-                    if (m_inputFiles[preferred_file_id].hasNextChunk())
-                    {
-                        fileId = preferred_file_id;
-                    }
-                    else
-                    {
-                        fileId = m_inputFileDistribution(prng);
-                    }
-                }
-                else
-                {
-                    fileId = m_inputFileDistribution(prng);
-                }
-                
+                const std::size_t fileId = m_inputFileDistribution(prng);
                 auto& inputFile = m_inputFiles[fileId];
 
                 std::unique_lock lock(m_fileMutex);
