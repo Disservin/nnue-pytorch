@@ -7615,8 +7615,7 @@ namespace binpack
             m_cyclic(cyclic),
             m_skipPredicate(std::move(skipPredicate)),
             m_rank(rank),
-            m_world_size(world_size),
-            m_currentChunkIndex(0)
+            m_world_size(world_size)
         {
             m_numRunningWorkers.store(0);
             std::vector<double> sizes; // discrete distribution wants double weights
@@ -7825,28 +7824,43 @@ namespace binpack
         // DDP support
         int m_rank;
         int m_world_size;
-        std::atomic<std::size_t> m_currentChunkIndex;
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
             if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
             {
-                std::unique_lock lock(m_fileMutex);
+                auto& prng = rng::get_thread_local_rng();
                 
-                // Implement round-robin chunk allocation for DDP
-                // Each process only reads chunks where chunk_index % world_size == rank
-                std::size_t chunk_index = m_currentChunkIndex.fetch_add(1);
-                
-                // Find the next chunk that belongs to this rank
-                while ((chunk_index % m_world_size) != m_rank)
+                // For DDP: bias file selection towards files assigned to this rank
+                // Each rank gets a different starting point in the file list
+                std::size_t fileId;
+                if (m_world_size > 1)
                 {
-                    chunk_index = m_currentChunkIndex.fetch_add(1);
+                    // Create a rank-biased file selection
+                    // Rank 0 prefers files 0, world_size, 2*world_size, ...
+                    // Rank 1 prefers files 1, world_size+1, 2*world_size+1, ...
+                    static thread_local std::size_t file_round_robin_counter = 0;
+                    std::size_t preferred_file_id = (m_rank + file_round_robin_counter * m_world_size) % m_inputFiles.size();
+                    file_round_robin_counter++;
+                    
+                    // Use preferred file if it has chunks, otherwise fall back to random selection
+                    if (m_inputFiles[preferred_file_id].hasNextChunk())
+                    {
+                        fileId = preferred_file_id;
+                    }
+                    else
+                    {
+                        fileId = m_inputFileDistribution(prng);
+                    }
+                }
+                else
+                {
+                    fileId = m_inputFileDistribution(prng);
                 }
                 
-                // Select file probabilistically based on file sizes
-                auto& prng = rng::get_thread_local_rng();
-                const std::size_t fileId = m_inputFileDistribution(prng);
                 auto& inputFile = m_inputFiles[fileId];
+
+                std::unique_lock lock(m_fileMutex);
 
                 if (!inputFile.hasNextChunk())
                 {
