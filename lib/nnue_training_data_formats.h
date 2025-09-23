@@ -7606,12 +7606,17 @@ namespace binpack
             std::vector<std::string> paths,
             std::ios_base::openmode om = std::ios_base::app,
             bool cyclic = false,
-            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr
+            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr,
+            int rank = 0,
+            int world_size = 1
         ) :
             m_concurrency(concurrency),
             m_bufferOffset(0),
             m_cyclic(cyclic),
-            m_skipPredicate(std::move(skipPredicate))
+            m_skipPredicate(std::move(skipPredicate)),
+            m_rank(rank),
+            m_world_size(world_size),
+            m_currentChunkIndex(0)
         {
             m_numRunningWorkers.store(0);
             std::vector<double> sizes; // discrete distribution wants double weights
@@ -7816,16 +7821,32 @@ namespace binpack
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
 
         std::vector<std::thread> m_workers;
+        
+        // DDP support
+        int m_rank;
+        int m_world_size;
+        std::atomic<std::size_t> m_currentChunkIndex;
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
             if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
             {
+                std::unique_lock lock(m_fileMutex);
+                
+                // Implement round-robin chunk allocation for DDP
+                // Each process only reads chunks where chunk_index % world_size == rank
+                std::size_t chunk_index = m_currentChunkIndex.fetch_add(1);
+                
+                // Find the next chunk that belongs to this rank
+                while ((chunk_index % m_world_size) != m_rank)
+                {
+                    chunk_index = m_currentChunkIndex.fetch_add(1);
+                }
+                
+                // Select file probabilistically based on file sizes
                 auto& prng = rng::get_thread_local_rng();
                 const std::size_t fileId = m_inputFileDistribution(prng);
                 auto& inputFile = m_inputFiles[fileId];
-
-                std::unique_lock lock(m_fileMutex);
 
                 if (!inputFile.hasNextChunk())
                 {
