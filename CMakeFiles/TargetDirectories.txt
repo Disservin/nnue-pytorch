@@ -1,7 +1,0 @@
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/training_data_loader.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/edit_cache.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/rebuild_cache.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/list_install_components.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/install.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/install/local.dir
-/home/runner/work/nnue-pytorch/nnue-pytorch/CMakeFiles/install/strip.dir

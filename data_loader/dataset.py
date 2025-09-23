@@ -16,6 +16,8 @@ class FenBatchProvider:
         num_workers,
         batch_size=None,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
+        rank: int = None,
+        world_size: int = None,
     ):
         self.filename = filename
         self.cyclic = cyclic
@@ -25,7 +27,7 @@ class FenBatchProvider:
 
         if batch_size:
             self.stream = stream.create_fen_batch_stream(
-                self.num_workers, [self.filename], batch_size, cyclic, config
+                self.num_workers, [self.filename], batch_size, cyclic, config, rank, world_size
             )
         else:
             # doesnt work yet
@@ -67,6 +69,8 @@ class TrainingDataProvider:
         num_workers,
         batch_size=None,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
+        rank: int = None,
+        world_size: int = None,
     ):
         self.feature_set = feature_set.encode("utf-8")
         self.create_stream = create_stream
@@ -87,10 +91,12 @@ class TrainingDataProvider:
                 batch_size,
                 cyclic,
                 config,
+                rank,
+                world_size,
             )
         else:
             self.stream = self.create_stream(
-                self.feature_set, self.num_workers, self.filenames, cyclic, config
+                self.feature_set, self.num_workers, self.filenames, cyclic, config, rank, world_size
             )
 
     def __iter__(self):
@@ -119,6 +125,8 @@ class SparseBatchProvider(TrainingDataProvider):
         cyclic=True,
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
+        rank: int = None,
+        world_size: int = None,
     ):
         super(SparseBatchProvider, self).__init__(
             feature_set,
@@ -131,6 +139,8 @@ class SparseBatchProvider(TrainingDataProvider):
             num_workers,
             batch_size,
             config,
+            rank,
+            world_size,
         )
 
 
@@ -143,6 +153,8 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         cyclic=True,
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
+        rank: int = None,
+        world_size: int = None,
     ):
         super().__init__()
         self.feature_set = feature_set
@@ -151,6 +163,8 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         self.cyclic = cyclic
         self.num_workers = num_workers
         self.config = config
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         return SparseBatchProvider(
@@ -160,6 +174,8 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             cyclic=self.cyclic,
             num_workers=self.num_workers,
             config=self.config,
+            rank=self.rank,
+            world_size=self.world_size,
         )
 
 
