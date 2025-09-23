@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -Wl,--dependency-file=CMakeFiles/training_data_loader.dir/link.d -shared -Wl,-soname,libtraining_data_loader.so -o libtraining_data_loader.so CMakeFiles/training_data_loader.dir/training_data_loader.cpp.o
