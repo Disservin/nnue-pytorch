@@ -65,6 +65,9 @@ class ScheduleFreeLightningModule(NNUE):
 
         return self.model
 
+    def on_before_optimizer_step(self) -> None:
+        self.optimizers().train()
+
     def on_fit_start(self) -> None:
         self.optimizers().train()
 
