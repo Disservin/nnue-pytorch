@@ -160,8 +160,8 @@ class NNUE(L.LightningModule):
 
         optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9)
 
-        if hasattr(optimizer, "train"):
-            optimizer.train()
+        # if hasattr(optimizer, "train"):
+        #     optimizer.train()
 
         return optimizer
         # return [optimizer], [scheduler]
