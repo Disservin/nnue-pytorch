@@ -131,3 +131,27 @@ class ScheduleFreeLightningModule(NNUE):
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         """Optional: can be used if needed to switch modes after training"""
         pass
+
+    def optimizer_step(
+        self,
+        epoch,
+        batch_idx,
+        optimizer,
+        optimizer_closure=None,
+    ):
+        """Override to ensure optimizer is in train mode before step()"""
+        # ScheduleFree requires train mode for step()
+        optimizer.train()
+
+        # Call the parent optimizer_step
+        super().optimizer_step(
+            epoch,
+            batch_idx,
+            optimizer,
+            optimizer_closure,
+        )
+
+    # Also ensure these hooks are present:
+    def on_train_start(self) -> None:
+        """Ensure train mode at training start"""
+        self.optimizers().train()
