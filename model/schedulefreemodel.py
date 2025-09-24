@@ -54,14 +54,25 @@ class ScheduleFreeLightningModule(NNUE):
     def evaluation_model(self) -> torch.nn.Module:
         # This is used during packaging to get the smoothed evaluation weights.
 
-        prev_state_dict = getattr(self, "_schedulefree_state_dict", None)
-        opt = self.configure_optimizers()
+        # Try to use existing optimizer first
+        opt = None
+        try:
+            opt = self.optimizers()
+        except:
+            # If no optimizer exists, return model as-is
+            return self.model
 
-        if prev_state_dict:
-            opt.load_state_dict(prev_state_dict)
+        if opt is not None:
+            # Load saved state if available
+            prev_state_dict = getattr(self, "_schedulefree_state_dict", None)
+            if prev_state_dict:
+                try:
+                    opt.load_state_dict(prev_state_dict)
+                except:
+                    pass  # State might be incompatible
 
-        # Set optimizer to evaluation mode for smoothed weights
-        opt.eval()
+            # Set optimizer to evaluation mode for smoothed weights
+            opt.eval()
 
         return self.model
 
