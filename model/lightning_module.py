@@ -1,14 +1,13 @@
 import lightning as L
 
 # from model.schedulefree import ScheduleFreeWrapper
-import ranger21
 import torch
 from torch import Tensor, nn
 
 from .config import LossParams, ModelConfig
 from .features import FeatureSet
 from .model import NNUEModel
-from pytorch_optimizer import Ranger,Ranger21, ScheduleFreeWrapper
+from pytorch_optimizer import Ranger, ScheduleFreeWrapper
 
 
 def _get_parameters(layers: list[nn.Module]):
@@ -151,7 +150,7 @@ class NNUE(L.LightningModule):
             use_adaptive_gradient_clipping=False,
             softplus=False,
             pnm_momentum_factor=0.0,
-            num_iterations=self.max_epoch * self.num_batches_per_epoch
+            num_iterations=self.max_epoch * self.num_batches_per_epoch,
         )
 
         scheduler = torch.optim.lr_scheduler.StepLR(
@@ -160,8 +159,8 @@ class NNUE(L.LightningModule):
 
         optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9)
 
-        # if hasattr(optimizer, "train"):
-        #     optimizer.train()
+        if hasattr(optimizer, "train"):
+            optimizer.train()
 
         return optimizer
         # return [optimizer], [scheduler]

@@ -151,7 +151,8 @@ class ScheduleFreeLightningModule(NNUE):
     ):
         """Override to ensure optimizer is in train mode before step()"""
         # ScheduleFree requires train mode for step()
-        optimizer.train()
+        if hasattr(optimizer, "train"):
+            optimizer.train()
 
         # Call the parent optimizer_step
         super().optimizer_step(
@@ -166,3 +167,8 @@ class ScheduleFreeLightningModule(NNUE):
         """Ensure train mode at training start"""
         self.optimizers().train()
 
+
+    def on_before_optimizer_step(self, optimizer):
+        # Lightning 2.x hook: called right before optimizer.step()
+        if hasattr(optimizer, "train"):
+            optimizer.train()
