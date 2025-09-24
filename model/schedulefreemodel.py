@@ -1,6 +1,6 @@
 # from .lightning import NequIPLightningModule
 from .lightning_module import NNUE
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # from nequip.utils import RankedLogger
 
@@ -25,122 +25,94 @@ class ScheduleFreeLightningModule(NNUE):
     """
 
     def __init__(self, **kwargs):
-        # Will be used to lazily restore optimizer state in evaluation_model
         self._schedulefree_state_dict: Dict[str, Any] = {}
-
         super().__init__(**kwargs)
+        self._cached_opt = None  # will cache after trainer attaches
 
-    #  Lightning Hook
+    def _sf_opt(self) -> Optional[Any]:
+        if self._cached_opt is not None:
+            return self._cached_opt
+        if not hasattr(self, "trainer") or self.trainer is None:
+            return None
+        if not hasattr(self.trainer, "strategy"):
+            return None
+        opts = getattr(self.trainer.strategy, "optimizers", [])
+        if not opts:
+            return None
+        self._cached_opt = opts[0]
+        return self._cached_opt
+
+    # --- checkpoint hooks ------------------------------------------------
     def on_save_checkpoint(self, checkpoint: dict):
-        """"""
-        # Schedule-Free optimizers require .eval() to expose smoothed weights.
-        # This hook is called AFTER Lightning has already saved model/optimizer state,
-        # so we only store the smoothed state_dict here for packaging.
-        opt = self.optimizers()
+        opt = self._sf_opt()
         if opt is not None:
             checkpoint["schedulefree_optimizer_state_dict"] = opt.state_dict()
 
-    #  Lightning Hook
     def on_load_checkpoint(self, checkpoint: dict):
-        """"""
-        # We extract our custom optimizer state for later lazy loading
         state = checkpoint.get("schedulefree_optimizer_state_dict")
         if state is not None:
             self._schedulefree_state_dict = state
 
-    #  NequIP-Specific Override for Packaging
-    # @property
-    # def evaluation_model(self) -> torch.nn.Module:
-    #     # This is used during packaging to get the smoothed evaluation weights.
-
-    #     # Try to use existing optimizer first
-    #     opt = None
-    #     try:
-    #         opt = self.optimizers()
-    #     except:
-    #         # If no optimizer exists, return model as-is
-    #         return self
-
-    #     if opt is not None:
-    #         # Load saved state if available
-    #         prev_state_dict = getattr(self, "_schedulefree_state_dict", None)
-    #         if prev_state_dict:
-    #             try:
-    #                 opt.load_state_dict(prev_state_dict)
-    #             except:
-    #                 pass  # State might be incompatible
-
-    #         # Set optimizer to evaluation mode for smoothed weights
-    #         opt.eval()
-
-    #     return self
-
+     # --- fit lifecycle ---------------------------------------------------
     def on_fit_start(self) -> None:
-        self.optimizers().train()
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
+            # (Re)load saved SF state if present (lazy)
+            if self._schedulefree_state_dict:
+                try:
+                    opt.load_state_dict(self._schedulefree_state_dict)
+                except Exception:
+                    pass
 
-    def on_predict_start(self) -> None:
-        self.optimizers().eval()
+    def on_train_start(self) -> None:
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
 
-    #  Lightning Hook
     def on_train_epoch_start(self) -> None:
-        """"""
-        # Ensures fast weights are used during training
-        print("Switching to training mode")
-        self.optimizers().train()
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
 
-    #  Lightning Hook
+    # --- validation ------------------------------------------------------
     def on_validation_epoch_start(self) -> None:
-        """"""
-        # Ensures smoothed weights are used for validation
-        self.optimizers().eval()
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "eval"):
+            opt.eval()
 
-    #  Lightning Hook
+    def on_validation_epoch_end(self) -> None:
+        # restore train mode for subsequent training epochs
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
+
+    # --- test ------------------------------------------------------------
     def on_test_epoch_start(self) -> None:
-        """"""
-        # Ensures smoothed weights are used during testing
-        self.optimizers().eval()
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "eval"):
+            opt.eval()
 
-    #  Lightning Hook
-    def on_predict_epoch_start(self) -> None:
-        """"""
-        # Ensures smoothed weights are used during prediction/inference
-        self.optimizers().eval()
+    def on_test_epoch_end(self) -> None:
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
 
-    def on_validation_model_eval(self) -> None:
-        self.eval()
-        self.optimizers().eval()
+    # --- predict ---------------------------------------------------------
+    def on_predict_start(self) -> None:
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "eval"):
+            opt.eval()
 
-    def on_validation_model_train(self) -> None:
-        self.train()
-        self.optimizers().train()
+    def on_predict_end(self) -> None:
+        opt = self._sf_opt()
+        if opt and hasattr(opt, "train"):
+            opt.train()
 
-    def on_test_model_eval(self) -> None:
-        self.eval()
-        self.optimizers().eval()
-
-    def on_test_model_train(self) -> None:
-        self.train()
-        self.optimizers().train()
-
-    def on_predict_model_eval(self) -> None:  # redundant with on_predict_start()
-        self.eval()
-        self.optimizers().eval()
-
-    def on_train_batch_start(self, batch, batch_idx) -> None:
-        """Ensure optimizer is in train mode before step() is called"""
-        self.optimizers().train()
-
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
-        """Ensure smoothed weights for validation batches"""
-        self.optimizers().eval()
-
-    def on_test_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
-        """Ensure smoothed weights for test batches"""
-        self.optimizers().eval()
-
-    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
-        """Optional: can be used if needed to switch modes after training"""
-        pass
+    # --- optimizer step safety -------------------------------------------
+    def on_before_optimizer_step(self, optimizer):
+        if hasattr(optimizer, "train"):
+            optimizer.train()
 
     def optimizer_step(
         self,
@@ -149,26 +121,6 @@ class ScheduleFreeLightningModule(NNUE):
         optimizer,
         optimizer_closure=None,
     ):
-        """Override to ensure optimizer is in train mode before step()"""
-        # ScheduleFree requires train mode for step()
         if hasattr(optimizer, "train"):
             optimizer.train()
-
-        # Call the parent optimizer_step
-        super().optimizer_step(
-            epoch,
-            batch_idx,
-            optimizer,
-            optimizer_closure,
-        )
-
-    # Also ensure these hooks are present:
-    def on_train_start(self) -> None:
-        """Ensure train mode at training start"""
-        self.optimizers().train()
-
-
-    def on_before_optimizer_step(self, optimizer):
-        # Lightning 2.x hook: called right before optimizer.step()
-        if hasattr(optimizer, "train"):
-            optimizer.train()
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
