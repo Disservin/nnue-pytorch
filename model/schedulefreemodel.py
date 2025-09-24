@@ -59,7 +59,7 @@ class ScheduleFreeLightningModule(NNUE):
     #         opt = self.optimizers()
     #     except:
     #         # If no optimizer exists, return model as-is
-    #         return self.model
+    #         return self
 
     #     if opt is not None:
     #         # Load saved state if available
@@ -73,7 +73,7 @@ class ScheduleFreeLightningModule(NNUE):
     #         # Set optimizer to evaluation mode for smoothed weights
     #         opt.eval()
 
-    #     return self.model
+    #     return self
 
     def on_fit_start(self) -> None:
         self.optimizers().train()
@@ -107,23 +107,23 @@ class ScheduleFreeLightningModule(NNUE):
         self.optimizers().eval()
 
     def on_validation_model_eval(self) -> None:
-        self.model.eval()
+        self.eval()
         self.optimizers().eval()
 
     def on_validation_model_train(self) -> None:
-        self.model.train()
+        self.train()
         self.optimizers().train()
 
     def on_test_model_eval(self) -> None:
-        self.model.eval()
+        self.eval()
         self.optimizers().eval()
 
     def on_test_model_train(self) -> None:
-        self.model.train()
+        self.train()
         self.optimizers().train()
 
     def on_predict_model_eval(self) -> None:  # redundant with on_predict_start()
-        self.model.eval()
+        self.eval()
         self.optimizers().eval()
 
     def on_train_batch_start(self, batch, batch_idx) -> None:
@@ -166,13 +166,3 @@ class ScheduleFreeLightningModule(NNUE):
         """Ensure train mode at training start"""
         self.optimizers().train()
 
-    def train(self, mode: bool = True) -> None:
-        """Set the model to training mode"""
-        self.model.train(mode)
-        self.optimizers().train()
-
-
-    def eval(self) -> None:
-        """Set the model to evaluation mode"""
-        self.model.eval()
-        self.optimizers().eval()
