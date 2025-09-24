@@ -6795,47 +6795,36 @@ namespace binpack
             m_file.seekg(0);
         }
         
-        // Seek to approximately the rank-th portion of the file for DDP
-        void seek_to_rank_position(int rank, int world_size)
+        bool skipChunks(std::size_t n, bool cyclic, bool allowSingleWrap)
         {
-            if (world_size <= 1) {
-                seek_to_start();
-                return;
-            }
-            
-            // Calculate the target position for this rank
-            std::size_t target_position = (m_sizeBytes * rank) / world_size;
-            
-            // Start from the beginning of the file
-            seek_to_start();
-            
-            // Skip chunks until we reach or exceed the target position
-            std::size_t current_position = 0;
-            while (current_position < target_position && hasNextChunk())
+            if (n == 0) return true;
+
+            bool wrapped = false;
+            std::size_t skipped = 0;
+
+            while (skipped < n)
             {
-                // Read the chunk header to get the size
-                auto current_pos = m_file.tellg();
-                Header header = readChunkHeader();
-                
-                // Calculate the total chunk size (header + data)
-                std::size_t chunk_total_size = 8 + header.chunkSize; // 8 bytes header + data
-                
-                // If skipping this chunk would overshoot the target significantly,
-                // start reading from here
-                if (current_position + chunk_total_size > target_position)
+                if (!hasNextChunk())
                 {
-                    // Seek back to the start of this chunk
-                    m_file.seekg(current_pos);
-                    return;
+                    if (cyclic && allowSingleWrap && !wrapped)
+                    {
+                        seek_to_start();
+                        wrapped = true;
+                        continue;
+                    }
+                    return false;
                 }
-                
-                // Skip the chunk data
+
+                auto curPos = m_file.tellg();
+                Header header = readChunkHeader();
                 m_file.seekg(header.chunkSize, std::ios_base::cur);
-                current_position += chunk_total_size;
+
+                assert(m_file.tellg() > curPos);
+
+                ++skipped;
             }
-            
-            // If we've reached the end without finding a good position,
-            // the current position is fine (at the last chunk or EOF)
+
+            return true;
         }
 
         [[nodiscard]] std::vector<unsigned char> readNextChunk()
@@ -7870,7 +7859,8 @@ namespace binpack
         // DDP support
         int m_rank;
         int m_world_size;
-        std::vector<bool> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
+        std::vector<std::uint8_t> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
+        std::vector<std::size_t> m_ddp_chunks_to_skip_after_read;
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
@@ -7882,25 +7872,36 @@ namespace binpack
 
                 std::unique_lock lock(m_fileMutex);
 
-                // For DDP: seek the file to rank position on first access
-                if (m_world_size > 1 && !m_files_seeked_for_ddp[fileId])
+                // DDP: chunk-based skipping
+                if (m_world_size > 1)
                 {
-                    inputFile.seek_to_rank_position(m_rank, m_world_size);
-                    m_files_seeked_for_ddp[fileId] = true;
+                    if (!m_files_seeked_for_ddp[fileId])
+                    {
+                        inputFile.skipChunks(static_cast<std::size_t>(m_rank), m_cyclic, true);
+                        m_files_seeked_for_ddp[fileId] = true;
+                    }
+                    else if (m_ddp_chunks_to_skip_after_read[fileId] > 0)
+                    {
+                        inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId], m_cyclic, true);
+                        m_ddp_chunks_to_skip_after_read[fileId] = 0;
+                    }
                 }
 
                 if (!inputFile.hasNextChunk())
                 {
                     if (m_cyclic)
-                    {
                         inputFile.seek_to_start();
-                    }
                     else
                         return true;
                 }
 
                 m_chunk = inputFile.readNextChunk();
                 m_offset = 0;
+
+                if (m_world_size > 1)
+                {
+                    m_ddp_chunks_to_skip_after_read[fileId] = (m_world_size > 0 ? static_cast<std::size_t>(m_world_size - 1) : 0);
+                }
             }
 
             return false;
