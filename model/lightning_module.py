@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from .config import LossParams, ModelConfig
 from .features import FeatureSet
 from .model import NNUEModel
-from pytorch_optimizer import ScheduleFreeAdamW
+from pytorch_optimizer import Ranger21, ScheduleFreeWrapper
 
 
 def _get_parameters(layers: list[nn.Module]):
@@ -136,7 +136,7 @@ class NNUE(L.LightningModule):
             {"params": [self.model.layer_stacks.output.bias], "lr": LR},
         ]
 
-        optimizer = ranger21.Ranger21(
+        optimizer = Ranger21(
             train_params,
             lr=1.0,
             betas=(0.9, 0.999),
@@ -151,12 +151,13 @@ class NNUE(L.LightningModule):
             use_adaptive_gradient_clipping=False,
             softplus=False,
             pnm_momentum_factor=0.0,
+            num_iterations=self.max_epoch * self.num_batches_per_epoch
         )
 
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=1, gamma=self.gamma
         )
 
-        optimizer = ScheduleFreeAdamW(params=train_params, lr=LR, weight_decay=0.0)
+        optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9)
         return optimizer
         # return [optimizer], [scheduler]
