@@ -1146,7 +1146,11 @@ int main(int argc, char** argv)
         .simple_eval_skipping = 0,
         .param_index = 0
     };
-    auto stream = create_sparse_batch_stream("HalfKAv2_hm^", concurrency, file_count, files, batch_size, cyclic, config);
+    const DataloaderDDPConfig ddp_config = {
+        .rank = 0,
+        .world_size = 1
+    };
+    auto stream = create_sparse_batch_stream("HalfKAv2_hm^", concurrency, file_count, files, batch_size, cyclic, config, ddp_config);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
