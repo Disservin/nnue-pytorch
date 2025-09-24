@@ -1,6 +1,7 @@
 # from .lightning import NequIPLightningModule
 from .lightning_module import NNUE
 from typing import Dict, Any
+
 # from nequip.utils import RankedLogger
 import torch
 
@@ -68,6 +69,7 @@ class ScheduleFreeLightningModule(NNUE):
     def on_train_epoch_start(self) -> None:
         """"""
         # Ensures fast weights are used during training
+        print("Switching to training mode")
         self.optimizers().train()
 
     #  Lightning Hook
