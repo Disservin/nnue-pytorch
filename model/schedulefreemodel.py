@@ -65,6 +65,12 @@ class ScheduleFreeLightningModule(NNUE):
 
         return self.model
 
+    def on_fit_start(self) -> None:
+        self.optimizers().train()
+
+    def on_predict_start(self) -> None:
+        self.optimizers().eval()
+
     #  Lightning Hook
     def on_train_epoch_start(self) -> None:
         """"""
@@ -88,4 +94,24 @@ class ScheduleFreeLightningModule(NNUE):
     def on_predict_epoch_start(self) -> None:
         """"""
         # Ensures smoothed weights are used during prediction/inference
+        self.optimizers().eval()
+
+    def on_validation_model_eval(self) -> None:
+        self.model.eval()
+        self.optimizers().eval()
+
+    def on_validation_model_train(self) -> None:
+        self.model.train()
+        self.optimizers().train()
+
+    def on_test_model_eval(self) -> None:
+        self.model.eval()
+        self.optimizers().eval()
+
+    def on_test_model_train(self) -> None:
+        self.model.train()
+        self.optimizers().train()
+
+    def on_predict_model_eval(self) -> None:  # redundant with on_predict_start()
+        self.model.eval()
         self.optimizers().eval()
