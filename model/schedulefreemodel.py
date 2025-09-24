@@ -65,15 +65,6 @@ class ScheduleFreeLightningModule(NNUE):
 
         return self.model
 
-    def on_before_optimizer_step(self) -> None:
-        self.optimizers().train()
-
-    def on_fit_start(self) -> None:
-        self.optimizers().train()
-
-    def on_predict_start(self) -> None:
-        self.optimizers().eval()
-
     #  Lightning Hook
     def on_train_epoch_start(self) -> None:
         """"""
@@ -98,63 +89,3 @@ class ScheduleFreeLightningModule(NNUE):
         """"""
         # Ensures smoothed weights are used during prediction/inference
         self.optimizers().eval()
-
-    def on_validation_model_eval(self) -> None:
-        self.model.eval()
-        self.optimizers().eval()
-
-    def on_validation_model_train(self) -> None:
-        self.model.train()
-        self.optimizers().train()
-
-    def on_test_model_eval(self) -> None:
-        self.model.eval()
-        self.optimizers().eval()
-
-    def on_test_model_train(self) -> None:
-        self.model.train()
-        self.optimizers().train()
-
-    def on_predict_model_eval(self) -> None:  # redundant with on_predict_start()
-        self.model.eval()
-        self.optimizers().eval()
-
-    def on_train_batch_start(self, batch, batch_idx) -> None:
-        """Ensure optimizer is in train mode before step() is called"""
-        self.optimizers().train()
-
-    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
-        """Ensure smoothed weights for validation batches"""
-        self.optimizers().eval()
-
-    def on_test_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
-        """Ensure smoothed weights for test batches"""
-        self.optimizers().eval()
-
-    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
-        """Optional: can be used if needed to switch modes after training"""
-        pass
-
-    def optimizer_step(
-        self,
-        epoch,
-        batch_idx,
-        optimizer,
-        optimizer_closure=None,
-    ):
-        """Override to ensure optimizer is in train mode before step()"""
-        # ScheduleFree requires train mode for step()
-        optimizer.train()
-
-        # Call the parent optimizer_step
-        super().optimizer_step(
-            epoch,
-            batch_idx,
-            optimizer,
-            optimizer_closure,
-        )
-
-    # Also ensure these hooks are present:
-    def on_train_start(self) -> None:
-        """Ensure train mode at training start"""
-        self.optimizers().train()
