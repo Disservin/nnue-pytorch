@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from .config import LossParams, ModelConfig
 from .features import FeatureSet
 from .model import NNUEModel
-from pytorch_optimizer import ScheduleFreeWrapper
+from pytorch_optimizer import ScheduleFreeAdamW
 
 
 def _get_parameters(layers: list[nn.Module]):
@@ -157,6 +157,6 @@ class NNUE(L.LightningModule):
             optimizer, step_size=1, gamma=self.gamma
         )
 
-        optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9)
+        optimizer = ScheduleFreeAdamW(params=train_params, lr=LR, weight_decay=0.0)
         return optimizer
         # return [optimizer], [scheduler]
