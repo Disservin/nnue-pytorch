@@ -7662,7 +7662,6 @@ namespace binpack
             // Initialize DDP seeking tracking
             m_files_seeked_for_ddp.resize(m_inputFiles.size(), false);
             m_ddp_chunks_to_skip_after_read.resize(m_inputFiles.size(), 0);
-            m_files_cycled_for_ddp.resize(m_inputFiles.size(), false);
 
             m_stopFlag.store(false);
 
@@ -7857,7 +7856,6 @@ namespace binpack
         int m_world_size;
         std::vector<std::uint8_t> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
         std::vector<std::size_t> m_ddp_chunks_to_skip_after_read;
-        std::vector<std::uint8_t> m_files_cycled_for_ddp;
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
@@ -7890,10 +7888,9 @@ namespace binpack
                     {
                         inputFile.seek_to_start();
 
-                        if (m_world_size > 1 && !m_files_cycled_for_ddp[fileId])
+                        if (m_world_size > 1 )
                         {
                             inputFile.skipChunks(static_cast<std::size_t>(m_rank));
-                            m_files_cycled_for_ddp[fileId] = true;
                         }
                     }
                     else
