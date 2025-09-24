@@ -5,7 +5,7 @@ import glob
 import numpy as np
 import torch
 
-from .config import CDataloaderSkipConfig
+from .config import CDataloaderSkipConfig, CDataloaderDDPConfig
 
 
 class SparseBatch(ctypes.Structure):
@@ -145,8 +145,7 @@ class CDataLoaderAPI:
         #     int batch_size,
         #     bool cyclic,
         #     DataloaderSkipConfig config,
-        #     int rank,
-        #     int world_size
+        #     DataloaderDDPConfig ddp_config
         # )
         self.dll.create_fen_batch_stream.restype = ctypes.c_void_p
         self.dll.create_fen_batch_stream.argtypes = [
@@ -156,8 +155,7 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
-            ctypes.c_int,
-            ctypes.c_int,
+            CDataloaderDDPConfig,
         ]
 
         # EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
@@ -175,8 +173,7 @@ class CDataLoaderAPI:
         #     int batch_size,
         #     bool cyclic,
         #     DataloaderSkipConfig config,
-        #     int rank,
-        #     int world_size
+        #     DataloaderDDPConfig ddp_config
         # )
         self.dll.create_sparse_batch_stream.restype = ctypes.c_void_p
         self.dll.create_sparse_batch_stream.argtypes = [
@@ -187,8 +184,7 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
-            ctypes.c_int,
-            ctypes.c_int,
+            CDataloaderDDPConfig,
         ]
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
