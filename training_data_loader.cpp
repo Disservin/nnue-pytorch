@@ -822,6 +822,11 @@ struct DataloaderSkipConfig {
     int param_index;
 };
 
+struct DataloaderDDPConfig {
+    int rank;
+    int world_size;
+};
+
 std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig config)
 {
     if (config.filtered || config.random_fen_skipping || config.wld_filtered || config.early_fen_skipping)
@@ -1008,12 +1013,12 @@ extern "C" {
     }
 
     // changing the signature needs matching changes in data_loader/_native.py
-    EXPORT FenBatchStream* CDECL create_fen_batch_stream(int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, DataloaderSkipConfig config, int rank, int world_size)
+    EXPORT FenBatchStream* CDECL create_fen_batch_stream(int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, DataloaderSkipConfig config, DataloaderDDPConfig ddp_config)
     {
         auto skipPredicate = make_skip_predicate(config);
         auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
 
-        return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+        return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
     }
 
     EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
@@ -1022,7 +1027,7 @@ extern "C" {
     }
 
     // changing the signature needs matching changes in data_loader/_native.py
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, DataloaderSkipConfig config, int rank, int world_size)
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, DataloaderSkipConfig config, DataloaderDDPConfig ddp_config)
     {
         auto skipPredicate = make_skip_predicate(config);
         auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
@@ -1030,35 +1035,35 @@ extern "C" {
         std::string_view feature_set(feature_set_c);
         if (feature_set == "HalfKP")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKP^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKA")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKA^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKAv2")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKAv2^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKAv2_hm")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hm>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hm>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         else if (feature_set == "HalfKAv2_hm^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hmFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, rank, world_size);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2_hmFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;

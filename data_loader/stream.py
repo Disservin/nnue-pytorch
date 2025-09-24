@@ -2,7 +2,7 @@ import ctypes
 import os
 
 from ._native import c_lib, SparseBatchPtr, FenBatchPtr
-from .config import CDataloaderSkipConfig, DataloaderSkipConfig
+from .config import CDataloaderSkipConfig, DataloaderSkipConfig, CDataloaderDDPConfig, DataloaderDDPConfig
 
 
 def _get_ddp_rank_and_world_size():
@@ -24,11 +24,11 @@ def create_fen_batch_stream(
     batch_size,
     cyclic,
     config: DataloaderSkipConfig,
-    rank: int = None,
-    world_size: int = None,
+    ddp_config: DataloaderDDPConfig = None,
 ) -> ctypes.c_void_p:
-    if rank is None or world_size is None:
+    if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
+        ddp_config = DataloaderDDPConfig(rank=rank, world_size=world_size)
     
     return c_lib.dll.create_fen_batch_stream(
         concurrency,
@@ -37,8 +37,7 @@ def create_fen_batch_stream(
         batch_size,
         cyclic,
         CDataloaderSkipConfig(config),
-        rank,
-        world_size,
+        CDataloaderDDPConfig(ddp_config),
     )
 
 
@@ -61,11 +60,11 @@ def create_sparse_batch_stream(
     batch_size,
     cyclic,
     config: DataloaderSkipConfig,
-    rank: int = None,
-    world_size: int = None,
+    ddp_config: DataloaderDDPConfig = None,
 ) -> ctypes.c_void_p:
-    if rank is None or world_size is None:
+    if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
+        ddp_config = DataloaderDDPConfig(rank=rank, world_size=world_size)
     
     return c_lib.dll.create_sparse_batch_stream(
         feature_set,
@@ -75,8 +74,7 @@ def create_sparse_batch_stream(
         batch_size,
         cyclic,
         CDataloaderSkipConfig(config),
-        rank,
-        world_size,
+        CDataloaderDDPConfig(ddp_config),
     )
 
 
