@@ -165,3 +165,14 @@ class ScheduleFreeLightningModule(NNUE):
     def on_train_start(self) -> None:
         """Ensure train mode at training start"""
         self.optimizers().train()
+
+    def train(self, mode: bool = True) -> None:
+        """Set the model to training mode"""
+        self.model.train(mode)
+        self.optimizers().train()
+
+
+    def eval(self) -> None:
+        """Set the model to evaluation mode"""
+        self.model.eval()
+        self.optimizers().eval()
