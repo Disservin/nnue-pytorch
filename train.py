@@ -383,7 +383,7 @@ def main():
 
     max_epoch = args.max_epochs or 800
     if args.resume_from_model is None:
-        nnue = M.NNUE(
+        nnue = M.ScheduleFreeLightningModule(
             feature_set=feature_set,
             loss_params=loss_params,
             max_epoch=max_epoch,

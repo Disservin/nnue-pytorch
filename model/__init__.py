@@ -4,7 +4,7 @@ from .features import add_feature_args, FeatureSet, get_feature_set_from_name
 from .lightning_module import NNUE
 from .model import NNUEModel
 from .utils import coalesce_ft_weights, load_model, NNUEReader, NNUEWriter
-
+from .schedulefreemodel import ScheduleFreeLightningModule
 
 __all__ = [
     "WeightClippingCallback",
@@ -19,4 +19,5 @@ __all__ = [
     "load_model",
     "NNUEReader",
     "NNUEWriter",
+    "ScheduleFreeLightningModule"
 ]

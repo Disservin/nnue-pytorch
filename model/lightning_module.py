@@ -1,4 +1,5 @@
 import lightning as L
+from model.schedulefree import ScheduleFreeWrapper
 import ranger21
 import torch
 from torch import Tensor, nn
@@ -154,4 +155,6 @@ class NNUE(L.LightningModule):
             optimizer, step_size=1, gamma=self.gamma
         )
 
-        return [optimizer], [scheduler]
+        optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9, weight_decay_at_y=0.1)
+        return optimizer
+        # return [optimizer], [scheduler]
