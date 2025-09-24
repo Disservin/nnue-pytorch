@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from .config import LossParams, ModelConfig
 from .features import FeatureSet
 from .model import NNUEModel
-from pytorch_optimizer import Ranger21, ScheduleFreeWrapper
+from pytorch_optimizer import Ranger,Ranger21, ScheduleFreeWrapper
 
 
 def _get_parameters(layers: list[nn.Module]):
@@ -136,7 +136,7 @@ class NNUE(L.LightningModule):
             {"params": [self.model.layer_stacks.output.bias], "lr": LR},
         ]
 
-        optimizer = Ranger21(
+        optimizer = Ranger(
             train_params,
             lr=1.0,
             betas=(0.9, 0.999),
