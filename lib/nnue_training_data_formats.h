@@ -6795,7 +6795,7 @@ namespace binpack
             m_file.seekg(0);
         }
         
-        bool skipChunks(std::size_t n, bool cyclic, bool allowSingleWrap)
+        bool skipChunks(std::size_t n)
         {
             if (n == 0) return true;
 
@@ -6806,12 +6806,6 @@ namespace binpack
             {
                 if (!hasNextChunk())
                 {
-                    if (cyclic && allowSingleWrap && !wrapped)
-                    {
-                        seek_to_start();
-                        wrapped = true;
-                        continue;
-                    }
                     return false;
                 }
 
@@ -7667,6 +7661,7 @@ namespace binpack
 
             // Initialize DDP seeking tracking
             m_files_seeked_for_ddp.resize(m_inputFiles.size(), false);
+            m_ddp_chunks_to_skip_after_read.resize(m_inputFiles.size(), 0);
 
             m_stopFlag.store(false);
 
@@ -7861,6 +7856,7 @@ namespace binpack
         int m_world_size;
         std::vector<std::uint8_t> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
         std::vector<std::size_t> m_ddp_chunks_to_skip_after_read;
+        std::vector<std::uint8_t> m_files_cycled_for_ddp;
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
@@ -7877,12 +7873,12 @@ namespace binpack
                 {
                     if (!m_files_seeked_for_ddp[fileId])
                     {
-                        inputFile.skipChunks(static_cast<std::size_t>(m_rank), m_cyclic, true);
+                        inputFile.skipChunks(static_cast<std::size_t>(m_rank));
                         m_files_seeked_for_ddp[fileId] = true;
                     }
                     else if (m_ddp_chunks_to_skip_after_read[fileId] > 0)
                     {
-                        inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId], m_cyclic, true);
+                        inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId]);
                         m_ddp_chunks_to_skip_after_read[fileId] = 0;
                     }
                 }
@@ -7890,9 +7886,19 @@ namespace binpack
                 if (!inputFile.hasNextChunk())
                 {
                     if (m_cyclic)
+                    {
                         inputFile.seek_to_start();
+
+                        if (m_world_size > 1 && !m_files_cycled_for_ddp[fileId])
+                        {
+                            inputFile.skipChunks(static_cast<std::size_t>(m_rank));
+                            m_files_cycled_for_ddp[fileId] = true;
+                        }
+                    }
                     else
+                    {
                         return true;
+                    }
                 }
 
                 m_chunk = inputFile.readNextChunk();
@@ -7900,7 +7906,7 @@ namespace binpack
 
                 if (m_world_size > 1)
                 {
-                    m_ddp_chunks_to_skip_after_read[fileId] = (m_world_size > 0 ? static_cast<std::size_t>(m_world_size - 1) : 0);
+                    m_ddp_chunks_to_skip_after_read[fileId] = static_cast<std::size_t>(m_world_size - 1);
                 }
             }
 
