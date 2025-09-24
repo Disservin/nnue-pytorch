@@ -1,5 +1,6 @@
 import lightning as L
-from model.schedulefree import ScheduleFreeWrapper
+
+# from model.schedulefree import ScheduleFreeWrapper
 import ranger21
 import torch
 from torch import Tensor, nn
@@ -7,6 +8,7 @@ from torch import Tensor, nn
 from .config import LossParams, ModelConfig
 from .features import FeatureSet
 from .model import NNUEModel
+from pytorch_optimizer import ScheduleFreeWrapper
 
 
 def _get_parameters(layers: list[nn.Module]):
@@ -155,6 +157,6 @@ class NNUE(L.LightningModule):
             optimizer, step_size=1, gamma=self.gamma
         )
 
-        optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9, weight_decay_at_y=0.1)
+        optimizer = ScheduleFreeWrapper(optimizer, momentum=0.9)
         return optimizer
         # return [optimizer], [scheduler]
