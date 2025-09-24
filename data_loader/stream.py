@@ -2,13 +2,19 @@ import ctypes
 import os
 
 from ._native import c_lib, SparseBatchPtr, FenBatchPtr
-from .config import CDataloaderSkipConfig, DataloaderSkipConfig, CDataloaderDDPConfig, DataloaderDDPConfig
+from .config import (
+    CDataloaderSkipConfig,
+    DataloaderSkipConfig,
+    CDataloaderDDPConfig,
+    DataloaderDDPConfig,
+)
 
 
 def _get_ddp_rank_and_world_size():
     """Get DDP rank and world size from environment variables."""
     rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    print(f"DDP rank: {rank}, world size: {world_size}")
     return rank, world_size
 
 
@@ -29,7 +35,7 @@ def create_fen_batch_stream(
     if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
         ddp_config = DataloaderDDPConfig(rank=rank, world_size=world_size)
-    
+
     return c_lib.dll.create_fen_batch_stream(
         concurrency,
         len(filenames),
@@ -65,7 +71,7 @@ def create_sparse_batch_stream(
     if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
         ddp_config = DataloaderDDPConfig(rank=rank, world_size=world_size)
-    
+
     return c_lib.dll.create_sparse_batch_stream(
         feature_set,
         concurrency,
