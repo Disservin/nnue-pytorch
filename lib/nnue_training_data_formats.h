@@ -6803,31 +6803,39 @@ namespace binpack
                 return;
             }
             
-            // Calculate the approximate position for this rank
+            // Calculate the target position for this rank
             std::size_t target_position = (m_sizeBytes * rank) / world_size;
             
-            // Seek to that position
-            m_file.seekg(target_position);
+            // Start from the beginning of the file
+            seek_to_start();
             
-            // Find the next valid chunk header by searching for "BINP"
-            unsigned char buffer[4];
-            while (m_file.read(reinterpret_cast<char*>(buffer), 4))
+            // Skip chunks until we reach or exceed the target position
+            std::size_t current_position = 0;
+            while (current_position < target_position && hasNextChunk())
             {
-                if (buffer[0] == 'B' && buffer[1] == 'I' && buffer[2] == 'N' && buffer[3] == 'P')
+                // Read the chunk header to get the size
+                auto current_pos = m_file.tellg();
+                Header header = readChunkHeader();
+                
+                // Calculate the total chunk size (header + data)
+                std::size_t chunk_total_size = 8 + header.chunkSize; // 8 bytes header + data
+                
+                // If skipping this chunk would overshoot the target significantly,
+                // start reading from here
+                if (current_position + chunk_total_size > target_position)
                 {
-                    // Found a chunk header, seek back to the start of it
-                    m_file.seekg(-4, std::ios_base::cur);
+                    // Seek back to the start of this chunk
+                    m_file.seekg(current_pos);
                     return;
                 }
-                else
-                {
-                    // Move back 3 bytes and try again (sliding window)
-                    m_file.seekg(-3, std::ios_base::cur);
-                }
+                
+                // Skip the chunk data
+                m_file.seekg(header.chunkSize, std::ios_base::cur);
+                current_position += chunk_total_size;
             }
             
-            // If we couldn't find a valid chunk, fall back to start
-            seek_to_start();
+            // If we've reached the end without finding a good position,
+            // the current position is fine (at the last chunk or EOF)
         }
 
         [[nodiscard]] std::vector<unsigned char> readNextChunk()
