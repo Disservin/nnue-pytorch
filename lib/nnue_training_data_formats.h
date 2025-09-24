@@ -7662,6 +7662,7 @@ namespace binpack
             // Initialize DDP seeking tracking
             m_files_seeked_for_ddp.resize(m_inputFiles.size(), false);
             m_ddp_chunks_to_skip_after_read.resize(m_inputFiles.size(), 0);
+            m_files_cycled_for_ddp.resize(m_inputFiles.size(), false);
 
             m_stopFlag.store(false);
 
