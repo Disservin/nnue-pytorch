@@ -7877,8 +7877,13 @@ namespace binpack
                     }
                     else if (m_ddp_chunks_to_skip_after_read[fileId] > 0)
                     {
-                        inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId]);
+                        const bool success = inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId]);
                         m_ddp_chunks_to_skip_after_read[fileId] = 0;
+                        if (!success && m_cyclic)
+                        {
+                            inputFile.seek_to_start();
+                            inputFile.skipChunks(static_cast<std::size_t>(m_rank));
+                        }
                     }
                 }
 
