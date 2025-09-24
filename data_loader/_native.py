@@ -144,7 +144,9 @@ class CDataLoaderAPI:
         #     const char* const* filenames,
         #     int batch_size,
         #     bool cyclic,
-        #     DataloaderSkipConfig config
+        #     DataloaderSkipConfig config,
+        #     int rank,
+        #     int world_size
         # )
         self.dll.create_fen_batch_stream.restype = ctypes.c_void_p
         self.dll.create_fen_batch_stream.argtypes = [
@@ -154,6 +156,8 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
+            ctypes.c_int,
+            ctypes.c_int,
         ]
 
         # EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
@@ -170,7 +174,9 @@ class CDataLoaderAPI:
         #     const char* const* filenames,
         #     int batch_size,
         #     bool cyclic,
-        #     DataloaderSkipConfig config
+        #     DataloaderSkipConfig config,
+        #     int rank,
+        #     int world_size
         # )
         self.dll.create_sparse_batch_stream.restype = ctypes.c_void_p
         self.dll.create_sparse_batch_stream.argtypes = [
@@ -181,6 +187,8 @@ class CDataLoaderAPI:
             ctypes.c_int,
             ctypes.c_bool,
             CDataloaderSkipConfig,
+            ctypes.c_int,
+            ctypes.c_int,
         ]
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)

@@ -6794,6 +6794,49 @@ namespace binpack
         {
             m_file.seekg(0);
         }
+        
+        // Seek to approximately the rank-th portion of the file for DDP
+        void seek_to_rank_position(int rank, int world_size)
+        {
+            if (world_size <= 1) {
+                seek_to_start();
+                return;
+            }
+            
+            // Calculate the target position for this rank
+            std::size_t target_position = (m_sizeBytes * rank) / world_size;
+            
+            // Start from the beginning of the file
+            seek_to_start();
+            
+            // Skip chunks until we reach or exceed the target position
+            std::size_t current_position = 0;
+            while (current_position < target_position && hasNextChunk())
+            {
+                // Read the chunk header to get the size
+                auto current_pos = m_file.tellg();
+                Header header = readChunkHeader();
+                
+                // Calculate the total chunk size (header + data)
+                std::size_t chunk_total_size = 8 + header.chunkSize; // 8 bytes header + data
+                
+                // If skipping this chunk would overshoot the target significantly,
+                // start reading from here
+                if (current_position + chunk_total_size > target_position)
+                {
+                    // Seek back to the start of this chunk
+                    m_file.seekg(current_pos);
+                    return;
+                }
+                
+                // Skip the chunk data
+                m_file.seekg(header.chunkSize, std::ios_base::cur);
+                current_position += chunk_total_size;
+            }
+            
+            // If we've reached the end without finding a good position,
+            // the current position is fine (at the last chunk or EOF)
+        }
 
         [[nodiscard]] std::vector<unsigned char> readNextChunk()
         {
@@ -7606,12 +7649,16 @@ namespace binpack
             std::vector<std::string> paths,
             std::ios_base::openmode om = std::ios_base::app,
             bool cyclic = false,
-            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr
+            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr,
+            int rank = 0,
+            int world_size = 1
         ) :
             m_concurrency(concurrency),
             m_bufferOffset(0),
             m_cyclic(cyclic),
-            m_skipPredicate(std::move(skipPredicate))
+            m_skipPredicate(std::move(skipPredicate)),
+            m_rank(rank),
+            m_world_size(world_size)
         {
             m_numRunningWorkers.store(0);
             std::vector<double> sizes; // discrete distribution wants double weights
@@ -7628,6 +7675,9 @@ namespace binpack
             }
 
             m_inputFileDistribution = std::discrete_distribution<>(sizes.begin(), sizes.end());
+
+            // Initialize DDP seeking tracking
+            m_files_seeked_for_ddp.resize(m_inputFiles.size(), false);
 
             m_stopFlag.store(false);
 
@@ -7816,6 +7866,11 @@ namespace binpack
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
 
         std::vector<std::thread> m_workers;
+        
+        // DDP support
+        int m_rank;
+        int m_world_size;
+        std::vector<bool> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
@@ -7826,6 +7881,13 @@ namespace binpack
                 auto& inputFile = m_inputFiles[fileId];
 
                 std::unique_lock lock(m_fileMutex);
+
+                // For DDP: seek the file to rank position on first access
+                if (m_world_size > 1 && !m_files_seeked_for_ddp[fileId])
+                {
+                    inputFile.seek_to_rank_position(m_rank, m_world_size);
+                    m_files_seeked_for_ddp[fileId] = true;
+                }
 
                 if (!inputFile.hasNextChunk())
                 {
