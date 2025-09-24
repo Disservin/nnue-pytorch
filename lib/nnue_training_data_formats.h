@@ -7676,14 +7676,8 @@ namespace binpack
 
             m_inputFileDistribution = std::discrete_distribution<>(sizes.begin(), sizes.end());
 
-            // For DDP: seek each file to a different starting position based on rank
-            if (m_world_size > 1)
-            {
-                for (auto& file : m_inputFiles)
-                {
-                    file.seek_to_rank_position(m_rank, m_world_size);
-                }
-            }
+            // Initialize DDP seeking tracking
+            m_files_seeked_for_ddp.resize(m_inputFiles.size(), false);
 
             m_stopFlag.store(false);
 
@@ -7876,6 +7870,7 @@ namespace binpack
         // DDP support
         int m_rank;
         int m_world_size;
+        std::vector<bool> m_files_seeked_for_ddp;  // Track which files have been seeked for DDP
 
         bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk)
         {
@@ -7886,6 +7881,13 @@ namespace binpack
                 auto& inputFile = m_inputFiles[fileId];
 
                 std::unique_lock lock(m_fileMutex);
+
+                // For DDP: seek the file to rank position on first access
+                if (m_world_size > 1 && !m_files_seeked_for_ddp[fileId])
+                {
+                    inputFile.seek_to_rank_position(m_rank, m_world_size);
+                    m_files_seeked_for_ddp[fileId] = true;
+                }
 
                 if (!inputFile.hasNextChunk())
                 {
