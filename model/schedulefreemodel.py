@@ -115,3 +115,19 @@ class ScheduleFreeLightningModule(NNUE):
     def on_predict_model_eval(self) -> None:  # redundant with on_predict_start()
         self.model.eval()
         self.optimizers().eval()
+
+    def on_train_batch_start(self, batch, batch_idx) -> None:
+        """Ensure optimizer is in train mode before step() is called"""
+        self.optimizers().train()
+
+    def on_validation_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
+        """Ensure smoothed weights for validation batches"""
+        self.optimizers().eval()
+
+    def on_test_batch_start(self, batch, batch_idx, dataloader_idx=0) -> None:
+        """Ensure smoothed weights for test batches"""
+        self.optimizers().eval()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        """Optional: can be used if needed to switch modes after training"""
+        pass
