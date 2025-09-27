@@ -285,6 +285,11 @@ def main():
         help="Initializes training using a given .ckpt model",
     )
     parser.add_argument(
+        "--resume-from-nnue",
+        dest="resume_from_nnue",
+        help="Initializes training using a given .nnue model",
+    )
+    parser.add_argument(
         "--network-save-period",
         type=int,
         default=20,
@@ -393,6 +398,20 @@ def main():
             param_index=args.param_index,
             config=M.ModelConfig(L1=args.l1),
         )
+    elif args.resume_from_nnue is not None:
+        with open(args.resume_from_nnue, "rb") as f:
+            nnue = M.NNUE(
+                feature_set,
+                M.ModelConfig(L1=args.l1),
+                loss_params=loss_params,
+                max_epoch=max_epoch,
+                num_batches_per_epoch=args.epoch_size / batch_size,
+                gamma=args.gamma,
+                lr=args.lr,
+                param_index=args.param_index,
+            )
+            reader = M.NNUEReader(f, feature_set, M.ModelConfig(L1=args.l1))
+            nnue.model = reader.model
     else:
         nnue = torch.load(args.resume_from_model, weights_only=False)
         nnue.model.set_feature_set(feature_set)
