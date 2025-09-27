@@ -477,6 +477,8 @@ def main():
         args.validation_size,
     )
 
+    nnue.freeze_input()
+
     if args.resume_from_checkpoint:
         trainer.fit(nnue, train, val, ckpt_path=args.resume_from_checkpoint)
     else:
