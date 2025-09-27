@@ -14,7 +14,7 @@ def _get_ddp_rank_and_world_size():
     """Get DDP rank and world size from environment variables."""
     rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    print(f"DDP rank: {rank}, world size: {world_size}")
+    print(f"DDP rank: {rank}, world size: {world_size}", flush=True)
     return rank, world_size
 
 
