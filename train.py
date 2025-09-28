@@ -439,13 +439,21 @@ def main():
         save_top_k=-1,
     )
 
+    devices = (
+        [int(x) for x in args.gpus.rstrip(",").split(",") if x] if args.gpus else "auto"
+    )
+    world_size = (
+        len(devices) if isinstance(devices, list) else torch.cuda.device_count()
+    )
+    # TODO fix hack for data loader, to work for the first process,
+    # where this is not yet set correctly at loader construction time
+    os.environ["WORLD_SIZE"] = str(world_size)
+
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
         accelerator="cuda",
-        devices=[int(x) for x in args.gpus.rstrip(",").split(",") if x]
-        if args.gpus
-        else "auto",
+        devices=devices,
         logger=tb_logger,
         callbacks=[
             checkpoint_callback,
@@ -465,7 +473,7 @@ def main():
     else:
         print("Not distributed")
 
-    print("Using C++ data loader")
+    print("Using C++ data loader", flush=True)
     train, val = make_data_loaders(
         train_datasets,
         val_datasets,
