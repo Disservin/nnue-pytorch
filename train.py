@@ -310,7 +310,7 @@ def main():
     parser.add_argument(
         "--validation-size",
         type=int,
-        default=1000000,
+        default=0,
         dest="validation_size",
         help="Number of positions per validation step.",
     )
