@@ -448,6 +448,9 @@ def main():
     # TODO fix hack for data loader, to work for the first process,
     # where this is not yet set correctly at loader construction time
     os.environ["WORLD_SIZE"] = str(world_size)
+    # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
+    # see lightning/fabric/plugins/environments/slurm.py near line 110
+    os.environ["SLURM_JOB_NAME"] = "bash"
 
     trainer = L.Trainer(
         default_root_dir=logdir,
