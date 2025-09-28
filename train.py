@@ -12,8 +12,6 @@ from torch.utils.data import DataLoader
 from lightning.pytorch import loggers as pl_loggers
 from lightning.pytorch.callbacks import TQDMProgressBar, Callback, ModelCheckpoint
 
-import torch.distributed as dist
-
 import data_loader
 import model as M
 
@@ -470,11 +468,6 @@ def main():
     )
 
     nnue = torch.compile(nnue, backend=args.compile_backend)
-
-    if dist.is_available() and dist.is_initialized():
-        print(f"Rank {dist.get_rank()} / {dist.get_world_size()}")
-    else:
-        print("Not distributed")
 
     print("Using C++ data loader", flush=True)
     train, val = make_data_loaders(
