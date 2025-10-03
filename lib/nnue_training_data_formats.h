@@ -7606,7 +7606,7 @@ namespace binpack
             std::vector<std::string> paths,
             std::ios_base::openmode om = std::ios_base::app,
             bool cyclic = false,
-            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr
+            std::function<bool( TrainingDataEntry&)> skipPredicate = nullptr
         ) :
             m_concurrency(concurrency),
             m_bufferOffset(0),
@@ -7647,7 +7647,7 @@ namespace binpack
                     {
                         if (m_movelistReader.has_value())
                         {
-                            const auto e = m_movelistReader->nextEntry();
+                            auto e = m_movelistReader->nextEntry();
 
                             if (!m_movelistReader->hasNext())
                             {
@@ -7669,7 +7669,7 @@ namespace binpack
                             const std::uint16_t numPlies = (m_chunk[m_offset] << 8) | m_chunk[m_offset + 1];
                             m_offset += 2;
 
-                            const auto e = unpackEntry(packed);
+                            auto e = unpackEntry(packed);
 
                             if (numPlies > 0)
                             {
@@ -7813,7 +7813,7 @@ namespace binpack
         std::mutex m_fileMutex;
         std::condition_variable m_waitingBufferEmpty;
         std::condition_variable m_waitingBufferFull;
-        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        std::function<bool( TrainingDataEntry&)> m_skipPredicate;
 
         std::vector<std::thread> m_workers;
 

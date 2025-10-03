@@ -463,7 +463,7 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
-    Stream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    Stream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(TrainingDataEntry&)> skipPredicate) :
         m_stream(training_data::open_sfen_input_file_parallel(concurrency, filenames, cyclic, skipPredicate))
     {
     }
@@ -479,7 +479,7 @@ struct AsyncStream : Stream<StorageT>
 {
     using BaseType = Stream<StorageT>;
 
-    AsyncStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    AsyncStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(TrainingDataEntry&)> skipPredicate) :
         BaseType(1, filenames, cyclic, skipPredicate)
     {
     }
@@ -506,7 +506,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const std::vector<std::string>& filenames, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FeaturedBatchStream(int concurrency, const std::vector<std::string>& filenames, int batch_size, bool cyclic, std::function<bool(TrainingDataEntry&)> skipPredicate) :
         BaseType(
             std::max(
                 1,
@@ -691,7 +691,7 @@ struct FenBatchStream : Stream<FenBatch>
 
     using BaseType = Stream<FenBatch>;
 
-    FenBatchStream(int concurrency, const std::vector<std::string>& filenames, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FenBatchStream(int concurrency, const std::vector<std::string>& filenames, int batch_size, bool cyclic, std::function<bool(TrainingDataEntry&)> skipPredicate) :
         BaseType(
             std::max(
                 1,
@@ -818,14 +818,14 @@ struct DataloaderSkipConfig {
     int param_index;
 };
 
-std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig config)
+std::function<bool(TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig config)
 {
     if (config.filtered || config.random_fen_skipping || config.wld_filtered || config.early_fen_skipping)
     {
         return [
             config,
             prob = double(config.random_fen_skipping) / (config.random_fen_skipping + 1)
-            ](const TrainingDataEntry& e){
+            ](TrainingDataEntry& e){
 
             // VALUE_NONE from Stockfish.
             // We need to allow a way to skip predetermined positions without
@@ -861,9 +861,14 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
             static constexpr double max_skipping_rate = 10.0;
 
             auto do_wld_skip = [&]() {
-                std::bernoulli_distribution distrib(1.0 - e.score_result_prob());
-                auto& prng = rng::get_thread_local_rng();
-                return distrib(prng);
+                // std::bernoulli_distribution distrib(1.0 - e.score_result_prob());
+                // auto& prng = rng::get_thread_local_rng();
+                // return distrib(prng);
+                auto [w, l, d] = e.win_rate_model();
+                if (w > 0.70 || l > 0.70)
+                    e.result = (w > l) ? 1 : -1;
+                if (d > 0.70)
+                    e.result = 0;
             };
 
             auto do_skip = [&]() {
@@ -889,8 +894,11 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
             if (config.filtered && do_filter())
                 return true;
 
-            if (config.wld_filtered && do_wld_skip())
-                return true;
+            if (config.wld_filtered) {
+                do_wld_skip();
+            }
+            // if (config.wld_filtered && do_wld_skip())
+                // return true;
 
             if (config.simple_eval_skipping > 0 && std::abs(e.pos.simple_eval()) < config.simple_eval_skipping)
                 return true;
