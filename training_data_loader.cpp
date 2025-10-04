@@ -881,7 +881,8 @@ std::function<bool(TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig
             if (e.score == VALUE_NONE)
                 return true;
 
-            if ((e.score > 0 && e.result == -1) || (e.score < 0 && e.result == 1))
+            // never take results from the losing side..
+            if (e.result == -1)
                 return true;
 
             if (e.ply <= config.early_fen_skipping)
