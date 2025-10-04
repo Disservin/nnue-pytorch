@@ -861,14 +861,10 @@ std::function<bool(TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig
             static constexpr double max_skipping_rate = 10.0;
 
             auto do_wld_skip = [&]() {
-                // std::bernoulli_distribution distrib(1.0 - e.score_result_prob());
-                // auto& prng = rng::get_thread_local_rng();
-                // return distrib(prng);
-                auto [w, l, d] = e.win_rate_model();
-                if (w > 0.70 || l > 0.70)
-                    e.result = (w > l) ? 1 : -1;
-                if (d > 0.70)
-                    e.result = 0;
+                std::bernoulli_distribution distrib(1.0 - e.score_result_prob());
+                auto& prng = rng::get_thread_local_rng();
+                return distrib(prng);
+
             };
 
             auto do_skip = [&]() {
@@ -885,6 +881,9 @@ std::function<bool(TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig
             if (e.score == VALUE_NONE)
                 return true;
 
+            if ((e.score > 0 && e.result == -1) || (e.score < 0 && e.result == 1))
+                return true;
+
             if (e.ply <= config.early_fen_skipping)
                 return true;
 
@@ -894,11 +893,10 @@ std::function<bool(TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig
             if (config.filtered && do_filter())
                 return true;
 
-            if (config.wld_filtered) {
-                do_wld_skip();
+
+            if (config.wld_filtered && do_wld_skip()) {
+                return true;
             }
-            // if (config.wld_filtered && do_wld_skip())
-                // return true;
 
             if (config.simple_eval_skipping > 0 && std::abs(e.pos.simple_eval()) < config.simple_eval_skipping)
                 return true;
