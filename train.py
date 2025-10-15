@@ -333,6 +333,13 @@ def main():
         dest="simple_eval_skipping",
         help="Skip positions that have abs(simple_eval(pos)) < n",
     )
+    parser.add_argument(
+        "--freeze-input",
+        type=bool,
+        default=False,
+        dest="freeze_input",
+        help="If enabled, the input layers will be frozen during training.",
+    )
     parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
     M.add_feature_args(parser)
     args = parser.parse_args()
@@ -479,6 +486,10 @@ def main():
         args.epoch_size,
         args.validation_size,
     )
+
+    if args.freeze_input:
+        print("Freezing input layers.")
+        nnue.freeze_input()
 
     if args.resume_from_checkpoint:
         trainer.fit(nnue, train, val, ckpt_path=args.resume_from_checkpoint)

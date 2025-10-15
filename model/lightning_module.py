@@ -51,6 +51,11 @@ class NNUE(L.LightningModule):
         self.lr = lr
         self.param_index = param_index
 
+    def freeze_input(self):
+        """Freeze only the feature transformer (input) parameters."""
+        for p in self.model.input.parameters():
+            p.requires_grad = False
+
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
@@ -123,17 +128,27 @@ class NNUE(L.LightningModule):
 
     def configure_optimizers(self):
         LR = self.lr
-        train_params = [
-            {"params": _get_parameters([self.model.input]), "lr": LR, "gc_dim": 0},
-            {"params": [self.model.layer_stacks.l1_fact.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l1_fact.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.l1.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l1.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.l2.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.l2.bias], "lr": LR},
-            {"params": [self.model.layer_stacks.output.weight], "lr": LR},
-            {"params": [self.model.layer_stacks.output.bias], "lr": LR},
-        ]
+
+        train_params: list[dict] = []
+
+        def add_group(params, lr: float, **extra):
+            params = [p for p in params if p.requires_grad]
+            if not params:
+                return
+            group = {"params": params, "lr": lr}
+            group.update(extra)
+            train_params.append(group)
+
+        add_group(_get_parameters([self.model.input]), LR, gc_dim=0)
+
+        add_group([self.model.layer_stacks.l1_fact.weight], LR)
+        add_group([self.model.layer_stacks.l1_fact.bias], LR)
+        add_group([self.model.layer_stacks.l1.weight], LR)
+        add_group([self.model.layer_stacks.l1.bias], LR)
+        add_group([self.model.layer_stacks.l2.weight], LR)
+        add_group([self.model.layer_stacks.l2.bias], LR)
+        add_group([self.model.layer_stacks.output.weight], LR)
+        add_group([self.model.layer_stacks.output.bias], LR)
 
         optimizer = ranger21.Ranger21(
             train_params,
