@@ -52,6 +52,10 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <random>
 #include <functional>
 
+#include <fstream>
+#include <sstream>
+#include <unistd.h> // for getpid()
+
 #ifdef HAS_BMI2
 #include <immintrin.h> // _pdep_u64
 #endif
@@ -6799,6 +6803,18 @@ namespace binpack
         {
             if (n == 0) return true;
 
+            static std::ofstream ofs;
+
+            if (!ofs.is_open()) {
+                std::ostringstream fname;
+                fname << "boo_" << getpid() << ".out";
+                ofs.open(fname.str(), std::ios::app);
+            }
+            if (n == 0) {
+                ofs << "index: " << m_file.tellg() << std::endl;
+                return true;
+            }
+
             bool wrapped = false;
             std::size_t skipped = 0;
 
@@ -6818,6 +6834,7 @@ namespace binpack
                 ++skipped;
             }
 
+            ofs << "index: " << m_file.tellg() << std::endl;
             return true;
         }
 
