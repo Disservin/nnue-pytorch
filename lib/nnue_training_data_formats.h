@@ -7882,6 +7882,7 @@ namespace binpack
                         if (!success && m_cyclic)
                         {
                             inputFile.seek_to_start();
+                            m_files_seeked_for_ddp[fileId] = false;
                             inputFile.skipChunks(static_cast<std::size_t>(m_rank));
                         }
                     }
