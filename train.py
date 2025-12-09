@@ -374,6 +374,13 @@ def main():
     )
 
     parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
+    parser.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use (0 disables PSQT). Defaults to the feature set preference.",
+    )
     M.add_feature_args(parser)
     args = parser.parse_args()
 
@@ -407,6 +414,11 @@ def main():
     print("Using batch size {}".format(batch_size))
 
     feature_set = M.get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
 
     loss_params = M.LossParams(
         in_offset=args.in_offset,
@@ -435,6 +447,7 @@ def main():
             param_index=args.param_index,
             config=M.ModelConfig(L1=args.l1),
             quantize_config=M.QuantizationConfig(),
+            num_psqt_buckets=num_psqt_buckets,
         )
     else:
         assert os.path.exists(args.resume_from_model)
@@ -453,11 +466,21 @@ def main():
         nnue.gamma = args.gamma
         nnue.lr = args.lr
         nnue.param_index = args.param_index
+        if (
+            args.psqt_buckets is not None
+            and nnue.model.num_psqt_buckets != num_psqt_buckets
+        ):
+            raise ValueError(
+                f"Loaded model was trained with {nnue.model.num_psqt_buckets} PSQT buckets "
+                f"instead of requested {num_psqt_buckets}."
+            )
+        num_psqt_buckets = nnue.model.num_psqt_buckets
 
     print("Feature set: {}".format(feature_set.name))
     print("Num real features: {}".format(feature_set.num_real_features))
     print("Num virtual features: {}".format(feature_set.num_virtual_features))
     print("Num features: {}".format(feature_set.num_features))
+    print("Num PSQT buckets: {}".format(num_psqt_buckets))
 
     print("Training with: {}".format(train_datasets))
     print("Validating with: {}".format(val_datasets))

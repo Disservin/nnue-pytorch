@@ -424,9 +424,16 @@ def read_model(
     feature_set: FeatureSet,
     config: ModelConfig,
     quantize_config: QuantizationConfig,
+    num_psqt_buckets: int,
 ) -> NNUEModel:
     with open(nnue_path, "rb") as f:
-        reader = NNUEReader(f, feature_set, config, quantize_config)
+        reader = NNUEReader(
+            f,
+            feature_set,
+            config,
+            quantize_config,
+            num_psqt_buckets=num_psqt_buckets,
+        )
         return reader.model
 
 
@@ -475,8 +482,15 @@ def forward_ft(
     layer_stack_indices: torch.Tensor,
 ) -> torch.Tensor:
     wp, bp = model.input(white_indices, white_values, black_indices, black_values)
-    w, _ = torch.split(wp, model.L1, dim=1)
-    b, _ = torch.split(bp, model.L1, dim=1)
+    if model.num_psqt_buckets > 0:
+        w, _ = torch.split(
+            wp, [model.L1, model.num_psqt_buckets], dim=1
+        )
+        b, _ = torch.split(
+            bp, [model.L1, model.num_psqt_buckets], dim=1
+        )
+    else:
+        w, b = wp, bp
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
     l0_ = torch.clamp(l0_, 0.0, model.quantization.ft_quantized_one)
 
@@ -584,17 +598,27 @@ def gather_impl(model: NNUEModel, dataset: str, count: int) -> npt.NDArray[np.bo
 
 def command_gather(args: argparse.Namespace) -> None:
     feature_set = M.get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
     if args.checkpoint:
         nnue = NNUE.load_from_checkpoint(
             args.checkpoint,
             feature_set=feature_set,
             config=ModelConfig(L1=args.l1),
             quantize_config=QuantizationConfig(),
+            num_psqt_buckets=num_psqt_buckets,
         )
         model = nnue.model
     else:
         model = read_model(
-            args.net, feature_set, ModelConfig(L1=args.l1), QuantizationConfig()
+            args.net,
+            feature_set,
+            ModelConfig(L1=args.l1),
+            QuantizationConfig(),
+            num_psqt_buckets,
         )
 
     model.eval()
@@ -711,6 +735,13 @@ def main() -> None:
         "--out", type=str, help="Filename under which to save the resulting ft matrix"
     )
     parser_gather.add_argument("--l1", type=int, default=M.ModelConfig().L1)
+    parser_gather.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use when constructing the model (0 disables PSQT). Defaults to the feature set preference.",
+    )
     M.add_feature_args(parser_gather)
     parser_gather.set_defaults(func=command_gather)
 

@@ -65,12 +65,24 @@ def main():
         "--dont-show", action="store_true", help="Don't show the plots."
     )
     parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
+    parser.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use when constructing the models (0 disables PSQT). Defaults to the feature set preference.",
+    )
     M.add_feature_args(parser)
     args = parser.parse_args()
 
     supported_features = ("HalfKAv2", "HalfKAv2^", "HalfKAv2_hm", "HalfKAv2_hm^")
     assert args.features in supported_features
     feature_set = M.get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
 
     from os.path import basename
 
@@ -84,7 +96,13 @@ def main():
         labels.append("\n".join(label.split("-")))
 
     models = [
-        M.load_model(m, feature_set, M.ModelConfig(L1=args.l1), M.QuantizationConfig())
+        M.load_model(
+            m,
+            feature_set,
+            M.ModelConfig(L1=args.l1),
+            M.QuantizationConfig(),
+            num_psqt_buckets=num_psqt_buckets,
+        )
         for m in args.models
     ]
 
@@ -93,10 +111,6 @@ def main():
     ]
     input_weights = [
         coalesced_in[:, : args.l1].flatten().numpy() for coalesced_in in coalesced_ins
-    ]
-    input_weights_psqt = [
-        (coalesced_in[:, args.l1 :] * 600).flatten().numpy()
-        for coalesced_in in coalesced_ins
     ]
     plot_hists(
         [input_weights],
@@ -108,16 +122,23 @@ def main():
         title="Distribution of feature transformer weights among different nets",
         filename="input_weights_hist.png",
     )
-    plot_hists(
-        [input_weights_psqt],
-        labels,
-        [None],
-        w=10.0,
-        h=3.0,
-        num_bins=8 * 128,
-        title="Distribution of feature transformer PSQT weights among different nets (in stockfish internal units)",
-        filename="input_weights_psqt_hist.png",
-    )
+    if any(model.num_psqt_buckets > 0 for model in models):
+        input_weights_psqt = [
+            (coalesced_in[:, args.l1 :] * 600).flatten().numpy()
+            for coalesced_in in coalesced_ins
+        ]
+        plot_hists(
+            [input_weights_psqt],
+            labels,
+            [None],
+            w=10.0,
+            h=3.0,
+            num_bins=8 * 128,
+            title="Distribution of feature transformer PSQT weights among different nets (in stockfish internal units)",
+            filename="input_weights_psqt_hist.png",
+        )
+    else:
+        print("Skipping PSQT histogram: models do not use PSQT outputs.")
 
     layer_stacks = [model.layer_stacks for model in models]
     layers_l1 = [[] for i in range(layer_stacks[0].count)]

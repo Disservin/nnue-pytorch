@@ -34,6 +34,11 @@ class FeatureSet:
             feature.num_virtual_features for feature in features
         )
         self.num_features = sum(feature.num_features for feature in features)
+        self.default_num_psqt_buckets = (
+            max(getattr(feature, "default_psqt_buckets", 8) for feature in features)
+            if features
+            else 8
+        )
 
     def get_virtual_feature_ranges(self) -> list[tuple[int, int]]:
         """
@@ -98,6 +103,9 @@ class FeatureSet:
             offset += feature.num_features
 
         raise Exception("No feature block to factorize {}".format(idx))
+
+    def get_default_num_psqt_buckets(self) -> int:
+        return self.default_num_psqt_buckets
 
     def get_virtual_to_real_features_gather_indices(self) -> list[list[int]]:
         """

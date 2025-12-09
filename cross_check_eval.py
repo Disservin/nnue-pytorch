@@ -21,9 +21,16 @@ def read_model(
     feature_set: FeatureSet,
     config: ModelConfig,
     quantize_config: QuantizationConfig,
+    num_psqt_buckets: int,
 ):
     with open(nnue_path, "rb") as f:
-        reader = NNUEReader(f, feature_set, config, quantize_config)
+        reader = NNUEReader(
+            f,
+            feature_set,
+            config,
+            quantize_config,
+            num_psqt_buckets=num_psqt_buckets,
+        )
         return reader.model
 
 
@@ -175,22 +182,39 @@ def main():
         "--count", type=int, default=100, help="number of datapoints to process"
     )
     parser.add_argument("--l1", type=int, default=ModelConfig().L1)
+    parser.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use when constructing the model (0 disables PSQT). Defaults to the feature set preference.",
+    )
     add_feature_args(parser)
     args = parser.parse_args()
 
     batch_size = 1000
 
     feature_set = get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
     if args.checkpoint:
         model = NNUE.load_from_checkpoint(
             args.checkpoint,
             feature_set=feature_set,
             config=ModelConfig(L1=args.l1),
             quantize_config=QuantizationConfig(),
+            num_psqt_buckets=num_psqt_buckets,
         )
     else:
         model = read_model(
-            args.net, feature_set, ModelConfig(L1=args.l1), QuantizationConfig()
+            args.net,
+            feature_set,
+            ModelConfig(L1=args.l1),
+            QuantizationConfig(),
+            num_psqt_buckets,
         )
     model.eval()
     fen_batch_provider = make_fen_batch_provider(args.data, batch_size)

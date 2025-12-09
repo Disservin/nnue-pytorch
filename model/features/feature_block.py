@@ -49,6 +49,9 @@ class FeatureBlock:
     that are active for this board.
     """
 
+    # Default number of PSQT buckets expected by networks using this feature block.
+    default_psqt_buckets: int = 8
+
     def __init__(self, name: str, hash: int, factors: OrderedDict[str, int]):
         if not isinstance(factors, OrderedDict):
             raise Exception("Factors must be an collections.OrderedDict")

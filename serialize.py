@@ -70,10 +70,22 @@ def main():
         "--device", type=int, default="0", help="Device to use for cupy"
     )
     parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
+    parser.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use when constructing models (0 disables PSQT). Defaults to the feature set preference.",
+    )
     M.add_feature_args(parser)
     args = parser.parse_args()
 
     feature_set = M.get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
 
     print("Converting %s to %s" % (args.source, args.target))
 
@@ -86,6 +98,7 @@ def main():
             feature_set=feature_set,
             config=M.ModelConfig(L1=args.l1),
             quantize_config=M.QuantizationConfig(),
+            num_psqt_buckets=num_psqt_buckets,
             map_location=torch.device("cpu"),
         )
         nnue.eval()
@@ -94,10 +107,17 @@ def main():
     elif args.source.endswith(".nnue"):
         with open(args.source, "rb") as f:
             nnue = M.NNUE(
-                feature_set, M.ModelConfig(L1=args.l1), M.QuantizationConfig()
+                feature_set,
+                M.ModelConfig(L1=args.l1),
+                M.QuantizationConfig(),
+                num_psqt_buckets=num_psqt_buckets,
             )
             reader = M.NNUEReader(
-                f, feature_set, M.ModelConfig(L1=args.l1), M.QuantizationConfig()
+                f,
+                feature_set,
+                M.ModelConfig(L1=args.l1),
+                M.QuantizationConfig(),
+                num_psqt_buckets=num_psqt_buckets,
             )
             nnue.model = reader.model
             if args.description is None:

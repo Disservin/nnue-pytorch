@@ -652,19 +652,42 @@ def main():
         help="Override the label used in plot titles and as prefix of saved files.",
     )
     parser.add_argument("--l1", type=int, default=M.ModelConfig().L1)
+    parser.add_argument(
+        "--psqt-buckets",
+        type=int,
+        default=None,
+        dest="psqt_buckets",
+        help="Number of PSQT buckets to use for the primary model (0 disables PSQT). Defaults to the feature set preference.",
+    )
+    parser.add_argument(
+        "--ref-psqt-buckets",
+        type=int,
+        default=None,
+        dest="ref_psqt_buckets",
+        help="Number of PSQT buckets to use for the reference model. Defaults to --psqt-buckets (if set) or the reference feature set preference.",
+    )
     M.add_feature_args(parser)
     args = parser.parse_args()
 
     supported_features = ("HalfKAv2_hm", "HalfKAv2_hm^")
     assert args.features in supported_features
     feature_set = M.get_feature_set_from_name(args.features)
+    num_psqt_buckets = (
+        args.psqt_buckets
+        if args.psqt_buckets is not None
+        else feature_set.get_default_num_psqt_buckets()
+    )
 
     from os.path import basename
 
     label = basename(args.model)
 
     model = M.load_model(
-        args.model, feature_set, M.ModelConfig(L1=args.l1), M.QuantizationConfig()
+        args.model,
+        feature_set,
+        M.ModelConfig(L1=args.l1),
+        M.QuantizationConfig(),
+        num_psqt_buckets=num_psqt_buckets,
     )
 
     if args.ref_model:
@@ -674,11 +697,19 @@ def main():
         else:
             ref_feature_set = feature_set
 
+        if args.ref_psqt_buckets is not None:
+            ref_num_psqt_buckets = args.ref_psqt_buckets
+        elif args.psqt_buckets is not None and args.ref_features is None:
+            ref_num_psqt_buckets = num_psqt_buckets
+        else:
+            ref_num_psqt_buckets = ref_feature_set.get_default_num_psqt_buckets()
+
         ref_model = M.load_model(
             args.ref_model,
             ref_feature_set,
             M.ModelConfig(L1=args.l1),
             M.QuantizationConfig(),
+            num_psqt_buckets=ref_num_psqt_buckets,
         )
 
         print(

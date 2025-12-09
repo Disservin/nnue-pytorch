@@ -24,6 +24,7 @@ class NNUEModel(nn.Module):
 
         self.num_psqt_buckets = num_psqt_buckets
         self.num_ls_buckets = num_ls_buckets
+        self.has_psqt = self.num_psqt_buckets > 0
 
         self.input = DoubleFeatureTransformer(
             feature_set.num_features, self.L1 + self.num_psqt_buckets
@@ -38,7 +39,8 @@ class NNUEModel(nn.Module):
 
     def _init_layers(self):
         self._zero_virtual_feature_weights()
-        self._init_psqt()
+        if self.has_psqt:
+            self._init_psqt()
 
     def _zero_virtual_feature_weights(self):
         """
@@ -52,6 +54,9 @@ class NNUEModel(nn.Module):
         self.input.weight = nn.Parameter(weights)
 
     def _init_psqt(self):
+        if not self.has_psqt:
+            return
+
         input_weights = self.input.weight
         input_bias = self.input.bias
         # 1.0 / kPonanzaConstant
@@ -186,8 +191,15 @@ class NNUEModel(nn.Module):
         layer_stack_indices: torch.Tensor,
     ):
         wp, bp = self.input(white_indices, white_values, black_indices, black_values)
-        w, wpsqt = torch.split(wp, self.L1, dim=1)
-        b, bpsqt = torch.split(bp, self.L1, dim=1)
+        if self.has_psqt:
+            w, wpsqt = torch.split(
+                wp, [self.L1, self.num_psqt_buckets], dim=1
+            )
+            b, bpsqt = torch.split(
+                bp, [self.L1, self.num_psqt_buckets], dim=1
+            )
+        else:
+            w, b = wp, bp
         l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
         l0_ = torch.clamp(l0_, 0.0, 1.0)
 
@@ -197,12 +209,14 @@ class NNUEModel(nn.Module):
         # and it's more efficient to divide by 128 instead.
         l0_ = torch.cat(l0_s1, dim=1) * (127 / 128)
 
-        psqt_indices_unsq = psqt_indices.unsqueeze(dim=1)
-        wpsqt = wpsqt.gather(1, psqt_indices_unsq)
-        bpsqt = bpsqt.gather(1, psqt_indices_unsq)
-        # The PSQT values are averaged over perspectives. "Their" perspective
-        # has a negative influence (us-0.5 is 0.5 for white and -0.5 for black,
-        # which does both the averaging and sign flip for black to move)
-        x = self.layer_stacks(l0_, layer_stack_indices) + (wpsqt - bpsqt) * (us - 0.5)
+        x = self.layer_stacks(l0_, layer_stack_indices)
+        if self.has_psqt:
+            psqt_indices_unsq = psqt_indices.unsqueeze(dim=1)
+            wpsqt = wpsqt.gather(1, psqt_indices_unsq)
+            bpsqt = bpsqt.gather(1, psqt_indices_unsq)
+            # The PSQT values are averaged over perspectives. "Their" perspective
+            # has a negative influence (us-0.5 is 0.5 for white and -0.5 for black,
+            # which does both the averaging and sign flip for black to move)
+            x = x + (wpsqt - bpsqt) * (us - 0.5)
 
         return x

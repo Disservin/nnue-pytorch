@@ -12,7 +12,11 @@ def load_model(
     feature_set: FeatureSet,
     config: ModelConfig,
     quantize_config: QuantizationConfig,
+    num_psqt_buckets: int | None = None,
 ) -> NNUEModel:
+    if num_psqt_buckets is None:
+        num_psqt_buckets = feature_set.get_default_num_psqt_buckets()
+
     if filename.endswith(".pt"):
         model = torch.load(filename, weights_only=False)
         model.eval()
@@ -26,13 +30,20 @@ def load_model(
             feature_set=feature_set,
             config=config,
             quantize_config=quantize_config,
+            num_psqt_buckets=num_psqt_buckets,
         )
         model.eval()
         return model.model
 
     elif filename.endswith(".nnue"):
         with open(filename, "rb") as f:
-            reader = NNUEReader(f, feature_set, config, quantize_config)
+            reader = NNUEReader(
+                f,
+                feature_set,
+                config,
+                quantize_config,
+                num_psqt_buckets=num_psqt_buckets,
+            )
         return reader.model
 
     else:

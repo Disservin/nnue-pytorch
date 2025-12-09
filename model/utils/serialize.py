@@ -18,7 +18,12 @@ from ..quantize import QuantizationConfig
 
 
 def ascii_hist(name, x, bins=6):
-    N, X = np.histogram(x, bins=bins)
+    arr = np.asarray(x)
+    if arr.size == 0:
+        print(f"{name} (empty)")
+        return
+
+    N, X = np.histogram(arr, bins=bins)
     width = 50
     nmax = N.max()
 
@@ -217,10 +222,18 @@ class NNUEReader:
         feature_set: FeatureSet,
         config: ModelConfig,
         quantize_config: QuantizationConfig,
+        num_psqt_buckets: int = 8,
+        num_ls_buckets: int = 8,
     ):
         self.f = f
         self.feature_set = feature_set
-        self.model = NNUEModel(feature_set, config, quantize_config)
+        self.model = NNUEModel(
+            feature_set,
+            config,
+            quantize_config,
+            num_psqt_buckets=num_psqt_buckets,
+            num_ls_buckets=num_ls_buckets,
+        )
         self.config = config
         fc_hash = NNUEWriter.fc_hash(self.model)
 
@@ -319,7 +332,7 @@ class NNUEReader:
             )
         )
 
-        layer.bias.data = torch.cat([bias, torch.tensor([0] * num_psqt_buckets)])
+        layer.bias.data = torch.cat([bias, bias.new_zeros(num_psqt_buckets)])
         layer.weight.data = torch.cat([weight, psqt_weight], dim=1)
 
     def read_fc_layer(self, layer: nn.Linear, is_output: bool = False) -> None:

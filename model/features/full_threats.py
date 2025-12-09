@@ -130,6 +130,8 @@ def halfka_psqts() -> list[int]:
 
 
 class Features(FeatureBlock):
+    default_psqt_buckets = 0
+
     def __init__(self):
         super().__init__(
             "Full_Threats", 0x8F234CB8, OrderedDict([("Full_Threats", NUM_INPUTS)])
@@ -145,6 +147,8 @@ class Features(FeatureBlock):
 
 
 class FactorizedFeatures(FeatureBlock):
+    default_psqt_buckets = 0
+
     def __init__(self):
         super().__init__(
             "Full_Threats^",
