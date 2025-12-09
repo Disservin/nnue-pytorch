@@ -153,7 +153,10 @@ class NNUEWriter:
 
         all_weight = coalesce_ft_weights(model.feature_set, layer)
         weight = all_weight[:, : model.L1]
-        psqt_weight = all_weight[:, model.L1 :]
+        if model.has_psqt:
+            psqt_weight = all_weight[:, model.L1 :]
+        else:
+            psqt_weight = all_weight.new_zeros(all_weight.shape[0], 0)
 
         def histogram_callback(
             bias: torch.Tensor, weight: torch.Tensor, psqt_weight: torch.Tensor
@@ -170,7 +173,8 @@ class NNUEWriter:
 
         self.write_tensor(bias.flatten().numpy(), ft_compression)
         self.write_tensor(weight.flatten().numpy(), ft_compression)
-        self.write_tensor(psqt_weight.flatten().numpy(), ft_compression)
+        if model.has_psqt:
+            self.write_tensor(psqt_weight.flatten().numpy(), ft_compression)
 
     def write_fc_layer(
         self, model: NNUEModel, layer: nn.Linear, is_output=False
@@ -324,7 +328,10 @@ class NNUEReader:
         bias = self.tensor(np.int16, [layer.bias.shape[0] - num_psqt_buckets])
         # weights stored as [num_features][outputs]
         weight = self.tensor(np.int16, [shape[0], shape[1] - num_psqt_buckets])
-        psqt_weight = self.tensor(np.int32, [shape[0], num_psqt_buckets])
+        if num_psqt_buckets > 0:
+            psqt_weight = self.tensor(np.int32, [shape[0], num_psqt_buckets])
+        else:
+            psqt_weight = weight.new_zeros(shape[0], num_psqt_buckets)
 
         bias, weight, psqt_weight = (
             self.model.quantization.dequantize_feature_transformer(
