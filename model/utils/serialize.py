@@ -164,7 +164,13 @@ class NNUEWriter:
         # Weights stored as [num_features][outputs]
 
         self.write_tensor(bias.flatten().numpy(), ft_compression)
-        self.write_tensor(weight.flatten().numpy(), ft_compression)
+        if model.feature_set.name.startswith("Full_Threats"):
+            threat_weight = weight[:79856].to(torch.int8)
+            psq_weight = psqt_weight[79856:]
+            self.write_tensor(threat_weight.flatten().numpy())
+            self.write_tensor(psq_weight.flatten().numpy(), ft_compression)
+        else:
+            self.write_tensor(weight.flatten().numpy(), ft_compression)
         self.write_tensor(psqt_weight.flatten().numpy(), ft_compression)
 
     def write_fc_layer(
