@@ -253,7 +253,7 @@ def main():
         num_sanity_val_steps=0,
     )
 
-    nnue = torch.compile(nnue, backend=args.compile_backend)
+    nnue = torch.compile(nnue, backend=args.compile_backend, mode=args.mode)
 
     print("Using C++ data loader", flush=True)
     train, val = make_data_loaders(

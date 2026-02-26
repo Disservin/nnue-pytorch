@@ -46,6 +46,9 @@ class TrainingConfig(LossParams, DataloaderSkipConfig, FeatureConfig, ModelConfi
     compile_backend: Literal["inductor", "cudagraphs"] = "inductor"
     """Which backend to use for torch.compile. inductor works well with larger nets, cudagraphs with smaller nets."""
 
+    mode: Optional[Literal["default", "reduce-overhead", "max-autotune"]] = None
+    """Mode to use for torch.compile. Default is None."""
+
     seed: int = 42
     """Torch seed to use."""
 
