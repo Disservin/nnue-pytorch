@@ -9,6 +9,7 @@ from .kernel import (
 
 class SparseLinearFunction(autograd.Function):
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, feature_indices, feature_values, weight, bias):
         ctx.save_for_backward(feature_indices, feature_values, weight, bias)
 
@@ -69,6 +70,7 @@ class SparseLinearFunction(autograd.Function):
         return output
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         assert not ctx.needs_input_grad[0]
         assert not ctx.needs_input_grad[1]

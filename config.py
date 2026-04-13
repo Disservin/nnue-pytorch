@@ -53,6 +53,9 @@ class TrainingConfig:
     compile_backend: Literal["inductor", "cudagraphs"] = "inductor"
     """Which backend to use for torch.compile. inductor works well with larger nets, cudagraphs with smaller nets."""
 
+    precision: Literal["32-true", "16-mixed", "bf16-mixed"] = "32-true"
+    """Trainer precision. Mixed modes use AMP for supported ops while keeping model weights and optimizer state in fp32."""
+
     seed: int = 42
     """Torch seed to use."""
 

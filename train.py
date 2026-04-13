@@ -421,6 +421,7 @@ def main():
         enable_progress_bar=False,
         enable_checkpointing=True,
         benchmark=True,
+        precision=args.precision,
         num_sanity_val_steps=0 if val is None else 4,
     )
 
