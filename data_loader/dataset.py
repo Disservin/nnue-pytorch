@@ -84,6 +84,8 @@ class TrainingDataProvider:
         batch_size=None,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
+        device="cpu",
+        buffers=None,
     ):
         self.feature_set = feature_set.encode("utf-8")
         self.create_stream = create_stream
@@ -95,6 +97,8 @@ class TrainingDataProvider:
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.config = config
+        self.device = device
+        self.buffers = buffers
 
         if batch_size:
             self.stream = self.create_stream(
@@ -123,7 +127,7 @@ class TrainingDataProvider:
         v = self.fetch_next(self.stream)
 
         if v:
-            tensors = v.contents.get_tensors("cpu")
+            tensors = v.contents.get_tensors(self.device, self.buffers)
             self.destroy_part(v)
             return tensors
         else:
@@ -143,6 +147,8 @@ class SparseBatchProvider(TrainingDataProvider):
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
+        device="cpu",
+        buffers=None,
     ):
         super().__init__(
             feature_set,
@@ -156,6 +162,8 @@ class SparseBatchProvider(TrainingDataProvider):
             batch_size,
             config,
             ddp_config,
+            device,
+            buffers,
         )
 
 
@@ -169,6 +177,8 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
+        device="cpu",
+        buffers=None,
     ):
         super().__init__()
         self.feature_set = feature_set
@@ -178,6 +188,8 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         self.num_workers = num_workers
         self.config = config
         self.ddp_config = ddp_config
+        self.device = device
+        self.buffers = buffers
 
     def __iter__(self):
         return SparseBatchProvider(
@@ -188,16 +200,30 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             num_workers=self.num_workers,
             config=self.config,
             ddp_config=self.ddp_config,
+            device=self.device,
+            buffers=self.buffers,
         )
 
 
 class FixedNumBatchesDataset(Dataset):
-    def __init__(self, dataset, num_batches, pin_memory=False, queue_size_limit=None):
+    def __init__(
+        self,
+        dataset,
+        num_batches,
+        pin_memory=False,
+        queue_size_limit=None,
+        device="cpu",
+        batch_size=None,
+        max_active_features=None,
+    ):
         super().__init__()
         self.dataset = dataset
-        self.iter = None  # Deferred to _start_prefetching
+        self.iter = None
         self.num_batches = num_batches
         self.pin_memory = pin_memory
+        self.device = device
+        self.batch_size = batch_size
+        self.max_active_features = max_active_features
         if queue_size_limit is None:
             queue_size_limit = 10 if pin_memory else 100
 
@@ -206,9 +232,58 @@ class FixedNumBatchesDataset(Dataset):
         self._stop_prefetching = threading.Event()
         self._prefetch_started = False
         self._lock = threading.Lock()
+        self._buffers = None
+        self._first_batch = None
+        if self.device != "cpu" and self.batch_size is not None and self.max_active_features is not None:
+            self._create_buffers()
+
+    def _create_buffers(self):
+        self._buffers = {
+            "us": torch.empty(
+                self.batch_size, 1, dtype=torch.float32, device=self.device
+            ),
+            "them": torch.empty(
+                self.batch_size, 1, dtype=torch.float32, device=self.device
+            ),
+            "white_indices": torch.empty(
+                self.batch_size,
+                self.max_active_features,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "white_values": torch.empty(
+                self.batch_size,
+                self.max_active_features,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "black_indices": torch.empty(
+                self.batch_size,
+                self.max_active_features,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "black_values": torch.empty(
+                self.batch_size,
+                self.max_active_features,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "outcome": torch.empty(
+                self.batch_size, 1, dtype=torch.float32, device=self.device
+            ),
+            "score": torch.empty(
+                self.batch_size, 1, dtype=torch.float32, device=self.device
+            ),
+            "psqt_indices": torch.empty(
+                self.batch_size, dtype=torch.long, device=self.device
+            ),
+            "layer_stack_indices": torch.empty(
+                self.batch_size, dtype=torch.long, device=self.device
+            ),
+        }
 
     def _safe_put(self, item):
-        """Helper to ensure we don't hang on shutdown if queue is full."""
         while not self._stop_prefetching.is_set():
             try:
                 self._prefetch_queue.put(item, timeout=1.0)
@@ -221,7 +296,6 @@ class FixedNumBatchesDataset(Dataset):
             while not self._stop_prefetching.is_set():
                 try:
                     item = next(self.iter)
-                    # Pin memory on worker thread if enabled.
                     if self.pin_memory:
                         item = _recursive_pin(item)
                     self._safe_put(item)
@@ -234,6 +308,8 @@ class FixedNumBatchesDataset(Dataset):
     def _start_prefetching(self):
         with self._lock:
             if not self._prefetch_started:
+                self.dataset.device = self.device
+                self.dataset.buffers = self._buffers
                 self.iter = iter(self.dataset)
                 self._prefetch_thread = threading.Thread(
                     target=self._prefetch_worker, daemon=True
@@ -248,7 +324,7 @@ class FixedNumBatchesDataset(Dataset):
         self._start_prefetching()
 
         try:
-            item = self._prefetch_queue.get(timeout=300.0)  # 300 second timeout
+            item = self._prefetch_queue.get(timeout=300.0)
 
             if item is None:
                 raise StopIteration("End of dataset reached")

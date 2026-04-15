@@ -26,11 +26,70 @@ class SparseBatch(ctypes.Structure):
         ("layer_stack_indices", ctypes.POINTER(ctypes.c_int)),
     ]
 
-    def get_tensors(self, device):
+    def get_tensors(self, device, buffers=None):
+        size = self.size
+        max_features = self.max_active_features
+
+        if buffers is not None:
+            buffers["us"].copy_(
+                torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(size, 1)))
+            )
+            buffers["them"][:size] = 1.0 - buffers["us"][:size]
+            buffers["white_values"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(
+                        self.white_values, shape=(size, max_features)
+                    )
+                )
+            )
+            buffers["black_values"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(self.black_values, shape=(size, max_features))
+                )
+            )
+            buffers["white_indices"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(self.white, shape=(size, max_features))
+                ).int()
+            )
+            buffers["black_indices"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(self.black, shape=(size, max_features))
+                ).int()
+            )
+            buffers["outcome"].copy_(
+                torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(size, 1)))
+            )
+            buffers["score"].copy_(
+                torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(size, 1)))
+            )
+            buffers["psqt_indices"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(self.psqt_indices, shape=(size,))
+                ).long()
+            )
+            buffers["layer_stack_indices"].copy_(
+                torch.from_numpy(
+                    np.ctypeslib.as_array(self.layer_stack_indices, shape=(size,))
+                ).long()
+            )
+            return (
+                buffers["us"],
+                buffers["them"],
+                buffers["white_indices"],
+                buffers["white_values"],
+                buffers["black_indices"],
+                buffers["black_values"],
+                buffers["outcome"],
+                buffers["score"],
+                buffers["psqt_indices"],
+                buffers["layer_stack_indices"],
+            )
+
         white_values = (
             torch.from_numpy(
                 np.ctypeslib.as_array(
-                    self.white_values, shape=(self.size, self.max_active_features)
+                    self.white_values, shape=(size, max_features)
                 )
             )
             .pin_memory()
@@ -38,50 +97,44 @@ class SparseBatch(ctypes.Structure):
         )
         black_values = (
             torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black_values, shape=(self.size, self.max_active_features)
-                )
+                np.ctypeslib.as_array(self.black, shape=(size, max_features))
             )
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         white_indices = (
             torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.white, shape=(self.size, self.max_active_features)
-                )
+                np.ctypeslib.as_array(self.white, shape=(size, max_features))
             )
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         black_indices = (
             torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black, shape=(self.size, self.max_active_features)
-                )
+                np.ctypeslib.as_array(self.black, shape=(size, max_features))
             )
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         us = (
-            torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1)))
+            torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(size, 1)))
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         them = 1.0 - us
         outcome = (
-            torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1)))
+            torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(size, 1)))
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         score = (
-            torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1)))
+            torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(size, 1)))
             .pin_memory()
             .to(device=device, non_blocking=True)
         )
         psqt_indices = (
             torch.from_numpy(
-                np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))
+                np.ctypeslib.as_array(self.psqt_indices, shape=(size,))
             )
             .long()
             .pin_memory()
@@ -89,7 +142,7 @@ class SparseBatch(ctypes.Structure):
         )
         layer_stack_indices = (
             torch.from_numpy(
-                np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))
+                np.ctypeslib.as_array(self.layer_stack_indices, shape=(size,))
             )
             .long()
             .pin_memory()

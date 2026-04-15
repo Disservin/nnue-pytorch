@@ -8,6 +8,18 @@ from .config import (
     DataloaderDDPConfig,
 )
 
+MAX_ACTIVE_FEATURES_MAP = {
+    "HalfKAv2_hm": 32,
+    "FullThreats": 128,
+    "Full_Threats+HalfKAv2_hm": 160,
+}
+
+
+def get_max_active_features(feature_set: str) -> int:
+    if feature_set in MAX_ACTIVE_FEATURES_MAP:
+        return MAX_ACTIVE_FEATURES_MAP[feature_set]
+    return 128
+
 
 def _get_ddp_rank_and_world_size():
     """Get DDP rank and world size from torch.distributed if available."""

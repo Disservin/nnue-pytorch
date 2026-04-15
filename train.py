@@ -16,6 +16,7 @@ import model as M
 import tyro
 
 from config import TrainingConfig
+from data_loader.stream import get_max_active_features
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
@@ -190,9 +191,10 @@ def make_data_loaders(
     val_size,
     pin_memory,
     queue_size_limit,
+    device="cuda",
 ):
-    # Epoch and validation sizes are arbitrary
     features_name = feature_name
+    max_features = get_max_active_features(features_name)
     train_infinite = data_loader.SparseBatchDataset(
         features_name,
         train_filenames,
@@ -200,14 +202,15 @@ def make_data_loaders(
         num_workers=num_workers,
         config=config,
     )
-    # num_workers has to be 0 for sparse, and 1 for dense
-    # it currently cannot work in parallel mode but it shouldn't need to
     train = DataLoader(
         data_loader.FixedNumBatchesDataset(
             train_infinite,
             (epoch_size + batch_size - 1) // batch_size,
             pin_memory=pin_memory,
             queue_size_limit=queue_size_limit,
+            device=device,
+            batch_size=batch_size,
+            max_active_features=max_features,
         ),
         batch_size=None,
         batch_sampler=None,
@@ -222,6 +225,9 @@ def make_data_loaders(
                 (val_size + batch_size - 1) // batch_size,
                 pin_memory=pin_memory,
                 queue_size_limit=queue_size_limit,
+                device=device,
+                batch_size=batch_size,
+                max_active_features=max_features,
             ),
             batch_size=None,
             batch_sampler=None,
@@ -240,6 +246,9 @@ def make_data_loaders(
                 (val_size + batch_size - 1) // batch_size,
                 pin_memory=pin_memory,
                 queue_size_limit=queue_size_limit,
+                device=device,
+                batch_size=batch_size,
+                max_active_features=max_features,
             ),
             batch_size=None,
             batch_sampler=None,
@@ -401,6 +410,7 @@ def main():
         args.validation_size,
         pin_memory=args.pin_memory,
         queue_size_limit=args.data_loader_queue_size,
+        device="cuda",
     )
 
     refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
