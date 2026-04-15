@@ -129,14 +129,27 @@ class TrainingDataProvider:
         v = self.fetch_next(self.stream)
 
         if v:
-            tensors = v.contents.get_tensors(self.device, self.buffers)
-            self.destroy_part(v)
-            return tensors
+            return _LazyBatch(v, self.destroy_part)
         else:
             raise StopIteration
 
     def __del__(self):
         self.destroy_stream(self.stream)
+
+
+class _LazyBatch:
+    def __init__(self, batch_ptr, destroy_fn):
+        self.batch_ptr = batch_ptr
+        self.destroy_fn = destroy_fn
+
+    def to_tensors(self, device, buffers=None):
+        tensors = self.batch_ptr.contents.get_tensors(device, buffers)
+        self.destroy_fn(self.batch_ptr)
+        return tensors
+
+    def __del__(self):
+        if hasattr(self, 'batch_ptr') and self.batch_ptr:
+            self.destroy_fn(self.batch_ptr)
 
 
 class SparseBatchProvider(TrainingDataProvider):
@@ -229,6 +242,9 @@ class FixedNumBatchesDataset(Dataset):
         if queue_size_limit is None:
             queue_size_limit = 10 if pin_memory else 100
 
+        if self.device != "cpu" and self.batch_size is not None and self.max_active_features is not None:
+            queue_size_limit = 1
+
         self._prefetch_queue = queue.Queue(maxsize=queue_size_limit)
         self._prefetch_thread = None
         self._stop_prefetching = threading.Event()
@@ -240,50 +256,53 @@ class FixedNumBatchesDataset(Dataset):
             self._create_buffers()
 
     def _create_buffers(self):
-        self._buffers = {
-            "us": torch.empty(
-                self.batch_size, 1, dtype=torch.float32, device=self.device
-            ),
-            "them": torch.empty(
-                self.batch_size, 1, dtype=torch.float32, device=self.device
-            ),
-            "white_indices": torch.empty(
-                self.batch_size,
-                self.max_active_features,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "white_values": torch.empty(
-                self.batch_size,
-                self.max_active_features,
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            "black_indices": torch.empty(
-                self.batch_size,
-                self.max_active_features,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "black_values": torch.empty(
-                self.batch_size,
-                self.max_active_features,
-                dtype=torch.float32,
-                device=self.device,
-            ),
-            "outcome": torch.empty(
-                self.batch_size, 1, dtype=torch.float32, device=self.device
-            ),
-            "score": torch.empty(
-                self.batch_size, 1, dtype=torch.float32, device=self.device
-            ),
-            "psqt_indices": torch.empty(
-                self.batch_size, dtype=torch.long, device=self.device
-            ),
-            "layer_stack_indices": torch.empty(
-                self.batch_size, dtype=torch.long, device=self.device
-            ),
-        }
+        def make_buffers():
+            return {
+                "us": torch.empty(
+                    self.batch_size, 1, dtype=torch.float32, device=self.device
+                ),
+                "them": torch.empty(
+                    self.batch_size, 1, dtype=torch.float32, device=self.device
+                ),
+                "white_indices": torch.empty(
+                    self.batch_size,
+                    self.max_active_features,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "white_values": torch.empty(
+                    self.batch_size,
+                    self.max_active_features,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "black_indices": torch.empty(
+                    self.batch_size,
+                    self.max_active_features,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "black_values": torch.empty(
+                    self.batch_size,
+                    self.max_active_features,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "outcome": torch.empty(
+                    self.batch_size, 1, dtype=torch.float32, device=self.device
+                ),
+                "score": torch.empty(
+                    self.batch_size, 1, dtype=torch.float32, device=self.device
+                ),
+                "psqt_indices": torch.empty(
+                    self.batch_size, dtype=torch.long, device=self.device
+                ),
+                "layer_stack_indices": torch.empty(
+                    self.batch_size, dtype=torch.long, device=self.device
+                ),
+            }
+        self._buffers = [make_buffers(), make_buffers()]
+        self._buffer_idx = 0
 
     def _safe_put(self, item):
         while not self._stop_prefetching.is_set():
@@ -298,26 +317,25 @@ class FixedNumBatchesDataset(Dataset):
             while not self._stop_prefetching.is_set():
                 try:
                     item = next(self.iter)
-                    if self.pin_memory:
-                        item = _recursive_pin(item)
-                    self._safe_put(item)
+                    self._safe_put((item, self._buffer_idx))
+                    self._buffer_idx = 1 - self._buffer_idx
                 except StopIteration:
-                    self._safe_put(None)
+                    self._safe_put((None, self._buffer_idx))
                     break
         except Exception as e:
-            self._safe_put(e)
+            self._safe_put((e, self._buffer_idx))
 
     def _start_prefetching(self):
         with self._lock:
             if not self._prefetch_started:
                 self.dataset.device = self.device
-                self.dataset.buffers = self._buffers
                 self.iter = iter(self.dataset)
                 self._prefetch_thread = threading.Thread(
                     target=self._prefetch_worker, daemon=True
                 )
                 self._prefetch_thread.start()
                 self._prefetch_started = True
+                self._buffer_idx = 0
 
     def __len__(self):
         return self.num_batches
@@ -326,14 +344,14 @@ class FixedNumBatchesDataset(Dataset):
         self._start_prefetching()
 
         try:
-            item = self._prefetch_queue.get(timeout=300.0)
+            item, buffer_idx = self._prefetch_queue.get(timeout=300.0)
 
             if item is None:
                 raise StopIteration("End of dataset reached")
             elif isinstance(item, Exception):
                 raise item
 
-            return item
+            return item.to_tensors(self.device, self._buffers[buffer_idx] if self._buffers is not None else None)
 
         except queue.Empty:
             raise RuntimeError("Prefetch timeout - no data available")
