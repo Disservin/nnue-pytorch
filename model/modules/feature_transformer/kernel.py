@@ -248,55 +248,47 @@ void sparse_input_linear_backward(
           float*   const bias_grad,
     const float*   const output_grad
 ) {{
-    __shared__
-          float          shared_output_grad[{output_size}];
+    const uint32_t block_idx    = blockIdx.x;
+    const uint32_t slice_offset = threadIdx.x * {output_thread_slice_size};
 
-    const uint32_t       block_idx                = blockIdx.x;
-    const uint32_t       slice_offset             = threadIdx.x * {output_thread_slice_size};
+    const float*   const output_grad_slice = output_grad + block_idx * {output_size} + slice_offset;
+    const int32_t* const input_index_row   = input_indices + block_idx * {max_active_indices};
+    const float*   const input_value_row   = input_values  + block_idx * {max_active_indices};
 
-    const float*   const output_grad_slice        = output_grad + block_idx * {output_size} + slice_offset;
-          float*   const bias_grad_slice          = bias_grad                               + slice_offset;
-          float*         shared_output_grad_slice = shared_output_grad                      + slice_offset;
+    // Load output grad slice into registers once — no shared memory needed
+    // since each thread only accesses its own slice.
+    float sog[{output_thread_slice_size}];
+    #pragma unroll
+    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
+        sog[s] = output_grad_slice[s];
 
-    const int32_t* const input_index_row          = input_indices + block_idx * {max_active_indices};
-    const float*   const input_value_row          = input_values  + block_idx * {max_active_indices};
-
+    // Bias grad: sum of output grads across batch.
+    // Each thread handles its own slice independently.
+    float*   const bias_grad_slice = bias_grad + slice_offset;
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        shared_output_grad_slice[s] = output_grad_slice[s];
+        if (sog[s] != 0.0f)
+            atomicAdd(&bias_grad_slice[s], sog[s]);
     }}
 
-    #pragma unroll
-    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-    {{
-        const float sog = shared_output_grad_slice[s];
-        if (sog != 0.0f)
-        {{
-            atomicAdd(&bias_grad_slice[s], sog);
-        }}
-    }}
-
+    // Weight grad: for each active input, accumulate sog * input_value
+    // into the corresponding weight row.
     for (uint32_t k = 0; k < {max_active_indices}; ++k)
     {{
         const int32_t input_index = input_index_row[k];
         const float   input_value = input_value_row[k];
-        if (input_index != -1)
+        if (input_index == -1) break;
+
+        float* const weight_grad_slice = weight_grad + input_index * {output_size} + slice_offset;
+        #pragma unroll
+        for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
         {{
-            float* const weight_grad_slice = weight_grad + input_index * {output_size} + slice_offset;
-            #pragma unroll
-            for (int s = 0; s < {output_thread_slice_size}; ++s)
-            {{
-                const float sog = shared_output_grad_slice[s];
-                if (sog != 0.0f)
-                {{
-                    atomicAdd(&weight_grad_slice[s], sog * input_value);
-                }}
-            }}
-        }} else break;
+            if (sog[s] != 0.0f)
+                atomicAdd(&weight_grad_slice[s], sog[s] * input_value);
+        }}
     }}
 }}
-
 """.format(
                 max_active_indices=max_active_indices,
                 output_thread_slice_size=output_thread_slice_size,
