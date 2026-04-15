@@ -14,17 +14,18 @@ class FullThreats(InputFeature):
     NUM_REAL_FEATURES = 60720
     EXPORT_WEIGHT_DTYPE = torch.int8
 
-    def __init__(self, num_outputs: int):
+    def __init__(self, num_outputs: int, dtype: torch.dtype = torch.float32):
         super().__init__()
 
         self.num_outputs = num_outputs
+        self.dtype = dtype
         self.weight = nn.Parameter(
-            torch.empty(self.NUM_INPUTS, num_outputs, dtype=torch.float32)
+            torch.empty(self.NUM_INPUTS, num_outputs, dtype=dtype)
         )
 
         self.reset_parameters()
 
-    def merged_weight(self) -> torch.Tensor:
+    def merged_weight(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         return self.weight
 
     @torch.no_grad()

@@ -48,7 +48,7 @@ _sparse_input_linear_forward_kernel_cache = dict()
 
 
 @torch.compiler.disable(recursive=False)
-def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size: int):
+def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size: int, dtype: torch.dtype = torch.float32):
     """
     @param: max_active_indices
         The maximum number of indices that are non-zero
@@ -60,11 +60,24 @@ def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size
         The number of outputs. Must match the shape of weights
         and biases.
         This value is of type uint32.
+
+    @param: dtype
+        The data type for computations (torch.float32 or torch.bfloat16).
     """
     num_threads = _get_num_threads_for_forward(output_size)
     output_thread_slice_size = output_size // num_threads
-    key = (max_active_indices, output_size, num_threads)
+    key = (max_active_indices, output_size, num_threads, dtype)
+
+    use_bf16 = dtype == torch.bfloat16
+
     if key not in _sparse_input_linear_forward_kernel_cache:
+        if use_bf16:
+            data_type = "nv_bfloat16"
+            compute_type = "float"
+        else:
+            data_type = "float"
+            compute_type = "float"
+
         kernel = cp.RawKernel(
             r"""
 
@@ -95,59 +108,59 @@ extern "C" __global__
         A matrix of shape (BATCH_SIZE, max_active_indices)
         containing the values (arity) of the corresponding
         input index in input_indices.
-        The type for the input value (arity) is float32.
+        The type for the input value (arity) is {data_type}.
 
     @param: weight
         The weight matrix of shape (NUM_INPUTS, output_size).
-        Weights must be of type float32.
+        Weights must be of type {data_type}.
 
     @param: bias
         The bias vector of shape (output_size,).
-        Bias values must be of type float32.
+        Bias values must be of type {data_type}.
 
     @param: output
         An output matrix of shape (BATCH_SIZE, output_size).
         It may not be initialized, bias is always copied
         to the output first.
-        Output values must have type float32.
+        Output values must have type {data_type}.
 */
 void sparse_input_linear_forward(
     const int32_t* const input_indices,
-    const float*   const input_values,
-    const float*   const weight,
-    const float*   const bias,
-          float*   const output
+    const {data_type}*   const input_values,
+    const {data_type}*   const weight,
+    const {data_type}*   const bias,
+          {data_type}*   const output
 ) {{
     __shared__
-          float          shared_output[{output_size}];
+          {compute_type}    shared_output[{output_size}];
 
     const uint32_t       block_idx           = blockIdx.x;
     const uint32_t       slice_offset        = threadIdx.x * {output_thread_slice_size};
 
-          float*   const output_slice        = output + block_idx * {output_size} + slice_offset;
-    const float*   const bias_slice          = bias                               + slice_offset;
-          float*         shared_output_slice = shared_output                      + slice_offset;
+          {data_type}*   const output_slice        = output + block_idx * {output_size} + slice_offset;
+    const {data_type}*   const bias_slice          = bias                               + slice_offset;
+          {compute_type}*   shared_output_slice = shared_output                      + slice_offset;
 
     const int32_t* const input_index_row     = input_indices + block_idx * {max_active_indices};
-    const float*   const input_value_row     = input_values  + block_idx * {max_active_indices};
+    const {data_type}*   const input_value_row     = input_values  + block_idx * {max_active_indices};
 
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        shared_output_slice[s] = bias_slice[s];
+        shared_output_slice[s] = (({compute_type})bias_slice[s]);
     }}
 
     for (uint32_t k = 0; k < {max_active_indices}; ++k)
     {{
         const int32_t input_index = input_index_row[k];
-        const float   input_value = input_value_row[k];
+        const {data_type}   input_value = input_value_row[k];
         if (input_index != -1)
         {{
-            const float* const weight_slice = weight + input_index * {output_size} + slice_offset;
+            const {data_type}* const weight_slice = weight + input_index * {output_size} + slice_offset;
             #pragma unroll
             for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
             {{
-                shared_output_slice[s] += weight_slice[s] * input_value;
+                shared_output_slice[s] += (({compute_type})weight_slice[s]) * (({compute_type})input_value);
             }}
         }} else break;
     }}
@@ -155,7 +168,7 @@ void sparse_input_linear_forward(
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        output_slice[s] = shared_output_slice[s];
+        output_slice[s] = ({data_type})shared_output_slice[s];
     }}
 }}
 
@@ -163,6 +176,8 @@ void sparse_input_linear_forward(
                 max_active_indices=max_active_indices,
                 output_thread_slice_size=output_thread_slice_size,
                 output_size=output_size,
+                data_type=data_type,
+                compute_type=compute_type,
             ),
             "sparse_input_linear_forward",
         )
@@ -177,7 +192,7 @@ _sparse_input_linear_backward_kernel_cache = dict()
 
 
 @torch.compiler.disable(recursive=False)
-def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_size: int):
+def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_size: int, dtype: torch.dtype = torch.float32):
     """
     @param: max_active_indices
         The maximum number of indices that are non-zero for
@@ -189,11 +204,24 @@ def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_siz
         The number of outputs. Must match the shape of weights
         and biases.
         This value is of type uint32.
+
+    @param: dtype
+        The data type for computations (torch.float32 or torch.bfloat16).
     """
     num_threads = _get_num_threads_for_backward(output_size)
     output_thread_slice_size = output_size // num_threads
-    key = (max_active_indices, output_size, num_threads)
+    key = (max_active_indices, output_size, num_threads, dtype)
+
+    use_bf16 = dtype == torch.bfloat16
+
     if key not in _sparse_input_linear_backward_kernel_cache:
+        if use_bf16:
+            data_type = "nv_bfloat16"
+            compute_type = "float"
+        else:
+            data_type = "float"
+            compute_type = "float"
+
         kernel = cp.RawKernel(
             r"""
 
@@ -223,74 +251,74 @@ extern "C" __global__
         A matrix of shape (BATCH_SIZE, max_active_indices)
         containing the values (arity) of the corresponding
         input index in input_indices.
-        The type for the input value (arity) is float32.
+        The type for the input value (arity) is {data_type}.
 
     @param: weight_grad
         The weight gradient matrix of shape (NUM_INPUTS, output_size).
         The gradient is accumulated, i.e. it must be zero initialized
         on the first call.
-        Weights must be of type float32.
+        Weights must be of type {data_type}.
 
     @param: bias_grad
         The bias gradient vector of shape (output_size,).
         The gradient is accumulated, i.e. it must be zero initialized
         on the first call.
-        Bias values must be of type float32.
+        Bias values must be of type {data_type}.
 
     @param: output_grad
         An output gradient matrix of shape (BATCH_SIZE, output_size).
-        Output values must have type float32.
+        Output values must have type {data_type}.
 */
 void sparse_input_linear_backward(
     const int32_t* const input_indices,
-    const float*   const input_values,
-          float*   const weight_grad,
-          float*   const bias_grad,
-    const float*   const output_grad
+    const {data_type}*   const input_values,
+          {data_type}*   const weight_grad,
+          {data_type}*   const bias_grad,
+    const {data_type}*   const output_grad
 ) {{
     __shared__
-          float          shared_output_grad[{output_size}];
+          {compute_type}    shared_output_grad[{output_size}];
 
     const uint32_t       block_idx                = blockIdx.x;
     const uint32_t       slice_offset             = threadIdx.x * {output_thread_slice_size};
 
-    const float*   const output_grad_slice        = output_grad + block_idx * {output_size} + slice_offset;
-          float*   const bias_grad_slice          = bias_grad                               + slice_offset;
-          float*         shared_output_grad_slice = shared_output_grad                      + slice_offset;
+    const {data_type}*   const output_grad_slice        = output_grad + block_idx * {output_size} + slice_offset;
+          {data_type}*   const bias_grad_slice          = bias_grad                               + slice_offset;
+          {compute_type}*   shared_output_grad_slice = shared_output_grad                      + slice_offset;
 
     const int32_t* const input_index_row          = input_indices + block_idx * {max_active_indices};
-    const float*   const input_value_row          = input_values  + block_idx * {max_active_indices};
+    const {data_type}*   const input_value_row          = input_values  + block_idx * {max_active_indices};
 
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        shared_output_grad_slice[s] = output_grad_slice[s];
+        shared_output_grad_slice[s] = (({compute_type})output_grad_slice[s]);
     }}
 
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        const float sog = shared_output_grad_slice[s];
+        const {compute_type} sog = shared_output_grad_slice[s];
         if (sog != 0.0f)
         {{
-            atomicAdd(&bias_grad_slice[s], sog);
+            atomicAdd(&bias_grad_slice[s], ({data_type})sog);
         }}
     }}
 
     for (uint32_t k = 0; k < {max_active_indices}; ++k)
     {{
         const int32_t input_index = input_index_row[k];
-        const float   input_value = input_value_row[k];
+        const {data_type}   input_value = input_value_row[k];
         if (input_index != -1)
         {{
-            float* const weight_grad_slice = weight_grad + input_index * {output_size} + slice_offset;
+            {data_type}* const weight_grad_slice = weight_grad + input_index * {output_size} + slice_offset;
             #pragma unroll
             for (int s = 0; s < {output_thread_slice_size}; ++s)
             {{
-                const float sog = shared_output_grad_slice[s];
+                const {compute_type} sog = shared_output_grad_slice[s];
                 if (sog != 0.0f)
                 {{
-                    atomicAdd(&weight_grad_slice[s], sog * input_value);
+                    atomicAdd(&weight_grad_slice[s], ({data_type})(sog * (({compute_type})input_value)));
                 }}
             }}
         }} else break;
@@ -301,6 +329,8 @@ void sparse_input_linear_backward(
                 max_active_indices=max_active_indices,
                 output_thread_slice_size=output_thread_slice_size,
                 output_size=output_size,
+                data_type=data_type,
+                compute_type=compute_type,
             ),
             "sparse_input_linear_backward",
         )

@@ -62,10 +62,10 @@ def test():
         indices1.clone(), values1.clone(), weight0, bias0
     )
     output10 = SparseLinearFunction.apply(
-        indices0.clone().cuda(), values0.clone().cuda(), weight1.cuda(), bias1.cuda()
+        indices0.clone().cuda(), values0.clone().cuda(), weight1.cuda(), bias1.cuda(), torch.float32
     )
     output11 = SparseLinearFunction.apply(
-        indices1.clone().cuda(), values1.clone().cuda(), weight1.cuda(), bias1.cuda()
+        indices1.clone().cuda(), values1.clone().cuda(), weight1.cuda(), bias1.cuda(), torch.float32
     )
 
     assert torch.max(torch.abs(output00.cpu() - output10.cpu())) < MAX_ERROR

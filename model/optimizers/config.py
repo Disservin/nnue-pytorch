@@ -10,6 +10,9 @@ class OptimizerConfig(Ranger21Config, ScheduleFreeConfig):
     optimizer_name: Literal["schedulefree", "ranger21"] = "ranger21"
     """Which optimizer to use. """
 
+    mixed_precision: Literal["bf16", "fp16", "none"] = "none"
+    """Mixed precision training type. bf16 is recommended for Ampere+ GPUs."""
+
     ft_weight_decay: float = 0.0
     """Weight decay to apply to the feature transformer parameters."""
 

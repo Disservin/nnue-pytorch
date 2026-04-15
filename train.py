@@ -404,6 +404,18 @@ def main():
     )
 
     refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
+
+    mp = args.nnue_lightning_config.optimizer_config.mixed_precision
+    if mp == "bf16":
+        precision = 16
+        amp_backend = "native"
+    elif mp == "fp16":
+        precision = 16
+        amp_backend = "native"
+    else:
+        precision = 32
+        amp_backend = None
+
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
@@ -422,6 +434,8 @@ def main():
         enable_checkpointing=True,
         benchmark=True,
         num_sanity_val_steps=0 if val is None else 4,
+        precision=precision,
+        amp_backend=amp_backend,
     )
 
     if actual_threads > 0:

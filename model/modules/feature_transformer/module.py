@@ -8,15 +8,16 @@ from .functions import SparseLinearFunction
 
 
 class BaseFeatureTransformer(nn.Module):
-    def __init__(self, num_inputs, num_outputs):
+    def __init__(self, num_inputs, num_outputs, dtype=torch.float32):
         super().__init__()
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
+        self.dtype = dtype
 
         self.weight = nn.Parameter(
-            torch.empty((num_inputs, num_outputs), dtype=torch.float32)
+            torch.empty((num_inputs, num_outputs), dtype=dtype)
         )
-        self.bias = nn.Parameter(torch.empty(num_outputs, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.empty(num_outputs, dtype=dtype))
 
         self.reset_parameters()
 
@@ -43,13 +44,31 @@ class BaseFeatureTransformer(nn.Module):
 
 
 class FeatureTransformer(BaseFeatureTransformer):
+    def __init__(self, num_inputs, num_outputs, dtype=torch.float32):
+        super().__init__(num_inputs, num_outputs)
+        self.dtype = dtype
+        self.weight = nn.Parameter(
+            torch.empty((num_inputs, num_outputs), dtype=dtype)
+        )
+        self.bias = nn.Parameter(torch.empty(num_outputs, dtype=dtype))
+        self.reset_parameters()
+
     def forward(self, feature_indices, feature_values):
         return SparseLinearFunction.apply(
-            feature_indices, feature_values, self.weight, self.bias
+            feature_indices, feature_values, self.weight, self.bias, self.dtype
         )
 
 
 class DoubleFeatureTransformer(BaseFeatureTransformer):
+    def __init__(self, num_inputs, num_outputs, dtype=torch.float32):
+        super().__init__(num_inputs, num_outputs)
+        self.dtype = dtype
+        self.weight = nn.Parameter(
+            torch.empty((num_inputs, num_outputs), dtype=dtype)
+        )
+        self.bias = nn.Parameter(torch.empty(num_outputs, dtype=dtype))
+        self.reset_parameters()
+
     def forward(
         self, feature_indices_0, feature_values_0, feature_indices_1, feature_values_1
     ):
@@ -59,11 +78,13 @@ class DoubleFeatureTransformer(BaseFeatureTransformer):
                 feature_values_0,
                 self.weight,
                 self.bias,
+                self.dtype,
             ),
             SparseLinearFunction.apply(
                 feature_indices_1,
                 feature_values_1,
                 self.weight,
                 self.bias,
+                self.dtype,
             ),
         )

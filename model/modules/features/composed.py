@@ -12,13 +12,14 @@ class ComposedFeatureTransformer(nn.Module):
     bias and delegates everything else to the underlying features.
     """
 
-    def __init__(self, features: list[InputFeature]):
+    def __init__(self, features: list[InputFeature], dtype=torch.float32):
         super().__init__()
 
         self.features = nn.ModuleList(features)
         self.num_outputs = features[0].num_outputs
+        self.dtype = dtype
 
-        self.bias = nn.Parameter(torch.empty(self.num_outputs, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.empty(self.num_outputs, dtype=dtype))
 
         # Aggregate attributes from components
         self.NUM_INPUTS = sum(f.NUM_INPUTS for f in features)
@@ -49,19 +50,21 @@ class ComposedFeatureTransformer(nn.Module):
     def forward(
         self, feature_indices_0, feature_values_0, feature_indices_1, feature_values_1
     ):
-        merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
+        merged = torch.cat([f.merged_weight(self.dtype) for f in self.features], dim=0)
         return (
             SparseLinearFunction.apply(
                 feature_indices_0,
                 feature_values_0,
                 merged,
                 self.bias,
+                self.dtype,
             ),
             SparseLinearFunction.apply(
                 feature_indices_1,
                 feature_values_1,
                 merged,
                 self.bias,
+                self.dtype,
             ),
         )
 
@@ -99,8 +102,8 @@ class ComposedFeatureTransformer(nn.Module):
 def combine_input_features(*feature_classes: type):
     """Return a factory that creates a ComposedFeatureTransformer."""
 
-    def factory(num_outputs: int) -> ComposedFeatureTransformer:
+    def factory(num_outputs: int, dtype=torch.float32) -> ComposedFeatureTransformer:
         features = [fc(num_outputs) for fc in feature_classes]
-        return ComposedFeatureTransformer(features)
+        return ComposedFeatureTransformer(features, dtype=dtype)
 
     return factory

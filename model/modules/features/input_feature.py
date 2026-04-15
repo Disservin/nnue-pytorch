@@ -14,7 +14,7 @@ class InputFeature(nn.Module, ABC):
     EXPORT_WEIGHT_DTYPE: torch.dtype = torch.int16
 
     @abstractmethod
-    def merged_weight(self) -> torch.Tensor:
+    def merged_weight(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Return effective weight matrix (with virtual weights merged if applicable)."""
 
     @abstractmethod

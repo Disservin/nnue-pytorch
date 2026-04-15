@@ -14,6 +14,7 @@ class NNUEModel(nn.Module):
         quantize_config: QuantizationConfig,
         num_psqt_buckets: int = 8,
         num_ls_buckets: int = 8,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
 
@@ -24,8 +25,9 @@ class NNUEModel(nn.Module):
 
         self.num_psqt_buckets = num_psqt_buckets
         self.num_ls_buckets = num_ls_buckets
+        self.dtype = dtype
 
-        self.input = feature_cls(self.L1 + self.num_psqt_buckets)
+        self.input = feature_cls(self.L1 + self.num_psqt_buckets, dtype=dtype)
         self.feature_name = self.input.FEATURE_NAME
         self.input_feature_name = self.input.INPUT_FEATURE_NAME
         self.feature_hash = self.input.HASH

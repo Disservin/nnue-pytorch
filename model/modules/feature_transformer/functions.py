@@ -9,21 +9,22 @@ from .kernel import (
 
 class SparseLinearFunction(autograd.Function):
     @staticmethod
-    def forward(ctx, feature_indices, feature_values, weight, bias):
+    def forward(ctx, feature_indices, feature_values, weight, bias, dtype=torch.float32):
         ctx.save_for_backward(feature_indices, feature_values, weight, bias)
+        ctx.dtype = dtype
 
         assert len(feature_indices.shape) == 2
         assert len(feature_values.shape) == 2
         assert feature_indices.shape[0] == feature_values.shape[0]
         assert feature_indices.shape[1] == feature_values.shape[1]
         assert feature_indices.dtype == torch.int32
-        assert feature_values.dtype == torch.float32
+        assert feature_values.dtype == dtype
 
         assert len(weight.shape) == 2
-        assert weight.dtype == torch.float32
+        assert weight.dtype == dtype
 
         assert len(bias.shape) == 1
-        assert bias.dtype == torch.float32
+        assert bias.dtype == dtype
 
         assert feature_indices.is_cuda
         assert feature_values.is_cuda
@@ -47,13 +48,13 @@ class SparseLinearFunction(autograd.Function):
         output = torch.empty(
             batch_size,
             output_size,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
             requires_grad=True,
         )
 
         kernel = make_sparse_input_linear_forward_kernel(
-            max_active_features, output_size
+            max_active_features, output_size, dtype
         )
         kernel(
             grid=(batch_size,),
@@ -72,10 +73,12 @@ class SparseLinearFunction(autograd.Function):
     def backward(ctx, grad_output):
         assert not ctx.needs_input_grad[0]
         assert not ctx.needs_input_grad[1]
+        assert not ctx.needs_input_grad[4]
 
         grad_output = grad_output.contiguous()
 
         feature_indices, feature_values, weight, bias = ctx.saved_tensors
+        dtype = ctx.dtype
 
         device = feature_indices.device
         batch_size = feature_indices.shape[0]
@@ -83,12 +86,12 @@ class SparseLinearFunction(autograd.Function):
         output_size = weight.shape[1]
 
         weight_grad = torch.zeros(
-            weight.shape[0], weight.shape[1], dtype=torch.float32, device=device
+            weight.shape[0], weight.shape[1], dtype=dtype, device=device
         )
-        bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
+        bias_grad = torch.zeros(output_size, dtype=dtype, device=device)
 
         kernel = make_sparse_input_linear_backward_kernel(
-            max_active_features, output_size
+            max_active_features, output_size, dtype
         )
         kernel(
             grid=(batch_size,),
@@ -101,4 +104,4 @@ class SparseLinearFunction(autograd.Function):
             ),
         )
 
-        return None, None, weight_grad, bias_grad
+        return None, None, weight_grad, bias_grad, None
