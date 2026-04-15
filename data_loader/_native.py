@@ -31,48 +31,49 @@ class SparseBatch(ctypes.Structure):
         max_features = self.max_active_features
 
         if buffers is not None:
-            buffers["us"].copy_(
-                torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(size, 1)))
-            )
-            buffers["them"][:size] = 1.0 - buffers["us"][:size]
-            buffers["white_values"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(
-                        self.white_values, shape=(size, max_features)
+            with torch.no_grad():
+                buffers["us"].copy_(
+                    torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(size, 1)))
+                )
+                buffers["them"].copy_(1.0 - buffers["us"])
+                buffers["white_values"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(
+                            self.white_values, shape=(size, max_features)
+                        )
                     )
                 )
-            )
-            buffers["black_values"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(self.black_values, shape=(size, max_features))
+                buffers["black_values"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(self.black_values, shape=(size, max_features))
+                    )
                 )
-            )
-            buffers["white_indices"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(self.white, shape=(size, max_features))
-                ).int()
-            )
-            buffers["black_indices"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(self.black, shape=(size, max_features))
-                ).int()
-            )
-            buffers["outcome"].copy_(
-                torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(size, 1)))
-            )
-            buffers["score"].copy_(
-                torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(size, 1)))
-            )
-            buffers["psqt_indices"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(self.psqt_indices, shape=(size,))
-                ).long()
-            )
-            buffers["layer_stack_indices"].copy_(
-                torch.from_numpy(
-                    np.ctypeslib.as_array(self.layer_stack_indices, shape=(size,))
-                ).long()
-            )
+                buffers["white_indices"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(self.white, shape=(size, max_features))
+                    ).int()
+                )
+                buffers["black_indices"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(self.black, shape=(size, max_features))
+                    ).int()
+                )
+                buffers["outcome"].copy_(
+                    torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(size, 1)))
+                )
+                buffers["score"].copy_(
+                    torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(size, 1)))
+                )
+                buffers["psqt_indices"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(self.psqt_indices, shape=(size,))
+                    ).long()
+                )
+                buffers["layer_stack_indices"].copy_(
+                    torch.from_numpy(
+                        np.ctypeslib.as_array(self.layer_stack_indices, shape=(size,))
+                    ).long()
+                )
             return (
                 buffers["us"],
                 buffers["them"],
