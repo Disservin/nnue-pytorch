@@ -103,7 +103,7 @@ def combine_input_features(*feature_classes: type):
     """Return a factory that creates a ComposedFeatureTransformer."""
 
     def factory(num_outputs: int, dtype=torch.float32) -> ComposedFeatureTransformer:
-        features = [fc(num_outputs) for fc in feature_classes]
+        features = [fc(num_outputs, dtype=dtype) for fc in feature_classes]
         return ComposedFeatureTransformer(features, dtype=dtype)
 
     return factory

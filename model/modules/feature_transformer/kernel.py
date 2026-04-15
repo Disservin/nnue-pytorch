@@ -64,6 +64,11 @@ def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size
     @param: dtype
         The data type for computations (torch.float32 or torch.bfloat16).
     """
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise NotImplementedError(
+            f"Sparse input linear forward kernel only supports torch.float32 and torch.bfloat16, got {dtype}."
+        )
+
     num_threads = _get_num_threads_for_forward(output_size)
     output_thread_slice_size = output_size // num_threads
     key = (max_active_indices, output_size, num_threads, dtype)
@@ -208,6 +213,11 @@ def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_siz
     @param: dtype
         The data type for computations (torch.float32 or torch.bfloat16).
     """
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise NotImplementedError(
+            f"Sparse input linear backward kernel only supports torch.float32 and torch.bfloat16, got {dtype}."
+        )
+
     num_threads = _get_num_threads_for_backward(output_size)
     output_thread_slice_size = output_size // num_threads
     key = (max_active_indices, output_size, num_threads, dtype)

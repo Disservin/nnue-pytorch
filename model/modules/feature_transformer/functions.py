@@ -10,6 +10,11 @@ from .kernel import (
 class SparseLinearFunction(autograd.Function):
     @staticmethod
     def forward(ctx, feature_indices, feature_values, weight, bias, dtype=torch.float32):
+        if dtype not in (torch.float32, torch.bfloat16):
+            raise NotImplementedError(
+                f"SparseLinearFunction only supports torch.float32 and torch.bfloat16, got {dtype}."
+            )
+
         ctx.save_for_backward(feature_indices, feature_values, weight, bias)
         ctx.dtype = dtype
 
