@@ -18,7 +18,7 @@ class SparseLinearFunction(autograd.Function):
         assert feature_indices.shape[0] == feature_values.shape[0]
         assert feature_indices.shape[1] == feature_values.shape[1]
         assert feature_indices.dtype == torch.int32
-        assert feature_values.dtype == dtype
+        assert feature_values.dtype == torch.float32 or feature_values.dtype == dtype
 
         assert len(weight.shape) == 2
         assert weight.dtype == dtype
@@ -44,6 +44,9 @@ class SparseLinearFunction(autograd.Function):
         batch_size = feature_indices.shape[0]
         max_active_features = feature_indices.shape[1]
         output_size = weight.shape[1]
+
+        if feature_values.dtype != dtype:
+            feature_values = feature_values.to(dtype=dtype)
 
         output = torch.empty(
             batch_size,
