@@ -36,21 +36,13 @@ class NNUE(L.LightningModule):
     ):
         super().__init__()
 
-        mp = config.optimizer_config.mixed_precision
-        if mp == "bf16":
-            dtype = torch.bfloat16
-        elif mp == "fp16":
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
-
         self.model: NNUEModel = NNUEModel(
             config.features,
             config.model_config,
             quantize_config,
             num_psqt_buckets,
             num_ls_buckets,
-            dtype=dtype,
+            input_dtype=torch.float32,
         )
         self.config = config
         self.max_epoch = max_epoch
