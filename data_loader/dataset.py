@@ -145,11 +145,8 @@ class _LazyBatch:
     def to_tensors(self, device, buffers=None):
         tensors = self.batch_ptr.contents.get_tensors(device, buffers)
         self.destroy_fn(self.batch_ptr)
+        self.batch_ptr = None
         return tensors
-
-    def __del__(self):
-        if hasattr(self, 'batch_ptr') and self.batch_ptr:
-            self.destroy_fn(self.batch_ptr)
 
 
 class SparseBatchProvider(TrainingDataProvider):
