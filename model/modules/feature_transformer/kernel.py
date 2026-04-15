@@ -77,14 +77,26 @@ def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size
 
     if key not in _sparse_input_linear_forward_kernel_cache:
         if use_bf16:
-            data_type = "nv_bfloat16"
+            type_definition = "#include <cuda_bf16.h>"
+            data_type = "__nv_bfloat16"
             compute_type = "float"
+            bias_to_compute = "__bfloat162float(bias_slice[s])"
+            input_to_compute = "__bfloat162float(input_value)"
+            weight_to_compute = "__bfloat162float(weight_slice[s])"
+            output_from_compute = "__float2bfloat16_rn(shared_output_slice[s])"
         else:
+            type_definition = ""
             data_type = "float"
             compute_type = "float"
+            bias_to_compute = "bias_slice[s]"
+            input_to_compute = "input_value"
+            weight_to_compute = "weight_slice[s]"
+            output_from_compute = "shared_output_slice[s]"
 
         kernel = cp.RawKernel(
             r"""
+
+{type_definition}
 
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -152,7 +164,7 @@ void sparse_input_linear_forward(
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        shared_output_slice[s] = (({compute_type})bias_slice[s]);
+        shared_output_slice[s] = {bias_to_compute};
     }}
 
     for (uint32_t k = 0; k < {max_active_indices}; ++k)
@@ -165,7 +177,7 @@ void sparse_input_linear_forward(
             #pragma unroll
             for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
             {{
-                shared_output_slice[s] += (({compute_type})weight_slice[s]) * (({compute_type})input_value);
+                shared_output_slice[s] += ({weight_to_compute}) * ({input_to_compute});
             }}
         }} else break;
     }}
@@ -173,16 +185,21 @@ void sparse_input_linear_forward(
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        output_slice[s] = ({data_type})shared_output_slice[s];
+        output_slice[s] = {output_from_compute};
     }}
 }}
 
 """.format(
+                type_definition=type_definition,
                 max_active_indices=max_active_indices,
                 output_thread_slice_size=output_thread_slice_size,
                 output_size=output_size,
                 data_type=data_type,
                 compute_type=compute_type,
+                bias_to_compute=bias_to_compute,
+                input_to_compute=input_to_compute,
+                weight_to_compute=weight_to_compute,
+                output_from_compute=output_from_compute,
             ),
             "sparse_input_linear_forward",
         )
@@ -226,14 +243,30 @@ def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_siz
 
     if key not in _sparse_input_linear_backward_kernel_cache:
         if use_bf16:
-            data_type = "nv_bfloat16"
+            type_definition = "#include <cuda_bf16.h>"
+            data_type = "__nv_bfloat16"
             compute_type = "float"
+            output_grad_to_compute = "__bfloat162float(output_grad_slice[s])"
+            input_to_compute = "__bfloat162float(input_value)"
+            bias_atomic_value = "__float2bfloat16_rn(sog)"
+            weight_atomic_value = "__float2bfloat16_rn(sog * ({input_to_compute}))"
         else:
+            type_definition = ""
             data_type = "float"
             compute_type = "float"
+            output_grad_to_compute = "output_grad_slice[s]"
+            input_to_compute = "input_value"
+            bias_atomic_value = "sog"
+            weight_atomic_value = "sog * ({input_to_compute})"
+
+        weight_atomic_value = weight_atomic_value.format(
+            input_to_compute=input_to_compute
+        )
 
         kernel = cp.RawKernel(
             r"""
+
+{type_definition}
 
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -302,7 +335,7 @@ void sparse_input_linear_backward(
     #pragma unroll
     for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
     {{
-        shared_output_grad_slice[s] = (({compute_type})output_grad_slice[s]);
+        shared_output_grad_slice[s] = {output_grad_to_compute};
     }}
 
     #pragma unroll
@@ -311,7 +344,7 @@ void sparse_input_linear_backward(
         const {compute_type} sog = shared_output_grad_slice[s];
         if (sog != 0.0f)
         {{
-            atomicAdd(&bias_grad_slice[s], ({data_type})sog);
+            atomicAdd(&bias_grad_slice[s], {bias_atomic_value});
         }}
     }}
 
@@ -328,7 +361,7 @@ void sparse_input_linear_backward(
                 const {compute_type} sog = shared_output_grad_slice[s];
                 if (sog != 0.0f)
                 {{
-                    atomicAdd(&weight_grad_slice[s], ({data_type})(sog * (({compute_type})input_value)));
+                    atomicAdd(&weight_grad_slice[s], {weight_atomic_value});
                 }}
             }}
         }} else break;
@@ -336,11 +369,15 @@ void sparse_input_linear_backward(
 }}
 
 """.format(
+                type_definition=type_definition,
                 max_active_indices=max_active_indices,
                 output_thread_slice_size=output_thread_slice_size,
                 output_size=output_size,
                 data_type=data_type,
                 compute_type=compute_type,
+                output_grad_to_compute=output_grad_to_compute,
+                bias_atomic_value=bias_atomic_value,
+                weight_atomic_value=weight_atomic_value,
             ),
             "sparse_input_linear_backward",
         )
