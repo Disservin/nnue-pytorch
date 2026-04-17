@@ -671,7 +671,7 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
             }
 
             if (e.score == VALUE_NONE) return true;
-            if (std::abs(e.result) < 100 && (e.result == 1 || e.result == -1)) return true;
+            if (std::abs(e.score) < 100 && (e.result == 1 || e.result == -1)) return true;
             if (skip_zero_after_large_previous) return true;
             if (e.ply <= config.early_fen_skipping) return true;
             if (config.random_fen_skipping && do_skip()) return true;
