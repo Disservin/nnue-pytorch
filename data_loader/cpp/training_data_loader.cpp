@@ -560,7 +560,7 @@ SparseBatch* FeaturedBatchStream::next() {
 }
 
 Fen::Fen() :
-    m_fen(nullptr) { }
+    m_fen(nullptr) {}
 
 Fen::Fen(const std::string& fen) :
     m_size(fen.size()),
@@ -810,6 +810,8 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
 
         last_ply = e.ply;
 
+        if (std::abs(e.score) < 135 && (e.result == 1 || e.result == -1))
+            return true;
         if (e.score == VALUE_NONE)
             return true;
         if (skip_placeholder_zero)
