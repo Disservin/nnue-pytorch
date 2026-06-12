@@ -1,13 +1,15 @@
 #include "training_data_loader_internal.h"
 
-#include <iostream>
 #include <algorithm>
-#include <iterator>
-#include <future>
-#include <random>
-#include <cstring>
+#include <cassert>
 #include <cmath>
-
+#include <cstdint>
+#include <cstring>
+#include <future>
+#include <iostream>
+#include <iterator>
+#include <new>
+#include <random>
 #include "lib/rng.h"
 
 using namespace binpack;
@@ -398,16 +400,63 @@ std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name) {
 // Class Implementations
 // ---------------------------------------------------------
 
+namespace {
+
+constexpr size_t align_up(size_t offset, size_t alignment) noexcept {
+    const size_t remainder = offset % alignment;
+    return remainder == 0 ? offset : offset + (alignment - remainder);
+}
+
 template <typename T>
-struct BumpAllocator {
-    T* ptr;
-    BumpAllocator(T* block) : ptr(block) {}
-    T* alloc(size_t count) {
-        T* res = ptr;
-        ptr += count;
-        return res;
-    }
+size_t reserve_span(size_t& offset, size_t count) noexcept {
+    offset = align_up(offset, alignof(T));
+    const size_t start = offset;
+    offset += sizeof(T) * count;
+    return start;
+}
+
+template <typename T>
+T* ptr_at(std::byte* base, size_t offset) noexcept {
+    auto* const ptr = base + offset;
+    assert(reinterpret_cast<std::uintptr_t>(ptr) % alignof(T) == 0);
+    return reinterpret_cast<T*>(ptr);
+}
+
+struct SparseBatchLayout {
+    size_t total_bytes;
+    size_t is_white_offset;
+    size_t outcome_offset;
+    size_t score_offset;
+    size_t white_values_offset;
+    size_t black_values_offset;
+    size_t white_offset;
+    size_t black_offset;
+    size_t psqt_indices_offset;
+    size_t layer_stack_indices_offset;
 };
+
+SparseBatchLayout make_sparse_batch_layout(int size, int max_active_features) noexcept {
+    const size_t batch_size    = static_cast<size_t>(size);
+    const size_t active_values = batch_size * static_cast<size_t>(max_active_features);
+
+    SparseBatchLayout layout{};
+    size_t            offset = 0;
+
+    layout.is_white_offset            = reserve_span<float>(offset, batch_size);
+    layout.outcome_offset             = reserve_span<float>(offset, batch_size);
+    layout.score_offset               = reserve_span<float>(offset, batch_size);
+    layout.white_values_offset        = reserve_span<float>(offset, active_values);
+    layout.black_values_offset        = reserve_span<float>(offset, active_values);
+    layout.white_offset               = reserve_span<int>(offset, active_values);
+    layout.black_offset               = reserve_span<int>(offset, active_values);
+    layout.psqt_indices_offset        = reserve_span<int>(offset, batch_size);
+    layout.layer_stack_indices_offset = reserve_span<int>(offset, batch_size);
+    layout.total_bytes                = offset;
+
+    return layout;
+}
+
+}  // namespace
 
 SparseBatch::SparseBatch(const IFeatureExtractor&              feature_set,
                          const std::vector<TrainingDataEntry>& entries)
@@ -420,44 +469,47 @@ SparseBatch::SparseBatch(const IFeatureExtractor&              feature_set,
     size                = entries.size();
     max_active_features = feature_set.max_active_features();
 
-    const size_t total_floats = size * 3 + size * max_active_features * 2;
-    const size_t total_ints   = size * 2 + size * max_active_features * 2;
+    const SparseBatchLayout layout = make_sparse_batch_layout(size, max_active_features);
 
-    m_float_block = new float[total_floats];
-    m_int_block   = new int[total_ints];
+    total_bytes                = layout.total_bytes;
+    is_white_offset            = layout.is_white_offset;
+    outcome_offset             = layout.outcome_offset;
+    score_offset               = layout.score_offset;
+    white_values_offset        = layout.white_values_offset;
+    black_values_offset        = layout.black_values_offset;
+    white_offset               = layout.white_offset;
+    black_offset               = layout.black_offset;
+    psqt_indices_offset        = layout.psqt_indices_offset;
+    layer_stack_indices_offset = layout.layer_stack_indices_offset;
 
-    BumpAllocator<float> float_alloc(m_float_block);
-    is_white     = float_alloc.alloc(size);
-    outcome      = float_alloc.alloc(size);
-    score        = float_alloc.alloc(size);
-    white_values = float_alloc.alloc(size * max_active_features);
-    black_values = float_alloc.alloc(size * max_active_features);
+    m_block = static_cast<std::byte*>(::operator new(total_bytes));
+    data    = reinterpret_cast<std::uint8_t*>(m_block);
 
-    BumpAllocator<int> int_alloc(m_int_block);
-    white               = int_alloc.alloc(size * max_active_features);
-    black               = int_alloc.alloc(size * max_active_features);
-    psqt_indices        = int_alloc.alloc(size);
-    layer_stack_indices = int_alloc.alloc(size);
+    is_white            = ptr_at<float>(m_block, is_white_offset);
+    outcome             = ptr_at<float>(m_block, outcome_offset);
+    score               = ptr_at<float>(m_block, score_offset);
+    white_values        = ptr_at<float>(m_block, white_values_offset);
+    black_values        = ptr_at<float>(m_block, black_values_offset);
+    white               = ptr_at<int>(m_block, white_offset);
+    black               = ptr_at<int>(m_block, black_offset);
+    psqt_indices        = ptr_at<int>(m_block, psqt_indices_offset);
+    layer_stack_indices = ptr_at<int>(m_block, layer_stack_indices_offset);
 
     num_active_white_features = 0;
     num_active_black_features = 0;
 
-    for (int i = 0; i < size * max_active_features; ++i)
-        white[i] = -1;
-    for (int i = 0; i < size * max_active_features; ++i)
-        black[i] = -1;
-    for (int i = 0; i < size * max_active_features; ++i)
-        white_values[i] = 0.0f;
-    for (int i = 0; i < size * max_active_features; ++i)
-        black_values[i] = 0.0f;
+    const size_t active_values = static_cast<size_t>(size) * static_cast<size_t>(max_active_features);
+    std::fill_n(white, active_values, -1);
+    std::fill_n(black, active_values, -1);
+    std::fill_n(white_values, active_values, 0.0f);
+    std::fill_n(black_values, active_values, 0.0f);
 
     for (int i = 0; i < size; ++i)
         fill_entry(feature_set, i, entries[i]);
 }
 
 SparseBatch::~SparseBatch() {
-    delete[] m_float_block;
-    delete[] m_int_block;
+    ::operator delete(m_block);
 }
 
 void SparseBatch::fill_entry(const IFeatureExtractor& fs, int i, const TrainingDataEntry& e) {

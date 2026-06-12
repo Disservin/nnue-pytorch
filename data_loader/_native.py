@@ -6,6 +6,9 @@ import numpy as np
 import torch
 
 from .config import CDataloaderSkipConfig, CDataloaderDDPConfig
+FLOAT32_BYTES = ctypes.sizeof(ctypes.c_float)
+INT32_BYTES = ctypes.sizeof(ctypes.c_int)
+
 
 
 def _pin_and_move(t: torch.Tensor, device, use_pinned_memory=False, dtype=None) -> torch.Tensor:
@@ -46,52 +49,70 @@ class SparseBatch(ctypes.Structure):
         ("black_values", ctypes.POINTER(ctypes.c_float)),
         ("psqt_indices", ctypes.POINTER(ctypes.c_int)),
         ("layer_stack_indices", ctypes.POINTER(ctypes.c_int)),
+        ("data", ctypes.POINTER(ctypes.c_uint8)),
+        ("total_bytes", ctypes.c_size_t),
+        ("is_white_offset", ctypes.c_size_t),
+        ("outcome_offset", ctypes.c_size_t),
+        ("score_offset", ctypes.c_size_t),
+        ("white_values_offset", ctypes.c_size_t),
+        ("black_values_offset", ctypes.c_size_t),
+        ("white_offset", ctypes.c_size_t),
+        ("black_offset", ctypes.c_size_t),
+        ("psqt_indices_offset", ctypes.c_size_t),
+        ("layer_stack_indices_offset", ctypes.c_size_t),
     ]
 
     def get_tensors(self, device, use_pinned_memory=False):
-        total_floats = self.size * 3 + self.size * self.max_active_features * 2
-        total_ints = self.size * 2 + self.size * self.max_active_features * 2
-
-        # Create CPU-side tensors sharing the contiguous C++ buffers
-        # self.is_white points to the start of the float block
-        float_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
+        block_cpu = torch.from_numpy(
+            np.ctypeslib.as_array(self.data, shape=(self.total_bytes,))
         )
-        # self.white points to the start of the int block
-        int_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.white, shape=(total_ints,))
-        )
+        block_gpu = _pin_and_move(block_cpu, device, use_pinned_memory)
 
-        # Move the 2 contiguous blocks to the target device in exactly 2 H2D transfers
-        float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
-        int_block_gpu = _pin_and_move(int_block_cpu, device, use_pinned_memory)
-
-        # Slice the contiguous blocks on the target device (zero-copy operations)
         size = self.size
         max_active = self.max_active_features
+        active_values = size * max_active
 
-        # Slices from float block
-        us = float_block_gpu[0 : size].view(size, 1)
-        outcome = float_block_gpu[size : 2 * size].view(size, 1)
-        score = float_block_gpu[2 * size : 3 * size].view(size, 1)
-        
-        offset_float = 3 * size
-        white_values = float_block_gpu[offset_float : offset_float + size * max_active].view(size, max_active)
-        offset_float += size * max_active
-        black_values = float_block_gpu[offset_float : offset_float + size * max_active].view(size, max_active)
+        def typed_view(offset_bytes, count, dtype, shape, itemsize):
+            end = offset_bytes + count * itemsize
+            return block_gpu[offset_bytes:end].view(dtype=dtype).view(*shape)
 
-        # Slices from int block
-        white_indices = int_block_gpu[0 : size * max_active].view(size, max_active)
-        offset_int = size * max_active
-        black_indices = int_block_gpu[offset_int : offset_int + size * max_active].view(size, max_active)
-        offset_int += size * max_active
-        
-        # psqt_indices and layer_stack_indices are sliced and then type-casted to long (int64) on the target device
-        psqt_indices = int_block_gpu[offset_int : offset_int + size].view(size).long()
-        offset_int += size
-        layer_stack_indices = int_block_gpu[offset_int : offset_int + size].view(size).long()
+        us = typed_view(
+            self.is_white_offset, size, torch.float32, (size, 1), FLOAT32_BYTES
+        )
+        outcome = typed_view(
+            self.outcome_offset, size, torch.float32, (size, 1), FLOAT32_BYTES
+        )
+        score = typed_view(
+            self.score_offset, size, torch.float32, (size, 1), FLOAT32_BYTES
+        )
+        white_values = typed_view(
+            self.white_values_offset,
+            active_values,
+            torch.float32,
+            (size, max_active),
+            FLOAT32_BYTES,
+        )
+        black_values = typed_view(
+            self.black_values_offset,
+            active_values,
+            torch.float32,
+            (size, max_active),
+            FLOAT32_BYTES,
+        )
 
-        # Compute 'them' on the target device
+        white_indices = typed_view(
+            self.white_offset, active_values, torch.int32, (size, max_active), INT32_BYTES
+        )
+        black_indices = typed_view(
+            self.black_offset, active_values, torch.int32, (size, max_active), INT32_BYTES
+        )
+        psqt_indices = typed_view(
+            self.psqt_indices_offset, size, torch.int32, (size,), INT32_BYTES
+        ).long()
+        layer_stack_indices = typed_view(
+            self.layer_stack_indices_offset, size, torch.int32, (size,), INT32_BYTES
+        ).long()
+
         if not us.is_cuda and use_pinned_memory:
             them = torch.empty_like(us, pin_memory=True)
             them.fill_(1.0)
@@ -217,8 +238,8 @@ class CDataLoaderAPI:
         ]
 
 
-type SparseBatchPtr = ctypes._Pointer[SparseBatch]
-type FenBatchPtr = ctypes._Pointer[FenBatch]
+SparseBatchPtr = ctypes.POINTER(SparseBatch)
+FenBatchPtr = ctypes.POINTER(FenBatch)
 
 try:
     c_lib = CDataLoaderAPI()

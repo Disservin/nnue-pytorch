@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <memory>
@@ -53,14 +54,24 @@ struct SparseBatch final {
     float* black_values;
     int* psqt_indices;
     int* layer_stack_indices;
+    std::uint8_t* data;
+    std::size_t total_bytes;
+    std::size_t is_white_offset;
+    std::size_t outcome_offset;
+    std::size_t score_offset;
+    std::size_t white_values_offset;
+    std::size_t black_values_offset;
+    std::size_t white_offset;
+    std::size_t black_offset;
+    std::size_t psqt_indices_offset;
+    std::size_t layer_stack_indices_offset;
 
 #ifdef NNUE_LOADER_STATISTICS
     std::vector<struct binpack::TrainingDataEntry> entries_copy;
 #endif
 
 private:
-    float* m_float_block = nullptr;
-    int*   m_int_block = nullptr;
+    std::byte* m_block = nullptr;
     void fill_entry(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
     void fill_features(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
 };
