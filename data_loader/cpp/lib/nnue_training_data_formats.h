@@ -6850,10 +6850,16 @@ namespace binpack
 
         [[nodiscard]] std::vector<unsigned char> readNextChunk()
         {
-            auto size = readChunkHeader().chunkSize;
-            std::vector<unsigned char> data(size);
-            m_file.read(reinterpret_cast<char*>(data.data()), size);
+            std::vector<unsigned char> data;
+            readNextChunkInto(data);
             return data;
+        }
+
+        void readNextChunkInto(std::vector<unsigned char>& data)
+        {
+            auto size = readChunkHeader().chunkSize;
+            data.resize(size);
+            m_file.read(reinterpret_cast<char*>(data.data()), size);
         }
 
         [[nodiscard]] std::size_t sizeBytes() const
@@ -7569,20 +7575,85 @@ namespace binpack
     {
         static constexpr std::size_t chunkSize = suggestedChunkSize;
 
+        struct ChunkReader
+        {
+            [[nodiscard]] bool hasNext(const std::vector<unsigned char>& chunk) const
+            {
+                if (m_movelistReader.has_value() && m_movelistReader->hasNext())
+                {
+                    return true;
+                }
+
+                return !m_isEnd && m_offset + sizeof(PackedTrainingDataEntry) + 2 <= chunk.size();
+            }
+
+            [[nodiscard]] TrainingDataEntry next(const std::vector<unsigned char>& chunk)
+            {
+                if (m_movelistReader.has_value())
+                {
+                    const auto e = m_movelistReader->nextEntry();
+
+                    if (!m_movelistReader->hasNext())
+                    {
+                        m_offset += m_movelistReader->numReadBytes();
+                        m_movelistReader.reset();
+                        finishIfAtEnd(chunk);
+                    }
+
+                    return e;
+                }
+
+                PackedTrainingDataEntry packed;
+                std::memcpy(&packed, chunk.data() + m_offset, sizeof(PackedTrainingDataEntry));
+                m_offset += sizeof(PackedTrainingDataEntry);
+
+                const std::uint16_t numPlies = (chunk[m_offset] << 8) | chunk[m_offset + 1];
+                m_offset += 2;
+
+                const auto e = unpackEntry(packed);
+
+                if (numPlies > 0)
+                {
+                    m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(const_cast<unsigned char*>(chunk.data())) + m_offset, numPlies);
+                }
+                else
+                {
+                    finishIfAtEnd(chunk);
+                }
+
+                return e;
+            }
+
+            void reset()
+            {
+                m_movelistReader.reset();
+                m_offset = 0;
+                m_isEnd = false;
+            }
+
+        private:
+            std::optional<PackedMoveScoreListReader> m_movelistReader;
+            std::size_t m_offset = 0;
+            bool m_isEnd = false;
+
+            void finishIfAtEnd(const std::vector<unsigned char>& chunk)
+            {
+                if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > chunk.size())
+                {
+                    m_isEnd = true;
+                }
+            }
+        };
+
         CompressedTrainingDataEntryReader(std::string path, std::ios_base::openmode om = std::ios_base::app) :
             m_inputFile(path, om | std::ios_base::in),
             m_chunk(),
-            m_movelistReader(std::nullopt),
-            m_offset(0),
+            m_chunkReader(),
             m_isEnd(false)
         {
-            if (!m_inputFile.hasNextChunk())
+            if (!loadNextChunk())
             {
                 m_isEnd = true;
-            }
-            else
-            {
-                m_chunk = m_inputFile.readNextChunk();
             }
         }
 
@@ -7593,35 +7664,9 @@ namespace binpack
 
         [[nodiscard]] TrainingDataEntry next()
         {
-            if (m_movelistReader.has_value())
-            {
-                const auto e = m_movelistReader->nextEntry();
+            const auto e = m_chunkReader.next(m_chunk);
 
-                if (!m_movelistReader->hasNext())
-                {
-                    m_offset += m_movelistReader->numReadBytes();
-                    m_movelistReader.reset();
-
-                    fetchNextChunkIfNeeded();
-                }
-
-                return e;
-            }
-
-            PackedTrainingDataEntry packed;
-            std::memcpy(&packed, m_chunk.data() + m_offset, sizeof(PackedTrainingDataEntry));
-            m_offset += sizeof(PackedTrainingDataEntry);
-
-            const std::uint16_t numPlies = (m_chunk[m_offset] << 8) | m_chunk[m_offset + 1];
-            m_offset += 2;
-
-            const auto e = unpackEntry(packed);
-
-            if (numPlies > 0)
-            {
-                m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(m_chunk.data()) + m_offset, numPlies);
-            }
-            else
+            if (!m_chunkReader.hasNext(m_chunk))
             {
                 fetchNextChunkIfNeeded();
             }
@@ -7632,24 +7677,30 @@ namespace binpack
     private:
         CompressedTrainingDataFile m_inputFile;
         std::vector<unsigned char> m_chunk;
-        std::optional<PackedMoveScoreListReader> m_movelistReader;
-        std::size_t m_offset;
+        ChunkReader m_chunkReader;
         bool m_isEnd;
 
         void fetchNextChunkIfNeeded()
         {
-            if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
+            if (!m_chunkReader.hasNext(m_chunk))
             {
-                if (m_inputFile.hasNextChunk())
-                {
-                    m_chunk = m_inputFile.readNextChunk();
-                    m_offset = 0;
-                }
-                else
+                if (!loadNextChunk())
                 {
                     m_isEnd = true;
                 }
             }
+        }
+
+        [[nodiscard]] bool loadNextChunk()
+        {
+            if (!m_inputFile.hasNextChunk())
+            {
+                return false;
+            }
+
+            m_inputFile.readNextChunkInto(m_chunk);
+            m_chunkReader.reset();
+            return true;
         }
     };
 
@@ -7667,7 +7718,8 @@ namespace binpack
             int world_size = 1
         ) :
             m_concurrency(concurrency),
-            m_numRunningWorkers(concurrency),
+            m_numRunningReaders(calculateNumReaderThreads(concurrency)),
+            m_numRunningDecoders(calculateNumDecoderThreads(concurrency)),
             m_cyclic(cyclic),
             m_skipPredicate(std::move(skipPredicate)),
             m_rank(rank),
@@ -7691,6 +7743,7 @@ namespace binpack
                 m_fileMutexes.push_back(std::make_unique<std::timed_mutex>());
             }
             m_distribution_weights = sizes;
+            m_rawChunkRingBuffer.reserve_internal(chunkSize);
             m_ringBuffer.reserve_internal(threadBufferSize);
 
             // Initialize DDP seeking tracking
@@ -7699,66 +7752,60 @@ namespace binpack
 
             m_stopFlag.store(false);
 
-            auto worker = [this]()
+            auto readerWorker = [this]()
             {
-                std::vector<unsigned char> m_chunk{};
-                std::optional<PackedMoveScoreListReader> m_movelistReader(std::nullopt);
-                std::size_t m_offset(0);
-                std::vector<TrainingDataEntry> m_localBuffer;
-                m_localBuffer.reserve(threadBufferSize);
-
                 std::discrete_distribution<std::size_t> local_dist(
                     m_distribution_weights.begin(), m_distribution_weights.end()
                 );
+                std::vector<unsigned char> chunk;
 
-                bool isEnd = fetchNextChunkIfNeeded(m_offset, m_chunk, local_dist);
-
-                while(!isEnd && !m_stopFlag.load())
+                while (!m_stopFlag.load())
                 {
-                    while (m_localBuffer.size() < threadBufferSize)
+                    if (!readNextChunk(chunk, local_dist))
                     {
-                        if (m_movelistReader.has_value())
-                        {
-                            const auto e = m_movelistReader->nextEntry();
+                        break;
+                    }
 
-                            if (!m_movelistReader->hasNext())
-                            {
-                                m_offset += m_movelistReader->numReadBytes();
-                                m_movelistReader.reset();
+                    bool success = m_rawChunkRingBuffer.put(chunk, [this]() {
+                        return this->should_stop_reader_producer();
+                    });
+                    if (!success)
+                    {
+                        break;
+                    }
+                }
 
-                                isEnd = fetchNextChunkIfNeeded(m_offset, m_chunk, local_dist);
-                            }
+                m_numRunningReaders.fetch_sub(1);
+                m_rawChunkRingBuffer.signal_stop(false);
+            };
 
-                            if (!m_skipPredicate || !m_skipPredicate(e))
-                                m_localBuffer.emplace_back(e);
-                        }
-                        else
-                        {
-                            PackedTrainingDataEntry packed;
-                            std::memcpy(&packed, m_chunk.data() + m_offset, sizeof(PackedTrainingDataEntry));
-                            m_offset += sizeof(PackedTrainingDataEntry);
+            auto decoderWorker = [this]()
+            {
+                CompressedTrainingDataEntryReader::ChunkReader chunkReader;
+                std::vector<unsigned char> chunk;
+                std::vector<TrainingDataEntry> m_localBuffer;
+                m_localBuffer.reserve(threadBufferSize);
 
-                            const std::uint16_t numPlies = (m_chunk[m_offset] << 8) | m_chunk[m_offset + 1];
-                            m_offset += 2;
-
-                            const auto e = unpackEntry(packed);
-
-                            if (numPlies > 0)
-                            {
-                                m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(m_chunk.data()) + m_offset, numPlies);
-                            }
-                            else
-                            {
-                                isEnd = fetchNextChunkIfNeeded(m_offset, m_chunk, local_dist);
-                            }
-
-                            if (!m_skipPredicate || !m_skipPredicate(e))
-                                m_localBuffer.emplace_back(e);
-                        }
-
-                        if (isEnd || m_stopFlag.load())
+                while (!m_stopFlag.load())
+                {
+                    if (!chunkReader.hasNext(chunk))
+                    {
+                        bool success = m_rawChunkRingBuffer.take(chunk, [this]() {
+                            return this->should_stop_reader_consumer();
+                        });
+                        if (!success)
                         {
                             break;
+                        }
+                        chunkReader.reset();
+                    }
+
+                    while (chunkReader.hasNext(chunk) && m_localBuffer.size() < threadBufferSize)
+                    {
+                        const auto e = chunkReader.next(chunk);
+                        if (!m_skipPredicate || !m_skipPredicate(e))
+                        {
+                            m_localBuffer.emplace_back(e);
                         }
                     }
 
@@ -7767,22 +7814,39 @@ namespace binpack
                         auto& prng = rng::get_thread_local_rng();
                         std::shuffle(m_localBuffer.begin(), m_localBuffer.end(), prng);
 
-                        bool success = m_ringBuffer.put(m_localBuffer, [this]() {
-                            return this->should_stop_producer();
-                        });
+                    bool success = m_ringBuffer.put(m_localBuffer, [this]() {
+                        return this->should_stop_decoder_producer();
+                    });
                         if (!success) break; // Ring and workers exhausted
 
                         m_localBuffer.clear();
                         m_localBuffer.reserve(threadBufferSize);
                     }
                 }
-                m_numRunningWorkers.fetch_sub(1);
+
+                if (!m_localBuffer.empty())
+                {
+                    auto& prng = rng::get_thread_local_rng();
+                    std::shuffle(m_localBuffer.begin(), m_localBuffer.end(), prng);
+
+                    bool success = m_ringBuffer.put(m_localBuffer, [this]() {
+                        return this->should_stop_decoder_producer();
+                    });
+                    (void)success;
+                }
+
+                m_numRunningDecoders.fetch_sub(1);
                 m_ringBuffer.signal_stop(false);
             };
 
-            for (int i = 0; i < concurrency; ++i)
+            for (int i = 0; i < calculateNumReaderThreads(concurrency); ++i)
             {
-                m_workers.emplace_back(worker);
+                m_readerWorkers.emplace_back(readerWorker);
+            }
+
+            for (int i = 0; i < calculateNumDecoderThreads(concurrency); ++i)
+            {
+                m_decoderWorkers.emplace_back(decoderWorker);
             }
         }
 
@@ -7797,7 +7861,7 @@ namespace binpack
             if (local.offset >= local.entries.size())
             {
                 bool success = m_ringBuffer.take(local.entries, [this]() {
-                    return this->should_stop_consumer();
+                    return this->should_stop_decoder_consumer();
                 });
                 if (!success) return std::nullopt;
                 local.offset = 0;
@@ -7815,7 +7879,7 @@ namespace binpack
                 if (local.offset >= local.entries.size()) [[unlikely]]
                 {
                     bool success = m_ringBuffer.take(local.entries, [this]() {
-                        return this->should_stop_consumer();
+                        return this->should_stop_decoder_consumer();
                     });
                     if (!success) break; // Ring and workers exhausted
                     local.offset = 0;
@@ -7839,8 +7903,16 @@ namespace binpack
         ~CompressedTrainingDataEntryParallelReader()
         {
             m_stopFlag.store(true);
+            m_rawChunkRingBuffer.signal_stop();
             m_ringBuffer.signal_stop();
-            for (auto& worker : m_workers)
+            for (auto& worker : m_readerWorkers)
+            {
+                if (worker.joinable())
+                {
+                    worker.join();
+                }
+            }
+            for (auto& worker : m_decoderWorkers)
             {
                 if (worker.joinable())
                 {
@@ -7851,14 +7923,18 @@ namespace binpack
 
     private:
         int m_concurrency;
-        std::atomic_int m_numRunningWorkers;
+        std::atomic_int m_numRunningReaders;
+        std::atomic_int m_numRunningDecoders;
         std::vector<CompressedTrainingDataFile> m_inputFiles;
         bool m_cyclic;
 
         static constexpr int threadBufferSize = 256 * 256 * 16;
+        static constexpr int rawChunkRingCapacity = 2;
+        static constexpr int outputRingCapacity = 1;
 
         std::atomic_bool m_stopFlag;
-        std::vector<std::thread> m_workers;
+        std::vector<std::thread> m_readerWorkers;
+        std::vector<std::thread> m_decoderWorkers;
 
         // Per File Lock
         std::vector<std::unique_ptr<std::timed_mutex>> m_fileMutexes;
@@ -7881,172 +7957,193 @@ namespace binpack
 
         // thread local data buffers
         using TrainingDataEntries = std::vector<TrainingDataEntry>;
+        using RawChunk = std::vector<unsigned char>;
         struct alignas(128) LocalBuffer {
             TrainingDataEntries entries;
             size_t offset = 0;
         };
 
-        // Constant Size Ring Buffer
-        static constexpr int ringCapacity = 1;
         thread_safe_types::ThreadLocalRegistry<LocalBuffer> m_bufferRegistry;
-        thread_safe_types::ThreadSafeRingBuffer<TrainingDataEntries, ringCapacity> m_ringBuffer;
+        thread_safe_types::ThreadSafeRingBuffer<RawChunk, rawChunkRingCapacity> m_rawChunkRingBuffer;
+        thread_safe_types::ThreadSafeRingBuffer<TrainingDataEntries, outputRingCapacity> m_ringBuffer;
 
-        bool should_stop_producer()
+        static int calculateNumReaderThreads(int concurrency)
+        {
+            if (concurrency <= 1)
+            {
+                return 1;
+            }
+
+            return 1;
+        }
+
+        static int calculateNumDecoderThreads(int concurrency)
+        {
+            return std::max(1, concurrency - calculateNumReaderThreads(concurrency));
+        }
+
+        bool should_stop_reader_producer()
         {
             return m_stopFlag.load();
         }
 
-        bool should_stop_consumer()
+        bool should_stop_reader_consumer()
         {
-            return m_numRunningWorkers.load() <= 0;
+            return m_numRunningReaders.load() <= 0;
         }
 
-        bool fetchNextChunkIfNeeded(std::size_t& m_offset, std::vector<unsigned char>& m_chunk,
-                                std::discrete_distribution<std::size_t>& local_dist)
+        bool should_stop_decoder_producer()
         {
-            if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
+            return m_stopFlag.load();
+        }
+
+        bool should_stop_decoder_consumer()
+        {
+            return m_numRunningDecoders.load() <= 0;
+        }
+
+        bool readNextChunk(std::vector<unsigned char>& chunk,
+                           std::discrete_distribution<std::size_t>& local_dist)
+        {
+            auto& prng = rng::get_thread_local_rng();
+
+            std::size_t fileId;
+            std::unique_lock<std::remove_reference_t<decltype(*m_fileMutexes[0])>> lock;
+
+            while (true)
             {
-                auto& prng = rng::get_thread_local_rng();
+                fileId = local_dist(prng);
+                lock = std::unique_lock(*m_fileMutexes[fileId], std::defer_lock);
 
-                std::size_t fileId;
-                std::unique_lock<std::remove_reference_t<decltype(*m_fileMutexes[0])>> lock;
-
-                while (true)
+                if (lock.try_lock_for(kMaxLockWaitTime))
                 {
-                    fileId = local_dist(prng);
-                    lock = std::unique_lock(*m_fileMutexes[fileId], std::defer_lock);
-
-                    if (lock.try_lock_for(kMaxLockWaitTime))
-                    {
-                        break;
-                    }
-
-                    m_timeout_count.fetch_add(1, std::memory_order_relaxed);
-
-                    auto now = std::chrono::steady_clock::now().time_since_epoch();
-                    int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
-                    int64_t last_sec = m_last_warning_time.load(std::memory_order_relaxed);
-
-                    if (now_sec - last_sec >= kWarningCooldownSeconds)
-                    {
-                        // Ensure only one thread evaluates this to true during the evaluation window
-                        if (m_last_warning_time.compare_exchange_strong(last_sec, now_sec, std::memory_order_relaxed))
-                        {
-                            // Atomically retrieve the total count and reset it to 0 without dropping concurrent increments
-                            uint64_t count_to_print = m_timeout_count.exchange(0, std::memory_order_relaxed);
-
-                            auto        utc_now  = std::chrono::system_clock::now();
-                            std::time_t utc_time = std::chrono::system_clock::to_time_t(utc_now);
-
-                            auto to_utc_tm = [](std::time_t time, std::tm& result)
-                            {
-                                #if defined(_MSC_VER)
-                                gmtime_s(&result, &time);
-                                #else
-                                gmtime_r(&time, &result);
-                                #endif
-                            };
-
-                            std::tm utc_tm{};
-                            to_utc_tm(utc_time, utc_tm);
-
-                            std::cerr << "[" << std::put_time(&utc_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
-                                      << "[Warning] Dataloader mutex acquisition for file with ID "
-                                      << fileId << " name " << m_inputFiles[fileId].path()
-                                      << " timed out after " << kMaxLockWaitTime.count()
-                                      << "ms. Re-rolling file. "
-                                      << "(" << count_to_print << " timeouts since last warning)\n";
-                        }
-                    }
+                    break;
                 }
 
-                auto& inputFile = m_inputFiles[fileId];
+                m_timeout_count.fetch_add(1, std::memory_order_relaxed);
 
-                auto seek_for_ddp_rank = [&](std::size_t rank) -> bool
+                auto now = std::chrono::steady_clock::now().time_since_epoch();
+                int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+                int64_t last_sec = m_last_warning_time.load(std::memory_order_relaxed);
+
+                if (now_sec - last_sec >= kWarningCooldownSeconds)
                 {
-                    std::size_t skipped = 0;
-                    if (inputFile.skipChunks(rank, &skipped))
+                    // Ensure only one thread evaluates this to true during the evaluation window
+                    if (m_last_warning_time.compare_exchange_strong(last_sec, now_sec, std::memory_order_relaxed))
                     {
-                        return true;
+                        // Atomically retrieve the total count and reset it to 0 without dropping concurrent increments
+                        uint64_t count_to_print = m_timeout_count.exchange(0, std::memory_order_relaxed);
+
+                        auto        utc_now  = std::chrono::system_clock::now();
+                        std::time_t utc_time = std::chrono::system_clock::to_time_t(utc_now);
+
+                        auto to_utc_tm = [](std::time_t time, std::tm& result)
+                        {
+                            #if defined(_MSC_VER)
+                            gmtime_s(&result, &time);
+                            #else
+                            gmtime_r(&time, &result);
+                            #endif
+                        };
+
+                        std::tm utc_tm{};
+                        to_utc_tm(utc_time, utc_tm);
+
+                        std::cerr << "[" << std::put_time(&utc_tm, "%Y-%m-%d %H:%M:%S UTC") << "] "
+                                  << "[Warning] Dataloader mutex acquisition for file with ID "
+                                  << fileId << " name " << m_inputFiles[fileId].path()
+                                  << " timed out after " << kMaxLockWaitTime.count()
+                                  << "ms. Re-rolling file. "
+                                  << "(" << count_to_print << " timeouts since last warning)\n";
                     }
-                    if (!m_cyclic)
+                }
+            }
+
+            auto& inputFile = m_inputFiles[fileId];
+
+            auto seek_for_ddp_rank = [&](std::size_t rank) -> bool
+            {
+                std::size_t skipped = 0;
+                if (inputFile.skipChunks(rank, &skipped))
+                {
+                    return true;
+                }
+                if (!m_cyclic)
+                {
+                    return false;
+                }
+                if (skipped == 0)
+                {
+                    return false;
+                }
+                inputFile.seek_to_start();
+                const std::size_t offset = rank % skipped;
+                const bool ok = inputFile.skipChunks(offset);
+                assert(ok);
+                return ok;
+            };
+
+            // DDP: chunk-based skipping
+            if (m_world_size > 1)
+            {
+                if (!m_files_seeked_for_ddp[fileId])
+                {
+                    const std::size_t rank = static_cast<std::size_t>(m_rank);
+                    if (!seek_for_ddp_rank(rank))
                     {
                         return false;
                     }
-                    if (skipped == 0)
+                    m_files_seeked_for_ddp[fileId] = true;
+                }
+                else if (m_ddp_chunks_to_skip_after_read[fileId] > 0)
+                {
+                    const bool success = inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId]);
+                    if (!success)
                     {
-                        return false;
+                        if (!m_cyclic)
+                        {
+                            return false;
+                        }
+                        inputFile.seek_to_start();
+                        const std::size_t rank = static_cast<std::size_t>(m_rank);
+                        if (!seek_for_ddp_rank(rank))
+                        {
+                            return false;
+                        }
                     }
+                    m_ddp_chunks_to_skip_after_read[fileId] = 0;
+                }
+            }
+
+            if (!inputFile.hasNextChunk())
+            {
+                if (m_cyclic)
+                {
                     inputFile.seek_to_start();
-                    const std::size_t offset = rank % skipped;
-                    const bool ok = inputFile.skipChunks(offset);
-                    assert(ok);
-                    return ok;
-                };
 
-                // DDP: chunk-based skipping
-                if (m_world_size > 1)
-                {
-                    if (!m_files_seeked_for_ddp[fileId])
+                    if (m_world_size > 1)
                     {
                         const std::size_t rank = static_cast<std::size_t>(m_rank);
                         if (!seek_for_ddp_rank(rank))
                         {
-                            return true;
+                            return false;
                         }
-                        m_files_seeked_for_ddp[fileId] = true;
-                    }
-                    else if (m_ddp_chunks_to_skip_after_read[fileId] > 0)
-                    {
-                        const bool success = inputFile.skipChunks(m_ddp_chunks_to_skip_after_read[fileId]);
-                        if (!success)
-                        {
-                            if (!m_cyclic)
-                            {
-                                return true;
-                            }
-                            inputFile.seek_to_start();
-                            const std::size_t rank = static_cast<std::size_t>(m_rank);
-                            if (!seek_for_ddp_rank(rank))
-                            {
-                                return true;
-                            }
-                        }
-                        m_ddp_chunks_to_skip_after_read[fileId] = 0;
                     }
                 }
-
-                if (!inputFile.hasNextChunk())
+                else
                 {
-                    if (m_cyclic)
-                    {
-                        inputFile.seek_to_start();
-
-                        if (m_world_size > 1)
-                        {
-                            const std::size_t rank = static_cast<std::size_t>(m_rank);
-                            if (!seek_for_ddp_rank(rank))
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        return true;
-                    }
-                }
-
-                m_chunk = inputFile.readNextChunk();
-                m_offset = 0;
-
-                if (m_world_size > 1)
-                {
-                    m_ddp_chunks_to_skip_after_read[fileId] = static_cast<std::size_t>(m_world_size - 1);
+                    return false;
                 }
             }
 
-            return false;
+            inputFile.readNextChunkInto(chunk);
+
+            if (m_world_size > 1)
+            {
+                m_ddp_chunks_to_skip_after_read[fileId] = static_cast<std::size_t>(m_world_size - 1);
+            }
+
+            return true;
         }
     };
 
