@@ -7929,8 +7929,8 @@ namespace binpack
         bool m_cyclic;
 
         static constexpr int threadBufferSize = 256 * 256 * 16;
-        static constexpr int rawChunkRingCapacity = 8;
-        static constexpr int outputRingCapacity = 2;
+        static constexpr int rawChunkRingCapacity = 32;
+        static constexpr int outputRingCapacity = 4;
 
         std::atomic_bool m_stopFlag;
         std::vector<std::thread> m_readerWorkers;
@@ -7969,17 +7969,12 @@ namespace binpack
 
         static int calculateNumReaderThreads(int concurrency)
         {
-            if (concurrency <= 2)
-            {
-                return 1;
-            }
-
-            return std::clamp(concurrency / 4, 1, concurrency - 1);
+            return std::max(1, concurrency);
         }
 
         static int calculateNumDecoderThreads(int concurrency)
         {
-            return std::max(1, concurrency - calculateNumReaderThreads(concurrency));
+            return std::max(1, concurrency);
         }
 
         bool should_stop_reader_producer()
