@@ -15,13 +15,27 @@ class ComposedFeatureTransformer(nn.Module):
     bias and delegates everything else to the underlying features.
     """
 
-    def __init__(self, feature_classes: list[Callable[[int], InputFeature]], l1_size: int, num_psqt_buckets:int, quantization: QuantizationManager):
+    def __init__(
+        self,
+        feature_classes: list[Callable[[int], InputFeature]],
+        l1_size: int,
+        num_psqt_buckets: int,
+        quantization: QuantizationManager,
+        *,
+        cross_dimensions: int = 0,
+    ):
         super().__init__()
 
         if not l1_size % 2 == 0:
             raise ValueError(f"l1_size must be even, got {l1_size}.")
+        if type(cross_dimensions) is not int or (
+            cross_dimensions != 0
+            and (l1_size <= 0 or l1_size % 32 != 0 or cross_dimensions != l1_size // 8)
+        ):
+            raise ValueError("Invalid cross-perspective FT dimensions")
 
         self.l1_size = l1_size
+        self.cross_dimensions = cross_dimensions
         self.num_psqt_buckets = num_psqt_buckets
         self.num_outputs = l1_size + num_psqt_buckets
 
@@ -60,17 +74,21 @@ class ComposedFeatureTransformer(nn.Module):
 
     def merged_weight_and_bias(
         self,
-        fake_quantize_weights: bool=False,
+        fake_quantize_weights: bool = False,
     ):
         merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
-        b = self.bias[:self.l1_size]
+        b = self.bias[: self.l1_size]
         if fake_quantize_weights:
-            w  = self.quantization.fake_quantize_weights(merged[:, :self.l1_size], "ft_weight")
-            pw = self.quantization.fake_quantize_weights(merged[:, self.l1_size:], "ft_psqt_weight")
+            w = self.quantization.fake_quantize_weights(
+                merged[:, : self.l1_size], "ft_weight"
+            )
+            pw = self.quantization.fake_quantize_weights(
+                merged[:, self.l1_size :], "ft_psqt_weight"
+            )
             merged = torch.cat([w, pw], dim=1)
             b = self.quantization.fake_quantize_weights(b, "ft_bias")
         # Technically unnecessary to zero bias, but it makes it clearer that the PSQT part of the bias is not used.
-        pb = torch.zeros_like(self.bias[self.l1_size:], dtype=b.dtype)
+        pb = torch.zeros_like(self.bias[self.l1_size :], dtype=b.dtype)
         bias = torch.cat([b, pb], dim=0)
 
         return merged, bias
@@ -122,9 +140,7 @@ class ComposedFeatureTransformer(nn.Module):
         fake_quantize_weights: bool,
         backend: str = "auto",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        merged, bias = self.merged_weight_and_bias(
-            fake_quantize_weights
-        )
+        merged, bias = self.merged_weight_and_bias(fake_quantize_weights)
         ft_max_act = self.quantization.max_ft_activation
 
         l0_, wpsqt, bpsqt = double_feature_transform(
@@ -138,6 +154,7 @@ class ComposedFeatureTransformer(nn.Module):
             ft_max_act,
             self.l1_size,
             backend,
+            cross_dimensions=self.cross_dimensions,
         )
 
         if fake_quantize_acts:

@@ -178,6 +178,21 @@ class NNUE(nn.Module):
                 "weight_decay": 0.0,
             },
         ]
+        if self.config.model_config.factorize_heads:
+            for layer in (self.model.layer_stacks.l2, self.model.layer_stacks.output):
+                train_params.extend([
+                    {
+                        "params": [layer.factorized_linear.weight],
+                        "lr": optimizer_config.lr,
+                        "weight_decay": factorized_wd,
+                    },
+                    {
+                        "params": [layer.factorized_linear.bias],
+                        "lr": optimizer_config.lr,
+                        "weight_decay": 0.0,
+                    },
+                ])
+
 
         return self.optimizer_wrapper.configure_optimizers(train_params)
 

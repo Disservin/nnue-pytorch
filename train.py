@@ -240,6 +240,7 @@ def main():
             nnue = torch.load(
                 args.resume_from_model, weights_only=False, map_location="cpu"
             )
+            nnue.model.validate_ft_layout(args.nnue_lightning_config.model_config)
             nnue.train()
         except ModuleNotFoundError as e:
             raise RuntimeError(
@@ -319,7 +320,9 @@ def main():
     )
 
     optimizer_and_schedulers = nnue.configure_optimizers()
-    optimizer, schedulers = _normalize_optimizer_and_schedulers(optimizer_and_schedulers)
+    optimizer, schedulers = _normalize_optimizer_and_schedulers(
+        optimizer_and_schedulers
+    )
 
     refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
     nan_callback = TerminateOnNaN()
@@ -378,10 +381,14 @@ def main():
     if rank == 0:
         last_savepath = os.path.join(tb_logger.log_dir, "checkpoints", "last.ckpt")
         swa_savepath = os.path.join(tb_logger.log_dir, "checkpoints", "last_swa.ckpt")
-        non_swa_path = os.path.join(tb_logger.log_dir, "checkpoints", "last_non_swa.ckpt")
+        non_swa_path = os.path.join(
+            tb_logger.log_dir, "checkpoints", "last_non_swa.ckpt"
+        )
         if os.path.exists(swa_savepath):
             if os.path.exists(last_savepath):
-                print(f"Renaming existing checkpoint at {last_savepath} to {non_swa_path} to preserve original model.")
+                print(
+                    f"Renaming existing checkpoint at {last_savepath} to {non_swa_path} to preserve original model."
+                )
                 os.rename(last_savepath, non_swa_path)
             os.rename(swa_savepath, last_savepath)
 

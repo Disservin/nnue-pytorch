@@ -31,6 +31,7 @@ def ascii_hist(name, x, bins=7):
         xi = f"{xi: <8.4g}".ljust(10)
         print(f"{xi}| {bar}")
 
+
 def get_histogram_callback(hist_title: str, verbose: bool):
     if not verbose:
         return None
@@ -61,6 +62,7 @@ def get_histogram_callback(hist_title: str, verbose: bool):
         print("-" * 15)
 
     return histogram_callback
+
 
 @njit
 def encode_leb_128_array(arr: npt.NDArray) -> list:
@@ -122,17 +124,28 @@ class NNUEWriter:
         self.int32(model.feature_hash ^ (model.L1 * 2))  # Feature transformer hash
         self.write_feature_transformer(model, ft_compression)
         layer_stacks = model.layer_stacks
-        for bucket, (l1, l2, output) in enumerate(layer_stacks.get_coalesced_layer_stacks()):
+        for bucket, (l1, l2, output) in enumerate(
+            layer_stacks.get_coalesced_layer_stacks()
+        ):
             self.int32(fc_hash)  # FC layers hash
-            self.write_fc_layer(model, l1, layer_stacks.l1.layer_key, f"bucket {bucket}")
-            self.write_fc_layer(model, l2, layer_stacks.l2.layer_key, f"bucket {bucket}")
-            self.write_fc_layer(model, output, layer_stacks.output.layer_key, f"bucket {bucket}")
+            self.write_fc_layer(
+                model, l1, layer_stacks.l1.layer_key, f"bucket {bucket}"
+            )
+            self.write_fc_layer(
+                model, l2, layer_stacks.l2.layer_key, f"bucket {bucket}"
+            )
+            self.write_fc_layer(
+                model, output, layer_stacks.output.layer_key, f"bucket {bucket}"
+            )
 
     @staticmethod
     def fc_hash(model: NNUEModel) -> int:
         # InputSlice hash
         prev_hash = 0xEC42E90D
         prev_hash ^= model.L1 * 2
+        if model.input.cross_dimensions:
+            prev_hash ^= 0x43504654
+            prev_hash ^= model.input.cross_dimensions
 
         # Fully connected layers
         layers = [
@@ -199,16 +212,22 @@ class NNUEWriter:
             ft_histogram_callback = get_histogram_callback(f.FEATURE_NAME, self.verbose)
             segment_weight = weight[offset : offset + n]
             segment_psqt_weight = psqt_weight[offset : offset + n]
-            segment_weight, segment_psqt_weight = model.quantization.quantize_feature_transformer_weights(
-                segment_weight, segment_psqt_weight, f_export_dtype, ft_histogram_callback
+            segment_weight, segment_psqt_weight = (
+                model.quantization.quantize_feature_transformer_weights(
+                    segment_weight,
+                    segment_psqt_weight,
+                    f_export_dtype,
+                    ft_histogram_callback,
+                )
             )
             # compression is only useful for types larger than 1 byte
-            segment_compression = ft_compression if f_export_dtype != torch.int8 else "none"
+            segment_compression = (
+                ft_compression if f_export_dtype != torch.int8 else "none"
+            )
             offset += n
 
             self.write_tensor(segment_weight, segment_compression)
             self.write_tensor(segment_psqt_weight, ft_compression)
-
 
     def write_fc_layer(
         self,
@@ -304,8 +323,7 @@ class NNUEReader:
             raise EOFError("Unexpected end of file when reading compressed data.")
 
         res = torch.tensor(
-            decode_leb_128_array(d, reduce(operator.mul, shape, 1)),
-            dtype=torch.float32
+            decode_leb_128_array(d, reduce(operator.mul, shape, 1)), dtype=torch.float32
         )
         res = res.reshape(shape)
         return res
@@ -349,7 +367,9 @@ class NNUEReader:
             dtype = np.int8 if feature.EXPORT_WEIGHT_DTYPE == torch.int8 else np.int16
             s = self.tensor(dtype, [feature.NUM_REAL_FEATURES, L1])
             segments.append(s)
-            s_psqt = self.tensor(np.int32, [feature.NUM_REAL_FEATURES, num_psqt_buckets])
+            s_psqt = self.tensor(
+                np.int32, [feature.NUM_REAL_FEATURES, num_psqt_buckets]
+            )
             segments_psqt.append(s_psqt)
 
         weight = torch.cat(segments, dim=0)
@@ -362,11 +382,12 @@ class NNUEReader:
         )
 
         # Combine weight and psqt_weight into export format, then expand
-        layer.bias.data = torch.cat([
-            bias.to(torch.float32),
-            torch.zeros(num_psqt_buckets, dtype=torch.float32)
-        ])
-        export_weight = torch.cat([weight.to(torch.float32), psqt_weight.to(torch.float32)], dim=1)
+        layer.bias.data = torch.cat(
+            [bias.to(torch.float32), torch.zeros(num_psqt_buckets, dtype=torch.float32)]
+        )
+        export_weight = torch.cat(
+            [weight.to(torch.float32), psqt_weight.to(torch.float32)], dim=1
+        )
         layer.load_export_weights(export_weight)
 
     def read_fc_layer(
@@ -388,7 +409,9 @@ class NNUEReader:
 
         layer_bias = bias.to(torch.float32)
         # Strip padding.
-        layer_weight = weight[: non_padded_shape[0], : non_padded_shape[1]].to(torch.float32)
+        layer_weight = weight[: non_padded_shape[0], : non_padded_shape[1]].to(
+            torch.float32
+        )
 
         layer_bias_t.data.copy_(layer_bias)
         layer_weight_t.data.copy_(layer_weight)

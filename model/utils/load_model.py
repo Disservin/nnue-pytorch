@@ -12,6 +12,7 @@ def load_model(
 ) -> NNUEModel:
     if filename.endswith(".pt"):
         model = torch.load(filename, weights_only=False)
+        model.model.validate_ft_layout(config)
         model.eval()
         return model.model
 

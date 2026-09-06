@@ -70,6 +70,7 @@ ZERO_BLOCK_SIZE = 4
 VERBOSE = False
 _DEVICE_OVERRIDE = None
 
+
 @dataclass
 class GatherConfig:
     data: str
@@ -129,7 +130,13 @@ class EvalPermConfig:
 @dataclass
 class FeaturePermutationConfig:
     subcommand: Annotated[
-        Annotated[GatherConfig, tyro.conf.subcommand("gather", prefix_name=False)] | Annotated[FindPermConfig, tyro.conf.subcommand("find_perm", prefix_name=False)] | Annotated[EvalPermConfig, tyro.conf.subcommand("eval_perm", prefix_name=False)],
+        Annotated[GatherConfig, tyro.conf.subcommand("gather", prefix_name=False)]
+        | Annotated[
+            FindPermConfig, tyro.conf.subcommand("find_perm", prefix_name=False)
+        ]
+        | Annotated[
+            EvalPermConfig, tyro.conf.subcommand("eval_perm", prefix_name=False)
+        ],
         tyro.conf.arg(name=""),
     ]
     use_cupy: Annotated[bool, tyro.conf.arg(name="cupy")] = True
@@ -157,6 +164,8 @@ def resolve_device(use_cupy: bool, device: int | Literal["cpu", "mps"]) -> str:
 
 
 T = TypeVar("T", npt.NDArray, torch.Tensor)
+
+
 def batched(arr: T, batch_size: int) -> Generator[T, None, None]:
     """
     Utility generator that yields chunks of array `arr` of size `batch_size`
@@ -188,9 +197,7 @@ def apply_rotate_right(perm: npt.NDArray, indices: tuple[int, ...]) -> None:
         perm[i] = j
 
 
-def get_swapped_zero_positive_count(
-    actmat_flat: torch.Tensor
-) -> torch.Tensor:
+def get_swapped_zero_positive_count(actmat_flat: torch.Tensor) -> torch.Tensor:
     shape = actmat_flat.shape
     # Group into blocks that are processed at once during inference
     # actmat is a boolean matrix of shape (N, L1 // 2) with "True" meaning 0
@@ -213,9 +220,8 @@ def get_swapped_zero_positive_count(
     # rest_zero_indicator = [... [... [0, 0, 1, 0], [0, 0, 0, 0], [1, 1, 1, 1] ...] ...]
     #
     rest_zero_indicator = (
-        (num_zeros - actmat_chunked.int() == ZERO_BLOCK_SIZE - 1)
-        .reshape(shape)
-    )
+        num_zeros - actmat_chunked.int() == ZERO_BLOCK_SIZE - 1
+    ).reshape(shape)
 
     # Sum all possible pairs of elements in a single sample of actmat_flat and rest_zero_indicator.
     # Aggregate sum over the whole batch.
@@ -223,16 +229,14 @@ def get_swapped_zero_positive_count(
     # how much "bad" it would do though, that will be accounted for later, for performance reasons.
     # Note: float32 has full precision up to a batch size of around 16M, more than enough for current cases.
     # int32 would offer full precision up to batch sizes of 2B instead.
-    swapped_zero_count = (
-        actmat_flat.to(torch.float32).T @ rest_zero_indicator.to(torch.float32)
+    swapped_zero_count = actmat_flat.to(torch.float32).T @ rest_zero_indicator.to(
+        torch.float32
     )
 
     return swapped_zero_count
 
 
-def get_swapped_zero_increase(
-    actmat: torch.Tensor
-) -> torch.Tensor:
+def get_swapped_zero_increase(actmat: torch.Tensor) -> torch.Tensor:
     n_neurons = actmat.shape[1]
     swapped_zero_count = 0
 
@@ -253,9 +257,7 @@ def get_swapped_zero_increase(
     return swapped_zero_increase
 
 
-def get_score_change(
-    actmat: torch.Tensor
-) -> torch.Tensor:
+def get_score_change(actmat: torch.Tensor) -> torch.Tensor:
     # actmat is a boolean matrix of shape (N, L1) with "True" meaning 0
 
     n_neurons = actmat.shape[1]
@@ -263,7 +265,10 @@ def get_score_change(
     score_change = get_swapped_zero_increase(actmat)
 
     # Kill off swaps between neurons in the same block
-    blocks = torch.arange(n_neurons, device=actmat.device).reshape((n_neurons, 1)) // ZERO_BLOCK_SIZE
+    blocks = (
+        torch.arange(n_neurons, device=actmat.device).reshape((n_neurons, 1))
+        // ZERO_BLOCK_SIZE
+    )
     same_block_killer = 1 - (blocks == blocks.T).to(torch.int)
     score_change = score_change * same_block_killer
     return score_change
@@ -423,7 +428,11 @@ def make_swaps_3(actmat: torch.Tensor) -> SwapResult:
 
 
 def find_perm_impl(
-    actmat: npt.NDArray[np.bool_] | torch.Tensor, device_str: str, L1: int
+    actmat: npt.NDArray[np.bool_] | torch.Tensor,
+    device_str: str,
+    L1: int,
+    *,
+    cross_dimensions: int = 0,
 ) -> npt.NDArray[np.int_]:
     if isinstance(actmat, np.ndarray):
         actmat = np.reshape(actmat, (actmat.shape[0] * 2, actmat.shape[1] // 2))
@@ -432,10 +441,23 @@ def find_perm_impl(
         actmat = actmat.reshape((actmat.shape[0] * 2, actmat.shape[1] // 2))
         actmat = actmat.to(device_str)
 
+    if cross_dimensions:
+        local_dimensions = L1 // 2 - cross_dimensions
+        return np.concatenate(
+            (
+                _find_perm_partition(actmat[:, :local_dimensions]),
+                _find_perm_partition(actmat[:, local_dimensions:]) + local_dimensions,
+            )
+        )
+    return _find_perm_partition(actmat)
+
+
+def _find_perm_partition(actmat: torch.Tensor) -> npt.NDArray[np.int_]:
+
     actmat_orig = actmat.clone()
 
     total_score_change = 0
-    perm = np.arange(L1 // 2)
+    perm = np.arange(actmat.shape[1])
 
     stages: list[SwapFunction] = [make_swaps_2, make_swaps_3]
     # The optimization routines are deterministic, so no need to retry.
@@ -498,18 +520,24 @@ def make_sparse_batch_provider(
     batch_size: int,
     feature_set_name: str,
     loader_num_workers: int = 4,
-    loader_config: data_loader.DataloaderSkipConfig | None = None
+    loader_config: data_loader.DataloaderSkipConfig | None = None,
 ) -> data_loader.SparseBatchProvider:
     if loader_config is None:
         loader_config = data_loader.DataloaderSkipConfig(
-                random_fen_skipping=10,
-                filtered=True, # filtering checks
+            random_fen_skipping=10,
+            filtered=True,  # filtering checks
         )
     # overwrite defaults
     elif loader_config.random_fen_skipping == 0 or not loader_config.filtered:
-        print("[ft_perm.py] WARNING: Overwriting dataloader config to ensure some level of fen skipping and filtering, which are important for performance and correctness of ft perm finding.")
+        print(
+            "[ft_perm.py] WARNING: Overwriting dataloader config to ensure some level of fen skipping and filtering, which are important for performance and correctness of ft perm finding."
+        )
         print(f"[ft_perm.py]   Before overwrites: {loader_config}")
-        random_fen_skipping = loader_config.random_fen_skipping if loader_config.random_fen_skipping != 0 else 10
+        random_fen_skipping = (
+            loader_config.random_fen_skipping
+            if loader_config.random_fen_skipping != 0
+            else 10
+        )
         loader_config = replace(
             loader_config,
             random_fen_skipping=random_fen_skipping,
@@ -526,11 +554,11 @@ def make_sparse_batch_provider(
     )
 
 
-def eval_ft(model: NNUEModel, batch: Iterable[torch.Tensor], device_str: str) -> torch.Tensor:
+def eval_ft(
+    model: NNUEModel, batch: Iterable[torch.Tensor], device_str: str
+) -> torch.Tensor:
     with torch.no_grad():
-        batch_tuple = tuple(
-            batch_part.to(device=device_str) for batch_part in batch
-        )
+        batch_tuple = tuple(batch_part.to(device=device_str) for batch_part in batch)
         (
             us,
             them,
@@ -540,7 +568,7 @@ def eval_ft(model: NNUEModel, batch: Iterable[torch.Tensor], device_str: str) ->
             _score,
             piece_count,
         ) = batch_tuple
-        psqt_indices, _  = model.calculate_buckets(piece_count)
+        psqt_indices, _ = model.calculate_buckets(piece_count)
         l0_, wpsqt, bpsqt = model.forward_ft(
             us,
             them,
@@ -553,16 +581,38 @@ def eval_ft(model: NNUEModel, batch: Iterable[torch.Tensor], device_str: str) ->
         _, _ = wpsqt, bpsqt
         return l0_
 
+
 @torch.no_grad()
 def ft_permute_impl(model: NNUEModel, perm: npt.NDArray[np.int_]) -> None:
-    permutation = list(perm)
+    try:
+        perm = np.asarray(perm)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid FT permutation") from error
 
     l1_size = model.layer_stacks.l1.linear.in_features
-    if l1_size != len(permutation) * 2:
-        raise ValueError(
-            f"Invalid permutation size. Expected {l1_size}. Got {len(permutation) * 2}."
-        )
+    half_size = l1_size // 2
+    if (
+        perm.ndim != 1
+        or perm.size != half_size
+        or not np.issubdtype(perm.dtype, np.integer)
+        or not np.array_equal(np.sort(perm), np.arange(half_size))
+    ):
+        raise ValueError("Invalid FT permutation")
 
+    cross_dimensions = model.input.cross_dimensions
+    if cross_dimensions:
+        local_dimensions = half_size - cross_dimensions
+        if np.any(perm[:local_dimensions] >= local_dimensions) or np.any(
+            perm[local_dimensions:] < local_dimensions
+        ):
+            raise ValueError(
+                "FT permutation must preserve local/cross interaction groups"
+            )
+
+    # Coalescing must follow validation: invalid external permutations cannot mutate the model.
+    model.input.coalesce()
+    model.layer_stacks.coalesce_layer_stacks_inplace()
+    permutation = list(perm)
     # Both sides of the FT must use the same permutation.
     permutation.extend([x + l1_size // 2 for x in permutation])
 
@@ -573,9 +623,9 @@ def ft_permute_impl(model: NNUEModel, perm: npt.NDArray[np.int_]) -> None:
     for f in model.input.features:
         f.weight.copy_(f.weight[:, ft_permutation])
     model.input.bias.copy_(model.input.bias[ft_permutation])
-    model.layer_stacks.l1.linear.weight.copy_(model.layer_stacks.l1.linear.weight[
-        :, permutation
-    ])
+    model.layer_stacks.l1.linear.weight.copy_(
+        model.layer_stacks.l1.linear.weight[:, permutation]
+    )
 
 
 def ft_permute(model: NNUEModel, ft_perm_path: str) -> None:
@@ -586,13 +636,13 @@ def ft_permute(model: NNUEModel, ft_perm_path: str) -> None:
 
 
 def gather_impl(
-        model: NNUEModel,
-        dataset: str,
-        count: int,
-        device_str: str,
-        loader_workers: int = 4,
-        loader_config: data_loader.DataloaderSkipConfig | None = None
-    ) -> npt.NDArray[np.bool_]:
+    model: NNUEModel,
+    dataset: str,
+    count: int,
+    device_str: str,
+    loader_workers: int = 4,
+    loader_config: data_loader.DataloaderSkipConfig | None = None,
+) -> npt.NDArray[np.bool_]:
     ZERO_POINT = 0.0  # Vary this to check hypothetical forced larger truncation to zero
     BATCH_SIZE = 1024
 
@@ -603,7 +653,7 @@ def gather_impl(
         BATCH_SIZE,
         copied_model.input_feature_name,
         loader_num_workers=loader_workers,
-        loader_config=loader_config
+        loader_config=loader_config,
     )
 
     actmats = []
@@ -655,7 +705,7 @@ def command_gather(args: FeaturePermutationConfig) -> None:
         args.subcommand.count,
         device_str,
         args.subcommand.loader_num_workers,
-        args.subcommand.loader_config
+        args.subcommand.loader_config,
     )
 
     with open(args.subcommand.out, "wb") as file:  # was: args.out
@@ -702,7 +752,12 @@ def command_find_perm(args: FeaturePermutationConfig) -> None:
         actmat = np.load(file)
 
     device_str = resolve_device(args.use_cupy, args.device)
-    perm = find_perm_impl(actmat, device_str, args.model_config.L1)
+    perm = find_perm_impl(
+        actmat,
+        device_str,
+        args.model_config.L1,
+        cross_dimensions=args.model_config.ft_cross_dimensions,
+    )
 
     # perm = np.random.permutation([i for i in range(L1)])
     with open(args.subcommand.out, "wb") as file:
@@ -723,13 +778,20 @@ def ft_optimize(
     device_str = resolve_device(use_cupy, device)
 
     print("Gathering activation data...")
-    actmat = gather_impl(model, dataset_path, count, device_str, loader_num_workers, loader_config)
+    actmat = gather_impl(
+        model, dataset_path, count, device_str, loader_num_workers, loader_config
+    )
     if actmat_save_path is not None:
         with open(actmat_save_path, "wb") as file:
             np.save(file, actmat)
 
     print("Finding permutation...")
-    perm = find_perm_impl(actmat, device_str, model.L1)
+    perm = find_perm_impl(
+        actmat,
+        device_str,
+        model.L1,
+        cross_dimensions=model.input.cross_dimensions,
+    )
     if perm_save_path is not None:
         with open(perm_save_path, "wb") as file:
             np.save(file, perm)
@@ -741,10 +803,11 @@ def ft_optimize(
     ft_permute_impl(model, perm)
 
 
-def set_cupy_device(device: int | None=None) -> None:
+def set_cupy_device(device: int | None = None) -> None:
     # kept for legacy reasons.
     global _DEVICE_OVERRIDE
     _DEVICE_OVERRIDE = device
+
 
 def main() -> None:
     cfg = tyro.cli(FeaturePermutationConfig)

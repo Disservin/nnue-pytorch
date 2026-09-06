@@ -55,7 +55,9 @@ class SerializeConfig:
     """Number of workers to use for data loading during FT optimization."""
 
     dataloader_config: OmitArgPrefixes[DataloaderSkipConfig] = field(
-        default_factory=DataloaderSkipConfig if DataloaderSkipConfig is not None else lambda: None
+        default_factory=DataloaderSkipConfig
+        if DataloaderSkipConfig is not None
+        else lambda: None
     )
 
 
@@ -97,6 +99,7 @@ def main():
         nnue.eval()
     elif args.source.endswith(".pt"):
         nnue = torch.load(args.source, weights_only=False)
+        nnue.model.validate_ft_layout(nnue_lightning_config.model_config)
     elif args.source.endswith(".nnue"):
         with open(args.source, "rb") as f:
             nnue = M.NNUE(
@@ -126,10 +129,6 @@ def main():
     if serialize_config.ft_perm is not None and target_is_nnue:
         import ftperm
 
-        if not args.source.endswith(".nnue"):
-            nnue.model.input.coalesce()
-            nnue.model.layer_stacks.coalesce_layer_stacks_inplace()
-
         ftperm.ft_permute(nnue.model, serialize_config.ft_perm)
 
     if serialize_config.ft_optimize and target_is_nnue:
@@ -146,10 +145,6 @@ def main():
             raise ValueError(
                 "Invalid number of positions to optimize FT with. (--ft_optimize_count)"
             )
-
-        if not args.source.endswith(".nnue"):
-            nnue.model.input.coalesce()
-            nnue.model.layer_stacks.coalesce_layer_stacks_inplace()
 
         ftperm.ft_optimize(
             nnue.model,

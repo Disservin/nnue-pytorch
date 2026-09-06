@@ -27,7 +27,13 @@ class NNUEModel(nn.Module):
         self.num_psqt_buckets = num_psqt_buckets
         self.num_ls_buckets = num_ls_buckets
 
-        self.input = ComposedFeatureTransformer(feature_cls, self.L1, self.num_psqt_buckets, self.quantization)
+        self.input = ComposedFeatureTransformer(
+            feature_cls,
+            self.L1,
+            self.num_psqt_buckets,
+            self.quantization,
+            cross_dimensions=config.ft_cross_dimensions,
+        )
         self.feature_name = self.input.FEATURE_NAME
         self.input_feature_name = self.input.INPUT_FEATURE_NAME
         self.feature_hash = self.input.HASH
@@ -37,6 +43,29 @@ class NNUEModel(nn.Module):
 
         self.input.init_weights()
 
+    def get_extra_state(self):
+        return {"ft_cross_dimensions": self.input.cross_dimensions}
+
+    def set_extra_state(self, state):
+        if (
+            not isinstance(state, dict)
+            or set(state) != {"ft_cross_dimensions"}
+            or type(state["ft_cross_dimensions"]) is not int
+            or state["ft_cross_dimensions"] != self.input.cross_dimensions
+        ):
+            raise ValueError(
+                "Checkpoint FT interaction layout does not match model configuration"
+            )
+
+    def validate_ft_layout(self, config: ModelConfig) -> None:
+        cross_dimensions = getattr(self.input, "cross_dimensions", None)
+        if (
+            type(cross_dimensions) is not int
+            or cross_dimensions != config.ft_cross_dimensions
+        ):
+            raise ValueError(
+                "Checkpoint FT interaction layout does not match model configuration"
+            )
 
     @torch.no_grad()
     def clip_weights(self, include_input):
@@ -70,12 +99,10 @@ class NNUEModel(nn.Module):
                             )
                     p_data_fp32.clamp_(min_weight, max_weight)
 
-
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
         self.input.zero_virtual_weights()
         self.layer_stacks.zero_virtual_weights()
-
 
     def forward_ft(
         self,
@@ -103,7 +130,6 @@ class NNUEModel(nn.Module):
 
         return psqt_indices, layer_stack_indices
 
-
     def forward(
         self,
         us: torch.Tensor,
@@ -111,8 +137,8 @@ class NNUEModel(nn.Module):
         white_indices: torch.Tensor,
         black_indices: torch.Tensor,
         piece_count: torch.Tensor,
-        fake_quantize_acts: bool=True,
-        fake_quantize_weights: bool=True,
+        fake_quantize_acts: bool = True,
+        fake_quantize_weights: bool = True,
     ):
         psqt_indices, layer_stack_indices = self.calculate_buckets(piece_count)
 
@@ -128,6 +154,8 @@ class NNUEModel(nn.Module):
         # The PSQT values are averaged over perspectives. "Their" perspective
         # has a negative influence (us-0.5 is 0.5 for white and -0.5 for black,
         # which does both the averaging and sign flip for black to move)
-        x = self.layer_stacks(l0_, layer_stack_indices, fake_quantize_acts, fake_quantize_weights) + (wpsqt - bpsqt) * (us - 0.5)
+        x = self.layer_stacks(
+            l0_, layer_stack_indices, fake_quantize_acts, fake_quantize_weights
+        ) + (wpsqt - bpsqt) * (us - 0.5)
 
         return x

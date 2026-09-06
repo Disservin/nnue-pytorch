@@ -15,7 +15,15 @@ def double_feature_transform(
     max_ft_activation: float,
     l1_size: int,
     backend: str = "auto",
+    *,
+    cross_dimensions: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if type(cross_dimensions) is not int or (
+        cross_dimensions != 0
+        and (l1_size <= 0 or l1_size % 32 != 0 or cross_dimensions != l1_size // 8)
+    ):
+        raise ValueError("Invalid cross-perspective FT dimensions")
+
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
     all_cuda = (
@@ -36,9 +44,13 @@ def double_feature_transform(
 
     if impl == "fused":
         if not cupy_available:
-            raise RuntimeError("Fused double FT backend requested, but CuPy kernels are not available.")
+            raise RuntimeError(
+                "Fused double FT backend requested, but CuPy kernels are not available."
+            )
         if not all_cuda:
-            raise RuntimeError("Fused double FT backend requested, but not all tensors/parameters are on CUDA.")
+            raise RuntimeError(
+                "Fused double FT backend requested, but not all tensors/parameters are on CUDA."
+            )
         return FusedDoubleFtFunction.apply(
             us,
             them,
@@ -49,13 +61,18 @@ def double_feature_transform(
             bias,
             max_ft_activation,
             l1_size,
+            cross_dimensions,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":
             if not cupy_available:
-                raise RuntimeError("Sparse backend requested, but CuPy kernels are not available.")
+                raise RuntimeError(
+                    "Sparse backend requested, but CuPy kernels are not available."
+                )
             if not all_cuda:
-                raise RuntimeError("Sparse backend requested, but not all tensors/parameters are on CUDA.")
+                raise RuntimeError(
+                    "Sparse backend requested, but not all tensors/parameters are on CUDA."
+                )
 
         assert l1_size % 2 == 0
 
@@ -74,8 +91,21 @@ def double_feature_transform(
         l0_ = torch.clamp(l0_, 0.0, max_ft_activation)
 
         l0_s = torch.split(l0_, l1_size // 2, dim=1)
-        l0_s1 = [l0_s[0] * l0_s[1], l0_s[2] * l0_s[3]]
-        l0_ = torch.cat(l0_s1, dim=1)
+        if cross_dimensions == 0:
+            l0_s1 = [l0_s[0] * l0_s[1], l0_s[2] * l0_s[3]]
+            l0_ = torch.cat(l0_s1, dim=1)
+        else:
+            local_dimensions = l1_size // 2 - cross_dimensions
+            u0, u1, v0, v1 = l0_s
+            l0_ = torch.cat(
+                [
+                    u0[:, :local_dimensions] * u1[:, :local_dimensions],
+                    u0[:, local_dimensions:] * v1[:, local_dimensions:],
+                    v0[:, :local_dimensions] * v1[:, :local_dimensions],
+                    v0[:, local_dimensions:] * u1[:, local_dimensions:],
+                ],
+                dim=1,
+            )
 
         return l0_, wpsqt, bpsqt
     else:

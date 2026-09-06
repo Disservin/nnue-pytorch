@@ -12,6 +12,19 @@ from .quantize import QuantizationConfig
 # 3 layer fully connected network
 @dataclass(kw_only=True)
 class ModelConfig(LayerStacksConfig):
+    ft_cross_perspective: bool = False
+    """Use cross-perspective FT products as a training/inference architecture choice."""
+
+    def __post_init__(self):
+        if self.ft_cross_perspective and (self.L1 <= 0 or self.L1 % 32 != 0):
+            raise ValueError(
+                "Cross-perspective FT requires positive L1 divisible by 32"
+            )
+
+    @property
+    def ft_cross_dimensions(self) -> int:
+        return self.L1 // 8 if self.ft_cross_perspective else 0
+
     @staticmethod
     def add_model_args(parser):
         parser.add_argument(
@@ -26,13 +39,25 @@ class ModelConfig(LayerStacksConfig):
             type=int,
             default=ModelConfig.L2,
         )
+        parser.add_argument(
+            "--factorize-heads",
+            action="store_true",
+            default=ModelConfig.factorize_heads,
+        )
+        parser.add_argument(
+            "--ft-cross-perspective",
+            action="store_true",
+            default=ModelConfig.ft_cross_perspective,
+        )
 
     @staticmethod
     def get_model_config(args) -> "ModelConfig":
-        config = ModelConfig()
-        config.L1 = args.L1
-        config.L2 = args.L2
-        return config
+        return ModelConfig(
+            L1=args.L1,
+            L2=args.L2,
+            factorize_heads=args.factorize_heads,
+            ft_cross_perspective=args.ft_cross_perspective,
+        )
 
     # Not omitting prefix on purpose.
     quantize_config: QuantizationConfig = field(default_factory=QuantizationConfig)
@@ -71,15 +96,24 @@ class LambdaConfig:
         if self.end_lambda is None:
             self.end_lambda = self.lambda_
 
-        if self.jitter_decay_lambda_batch < 0.0 or self.jitter_decay_lambda_batch >= 1.0:
-            raise ValueError("jitter_decay_lambda_batch must be in the range [0.0, 1.0).")
+        if (
+            self.jitter_decay_lambda_batch < 0.0
+            or self.jitter_decay_lambda_batch >= 1.0
+        ):
+            raise ValueError(
+                "jitter_decay_lambda_batch must be in the range [0.0, 1.0)."
+            )
         if self.jitter_lambda_batch < 0.0 or self.jitter_lambda_sample < 0.0:
-            raise ValueError("jitter_lambda_batch and jitter_lambda_sample must be non-negative.")
+            raise ValueError(
+                "jitter_lambda_batch and jitter_lambda_sample must be non-negative."
+            )
         if self.lambda_schedule_steps >= 0:
             if self.lambda_schedule_steps == 0:
                 raise ValueError("lambda_schedule_steps must be positive.")
             if self.lambda_cycle_warmup_pct < 0.0 or self.lambda_cycle_warmup_pct > 1.0:
-                raise ValueError("lambda_cycle_warmup_pct must be in the range [0.0, 1.0].")
+                raise ValueError(
+                    "lambda_cycle_warmup_pct must be in the range [0.0, 1.0]."
+                )
 
 
 # parameters needed for the definition of the loss
@@ -109,6 +143,7 @@ class LossParams:
     """Tablebase score remapping scale value (default=20000.0)"""
     tb_remap_decay: float = 0.85
     """Tablebase score remapping decay parameter (default=0.8)"""
+
 
 @dataclass(kw_only=True)
 class NNUELightningConfig(FeatureConfig):
