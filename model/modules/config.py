@@ -13,3 +13,5 @@ class LayerStacksConfig:
     """Size of second hidden layer."""
     L3: Annotated[int, tyro.conf.arg(name="l3")] = 32
     """Size of third hidden layer."""
+    factorize_heads: bool = False
+    """Share trainable dense-head weights across material buckets; folded away on export."""

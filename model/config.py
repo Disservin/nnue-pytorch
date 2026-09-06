@@ -26,12 +26,18 @@ class ModelConfig(LayerStacksConfig):
             type=int,
             default=ModelConfig.L2,
         )
+        parser.add_argument(
+            "--factorize-heads",
+            action="store_true",
+            default=ModelConfig.factorize_heads,
+        )
 
     @staticmethod
     def get_model_config(args) -> "ModelConfig":
         config = ModelConfig()
         config.L1 = args.L1
         config.L2 = args.L2
+        config.factorize_heads = args.factorize_heads
         return config
 
     # Not omitting prefix on purpose.

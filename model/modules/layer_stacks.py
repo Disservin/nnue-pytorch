@@ -18,14 +18,13 @@ class LayerStacks(nn.Module):
         self.L3 = config.L3
         self.quantization = quantization
 
-        # Factorizer only for the first layer because later
-        # there's a non-linearity and factorization breaks.
-        # This is by design. The weights in the further layers should be
-        # able to diverge a lot.
+        # Share parameters within each affine layer, not across nonlinearities.
+        # Export folds shared weights into each bucket, leaving inference unchanged.
         self.l1 = FactorizedStackedLinear(2 * self.L1 // 2, self.L2, count, quantization, "ls_l1")
-        self.l2 = StackedLinear(self.L2 * 2, self.L3, count, quantization, "ls_l2")
+        head_type = FactorizedStackedLinear if config.factorize_heads else StackedLinear
+        self.l2 = head_type(self.L2 * 2, self.L3, count, quantization, "ls_l2")
 
-        self.output = StackedLinear(self.L2 * 2 + self.L3 * 2, 1, count, quantization, "ls_output")
+        self.output = head_type(self.L2 * 2 + self.L3 * 2, 1, count, quantization, "ls_output")
 
         with torch.no_grad():
             self.output.linear.bias.zero_()
@@ -85,7 +84,9 @@ class LayerStacks(nn.Module):
 
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
-        self.l1.zero_virtual_weights()
+        for layer in (self.l1, self.l2, self.output):
+            if isinstance(layer, FactorizedStackedLinear):
+                layer.zero_virtual_weights()
 
     @torch.no_grad()
     def get_coalesced_layer_stacks(
@@ -99,4 +100,6 @@ class LayerStacks(nn.Module):
 
     @torch.no_grad()
     def coalesce_layer_stacks_inplace(self) -> None:
-        self.l1.coalesce_weights()
+        for layer in (self.l1, self.l2, self.output):
+            if isinstance(layer, FactorizedStackedLinear):
+                layer.coalesce_weights()
