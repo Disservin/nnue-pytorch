@@ -473,27 +473,24 @@ std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name) {
 // Class Implementations
 // ---------------------------------------------------------
 
-template <typename T>
-struct BumpAllocator {
-    T* ptr;
-    BumpAllocator(T* block) : ptr(block) {}
-    T* alloc(size_t count) {
-        T* res = ptr;
-        ptr += count;
-        return res;
-    }
-};
+SparseBatchBuffers::SparseBatchBuffers(std::size_t batch_size, std::size_t max_active_features) :
+    batch_size(batch_size),
+    max_active_features(max_active_features),
+    floats(new float[batch_size * 3]),
+    ints(new int[batch_size * (2 * max_active_features + 1)]) {}
 
-SparseBatchBufferPool::SparseBatchBufferPool(std::size_t floats,
-                                            std::size_t ints,
-                                            std::size_t capacity) :
-    m_floats(floats), m_ints(ints), m_capacity(capacity) {
+SparseBatchBufferPool::SparseBatchBufferPool(std::size_t batch_size,
+                                             std::size_t max_active_features,
+                                             std::size_t capacity) :
+    m_batch_size(batch_size),
+    m_max_active_features(max_active_features),
+    m_capacity(capacity) {
     m_free.reserve(capacity);
 }
 
-SparseBatchBufferPool::Buffers SparseBatchBufferPool::acquire(std::size_t floats,
-                                                             std::size_t ints) {
-    if (floats == m_floats && ints == m_ints)
+SparseBatchBuffers SparseBatchBufferPool::acquire(std::size_t batch_size,
+                                                  std::size_t max_active_features) {
+    if (batch_size == m_batch_size && max_active_features == m_max_active_features)
     {
         std::lock_guard lock(m_mutex);
         if (!m_free.empty())
@@ -503,12 +500,11 @@ SparseBatchBufferPool::Buffers SparseBatchBufferPool::acquire(std::size_t floats
             return buffers;
         }
     }
-    return {std::unique_ptr<float[]>(new float[floats]),
-            std::unique_ptr<int[]>(new int[ints])};
+    return SparseBatchBuffers(batch_size, max_active_features);
 }
 
-void SparseBatchBufferPool::release(Buffers buffers, std::size_t floats, std::size_t ints) {
-    if (floats == m_floats && ints == m_ints)
+void SparseBatchBufferPool::release(SparseBatchBuffers buffers) {
+    if (buffers.batch_size == m_batch_size && buffers.max_active_features == m_max_active_features)
     {
         std::lock_guard lock(m_mutex);
         if (m_free.size() < m_capacity)
@@ -518,50 +514,31 @@ void SparseBatchBufferPool::release(Buffers buffers, std::size_t floats, std::si
     // never retains storage with a different layout or beyond its capacity.
 }
 
-SparseBatch::SparseBatch(const IFeatureExtractor&              feature_set,
-                         const std::vector<TrainingDataEntry>& entries,
-                         std::shared_ptr<SparseBatchBufferPool> buffer_pool)
-    :
+SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
+                         const std::vector<TrainingDataEntry>&  entries,
+                         std::shared_ptr<SparseBatchBufferPool> buffer_pool) :
+    num_inputs(feature_set.inputs()),
+    size(entries.size()),
+    num_active_white_features(0),
+    num_active_black_features(0),
+    max_active_features(feature_set.max_active_features()),
 #ifdef NNUE_LOADER_STATISTICS
     entries_copy(entries),
 #endif
-    m_buffer_pool(std::move(buffer_pool))
-{
-    num_inputs          = feature_set.inputs();
-    size                = entries.size();
-    max_active_features = feature_set.max_active_features();
-    const size_t total_floats = size * 3;
-    const size_t total_ints   = size + size * max_active_features * 2;
+    m_buffers(buffer_pool ? buffer_pool->acquire(size, max_active_features)
+                          : SparseBatchBuffers(size, max_active_features)),
+    m_buffer_pool(std::move(buffer_pool)) {
+    is_white = m_buffers.floats.get();
+    outcome  = is_white + size;
+    score    = outcome + size;
 
-    if (m_buffer_pool)
-    {
-        auto buffers = m_buffer_pool->acquire(total_floats, total_ints);
-        m_float_block = buffers.first.release();
-        m_int_block = buffers.second.release();
-    }
-    else
-    {
-        m_float_block = new float[total_floats];
-        m_int_block   = new int[total_ints];
-    }
+    const auto feature_slots = std::size_t(size) * max_active_features;
+    white       = m_buffers.ints.get();
+    black       = white + feature_slots;
+    piece_count = black + feature_slots;
 
-    BumpAllocator<float> float_alloc(m_float_block);
-    is_white     = float_alloc.alloc(size);
-    outcome      = float_alloc.alloc(size);
-    score        = float_alloc.alloc(size);
-
-    BumpAllocator<int> int_alloc(m_int_block);
-    white               = int_alloc.alloc(size * max_active_features);
-    black               = int_alloc.alloc(size * max_active_features);
-    piece_count         = int_alloc.alloc(size);
-
-    num_active_white_features = 0;
-    num_active_black_features = 0;
-
-    for (int i = 0; i < size * max_active_features; ++i)
-        white[i] = -1;
-    for (int i = 0; i < size * max_active_features; ++i)
-        black[i] = -1;
+    // Reset both colors' padding, including feature slots left by a previous batch.
+    std::fill(white, piece_count, -1);
 
     for (int i = 0; i < size; ++i)
         fill_entry(feature_set, i, entries[i]);
@@ -569,14 +546,7 @@ SparseBatch::SparseBatch(const IFeatureExtractor&              feature_set,
 
 SparseBatch::~SparseBatch() {
     if (m_buffer_pool)
-        m_buffer_pool->release(
-            {std::unique_ptr<float[]>(m_float_block), std::unique_ptr<int[]>(m_int_block)},
-            std::size_t(size) * 3, std::size_t(size) * (2 * max_active_features + 1));
-    else
-    {
-        delete[] m_float_block;
-        delete[] m_int_block;
-    }
+        m_buffer_pool->release(std::move(m_buffers));
 }
 
 void SparseBatch::fill_entry(const IFeatureExtractor& fs, int i, const TrainingDataEntry& e) {
@@ -630,17 +600,13 @@ FeaturedBatchStream::FeaturedBatchStream(
     m_feature_set(std::move(feature_set)),
     m_batch_size(batch_size),
     m_concurrency(concurrency),
+    m_stop_flag(false),
     m_num_workers(calculate_num_worker_threads(concurrency)),
-    m_batch_queue_capacity(calculate_num_worker_threads(concurrency) + 4) {
-
-    // At most one fetched batch, the finished deque, and one batch per builder
-    // normally exist at a time. Recycle that working set without growing a
-    // process-global cache or keeping buffers alive after the stream closes.
-    m_buffer_pool = std::make_shared<SparseBatchBufferPool>(
-        std::size_t(batch_size) * 3,
-        std::size_t(batch_size) * (2 * m_feature_set->max_active_features() + 1),
-        std::size_t(m_batch_queue_capacity) + m_num_workers.load() + 1);
-    m_stop_flag.store(false);
+    m_batch_queue_capacity(calculate_num_worker_threads(concurrency) + 4),
+    m_buffer_pool(std::make_shared<SparseBatchBufferPool>(batch_size,
+                                                          m_feature_set->max_active_features(),
+                                                          std::size_t(m_batch_queue_capacity)
+                                                            + m_num_workers.load() + 1)) {
 
     auto worker = [this]() {
         std::vector<TrainingDataEntry> entries;
@@ -655,14 +621,16 @@ FeaturedBatchStream::FeaturedBatchStream(
                     break;
             }
 
-            auto batch = new SparseBatch(*m_feature_set, entries, m_buffer_pool);
+            auto batch = std::make_unique<SparseBatch>(*m_feature_set, entries, m_buffer_pool);
 
             {
                 std::unique_lock lock(m_batch_mutex);
                 m_batches_not_full.wait(lock, [this]() {
                     return m_batches.size() < static_cast<size_t>(m_batch_queue_capacity) || m_stop_flag.load();
                 });
-                m_batches.emplace_back(batch);
+                if (m_stop_flag.load())
+                    break;
+                m_batches.emplace_back(std::move(batch));
                 lock.unlock();
                 m_batches_any.notify_one();
             }
@@ -686,8 +654,6 @@ FeaturedBatchStream::~FeaturedBatchStream() {
         if (worker.joinable())
             worker.join();
     }
-    for (auto& batch : m_batches)
-        delete batch;
     // Counter is owned by AnyStream and deleted after m_stream (and its
     // workers) are destroyed, preventing use-after-free.
 }
@@ -697,11 +663,11 @@ SparseBatch* FeaturedBatchStream::next() {
     m_batches_any.wait(lock, [this]() { return !m_batches.empty() || m_num_workers.load() == 0; });
     if (!m_batches.empty())
     {
-        auto batch = m_batches.front();
+        auto batch = std::move(m_batches.front());
         m_batches.pop_front();
         lock.unlock();
         m_batches_not_full.notify_one();
-        return batch;
+        return batch.release();
     }
     return nullptr;
 }

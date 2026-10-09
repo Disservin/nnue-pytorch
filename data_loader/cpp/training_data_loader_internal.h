@@ -30,23 +30,34 @@ struct IFeatureExtractor {
 std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name);
 std::function<bool(const struct binpack::TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig config);
 
+// Own both contiguous allocations and the dimensions they were allocated for.
+// The public SparseBatch pointers are views into this storage.
+struct SparseBatchBuffers final {
+    SparseBatchBuffers(std::size_t batch_size, std::size_t max_active_features);
+
+    std::size_t              batch_size;
+    std::size_t              max_active_features;
+    std::unique_ptr<float[]> floats;
+    std::unique_ptr<int[]>   ints;
+};
+
 // Keep large feature buffers resident between batches. Returning ~300 MiB to
 // the system allocator on every batch can stall the Python prefetch thread.
 // Each stream owns a bounded cache; outstanding batches share its lifetime.
 class SparseBatchBufferPool final {
 public:
-    using Buffers = std::pair<std::unique_ptr<float[]>, std::unique_ptr<int[]>>;
-
-    SparseBatchBufferPool(std::size_t floats, std::size_t ints, std::size_t capacity);
-    Buffers acquire(std::size_t floats, std::size_t ints);
-    void release(Buffers buffers, std::size_t floats, std::size_t ints);
+    SparseBatchBufferPool(std::size_t batch_size,
+                          std::size_t max_active_features,
+                          std::size_t capacity);
+    SparseBatchBuffers acquire(std::size_t batch_size, std::size_t max_active_features);
+    void release(SparseBatchBuffers buffers);
 
 private:
-    const std::size_t m_floats;
-    const std::size_t m_ints;
+    const std::size_t m_batch_size;
+    const std::size_t m_max_active_features;
     const std::size_t m_capacity;
     std::mutex m_mutex;
-    std::vector<Buffers> m_free;
+    std::vector<SparseBatchBuffers> m_free;
 };
 
 struct SparseBatch final {
@@ -76,8 +87,7 @@ struct SparseBatch final {
 #endif
 
 private:
-    float* m_float_block = nullptr;
-    int*   m_int_block = nullptr;
+    SparseBatchBuffers m_buffers;
     std::shared_ptr<SparseBatchBufferPool> m_buffer_pool;
     void fill_entry(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
     void fill_features(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
@@ -151,7 +161,7 @@ private:
     std::shared_ptr<IFeatureExtractor> m_feature_set;
     int m_batch_size;
     int m_concurrency;
-    std::deque<SparseBatch*> m_batches;
+    std::deque<std::unique_ptr<SparseBatch>> m_batches;
     std::mutex m_batch_mutex;
     std::condition_variable m_batches_not_full;
     std::condition_variable m_batches_any;
@@ -162,6 +172,8 @@ private:
     // bytes (~300 MiB at production settings), so a large worker count must
     // not translate into a large queue.
     int m_batch_queue_capacity;
+    // Queued batches, one batch per builder, and one consumer batch form the
+    // normal working set. Outstanding batches keep this bounded pool alive.
     std::shared_ptr<SparseBatchBufferPool> m_buffer_pool;
     std::vector<std::thread> m_workers;
 
