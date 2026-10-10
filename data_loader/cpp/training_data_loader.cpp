@@ -476,8 +476,8 @@ std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name) {
 SparseBatchBuffers::SparseBatchBuffers(std::size_t batch_size, std::size_t max_active_features) :
     batch_size(batch_size),
     max_active_features(max_active_features),
-    floats(new float[batch_size * 3]),
-    ints(new int[batch_size * (2 * max_active_features + 1)]) {}
+    floats(std::make_unique_for_overwrite<float[]>(3 * batch_size)),
+    ints(std::make_unique_for_overwrite<int[]>(batch_size * (2 * max_active_features + 1))) {}
 
 SparseBatchBufferPool::SparseBatchBufferPool(std::size_t batch_size,
                                              std::size_t max_active_features,
@@ -504,14 +504,15 @@ SparseBatchBuffers SparseBatchBufferPool::acquire(std::size_t batch_size,
 }
 
 void SparseBatchBufferPool::release(SparseBatchBuffers buffers) {
-    if (buffers.batch_size == m_batch_size && buffers.max_active_features == m_max_active_features)
+    if (buffers.batch_size == m_batch_size
+        && buffers.max_active_features == m_max_active_features)
     {
         std::lock_guard lock(m_mutex);
         if (m_free.size() < m_capacity)
             m_free.push_back(std::move(buffers));
     }
     // Partial final batches and excess buffers are freed normally. The cache
-    // never retains storage with a different layout or beyond its capacity.
+    // never retains storage with different dimensions or beyond its capacity.
 }
 
 SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
@@ -528,6 +529,7 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
     m_buffers(buffer_pool ? buffer_pool->acquire(size, max_active_features)
                           : SparseBatchBuffers(size, max_active_features)),
     m_buffer_pool(std::move(buffer_pool)) {
+    // Packed order is shared with SparseBatch.get_tensors() in Python.
     is_white = m_buffers.floats.get();
     outcome  = is_white + size;
     score    = outcome + size;
@@ -538,7 +540,8 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
     piece_count = black + feature_slots;
 
     // Reset both colors' padding, including feature slots left by a previous batch.
-    std::fill(white, piece_count, -1);
+    std::fill_n(white, feature_slots, -1);
+    std::fill_n(black, feature_slots, -1);
 
     for (int i = 0; i < size; ++i)
         fill_entry(feature_set, i, entries[i]);

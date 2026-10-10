@@ -55,29 +55,22 @@ class SparseBatch(ctypes.Structure):
         size = self.size
         max_active = self.max_active_features
 
-        # We only transfer:
-        # - float block: is_white, outcome, score (3 * size floats)
-        # - int block: white, black, piece_count (2 * size * max_active + size ints)
-        total_floats = size * 3
-        total_ints = size * max_active * 2 + size
-
-        float_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
+        # Packed order matches SparseBatch's C++ constructor:
+        # floats: is_white, outcome, score; ints: white, black, piece_count.
+        feature_slots = size * max_active
+        floats_cpu = torch.from_numpy(
+            np.ctypeslib.as_array(self.is_white, shape=(3 * size,))
         )
-        int_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.white, shape=(total_ints,))
+        ints_cpu = torch.from_numpy(
+            np.ctypeslib.as_array(self.white, shape=(2 * feature_slots + size,))
         )
+        floats = _pin_and_move(floats_cpu, device, use_pinned_memory)
+        ints = _pin_and_move(ints_cpu, device, use_pinned_memory)
 
-        float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
-        int_block_gpu = _pin_and_move(int_block_cpu, device, use_pinned_memory)
-
-        us = float_block_gpu[0 : size].view(size, 1)
-        outcome = float_block_gpu[size : 2 * size].view(size, 1)
-        score = float_block_gpu[2 * size : 3 * size].view(size, 1)
-
-        white_indices = int_block_gpu[0 : size * max_active].view(size, max_active)
-        black_indices = int_block_gpu[size * max_active : 2 * size * max_active].view(size, max_active)
-        piece_count_i32 = int_block_gpu[2 * size * max_active : 2 * size * max_active + size].view(size)
+        us, outcome, score = floats.view(3, size, 1).unbind(0)
+        white, black, piece_count_i32 = ints.split((feature_slots, feature_slots, size))
+        white_indices = white.view(size, max_active)
+        black_indices = black.view(size, max_active)
 
         # Keep piece counts as int64 so callers can derive buckets on the target device.
         if not us.is_cuda and use_pinned_memory:

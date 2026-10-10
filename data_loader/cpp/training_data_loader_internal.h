@@ -30,15 +30,14 @@ struct IFeatureExtractor {
 std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name);
 std::function<bool(const struct binpack::TrainingDataEntry&)> make_skip_predicate(DataloaderSkipConfig config);
 
-// Own both contiguous allocations and the dimensions they were allocated for.
-// The public SparseBatch pointers are views into this storage.
+// Own the two packed allocations; SparseBatch's public pointers view this storage.
 struct SparseBatchBuffers final {
     SparseBatchBuffers(std::size_t batch_size, std::size_t max_active_features);
 
-    std::size_t              batch_size;
-    std::size_t              max_active_features;
+    std::size_t batch_size;
+    std::size_t max_active_features;
     std::unique_ptr<float[]> floats;
-    std::unique_ptr<int[]>   ints;
+    std::unique_ptr<int[]> ints;
 };
 
 // Keep large feature buffers resident between batches. Returning ~300 MiB to
