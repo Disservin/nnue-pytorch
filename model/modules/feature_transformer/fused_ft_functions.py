@@ -145,6 +145,18 @@ def _fused_double_ft_backward(
     # Feature extractors guarantee unique IDs within each perspective.
     # Keep direct scatter for unsupported shapes/devices and small batches.
     if _use_aggregated_backward(l1_size, batch_size, max_active_features, us.device):
+        # A larger tile removes more repeated feature atomics on the RTX 4090
+        # production net; retain the existing geometry for other workloads.
+        tile_size = (
+            14
+            if (
+                l1_size == 1024
+                and max_active_features == 288
+                and batch_size >= 32768
+                and torch.cuda.get_device_capability(us.device) == (8, 9)
+            )
+            else 8
+        )
         aggregated_ft_backward(
             us,
             them,
@@ -155,6 +167,7 @@ def _fused_double_ft_backward(
             grad_weight,
             grad_bias,
             max_ft_activation,
+            tile_size=tile_size,
         )
         return grad_weight, grad_bias
 

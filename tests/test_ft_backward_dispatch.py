@@ -84,9 +84,9 @@ def test_dispatched_aggregation_gradient_parity(monkeypatch, width):
     calls = []
     aggregate = fused.aggregated_ft_backward
 
-    def record(*args):
+    def record(*args, **kwargs):
         calls.append(True)
-        return aggregate(*args)
+        return aggregate(*args, **kwargs)
 
     monkeypatch.setattr(fused, "aggregated_ft_backward", record)
     output = double_feature_transform(us, them, white, black, weight, bias, 1.0, width, "fused")
