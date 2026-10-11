@@ -38,7 +38,7 @@ def _get_num_threads_for_backward(output_size: int) -> int:
 
 
 def _kernel_with_threads(kernel, threads):
-    @torch.compiler.disable
+    # Registered operators own the compiler boundary; launches run eagerly.
     def f(grid, args):
         stream = cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
         kernel(grid=grid, block=threads, args=args, stream=stream)
@@ -49,7 +49,6 @@ def _kernel_with_threads(kernel, threads):
 _sparse_input_linear_forward_kernel_cache = {}
 
 
-@torch.compiler.disable(recursive=False)
 def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size: int):
     """
     @param: max_active_indices
@@ -171,7 +170,6 @@ void sparse_input_linear_forward(
 _sparse_input_linear_backward_kernel_cache = {}
 
 
-@torch.compiler.disable(recursive=False)
 def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_size: int):
     """
     @param: max_active_indices

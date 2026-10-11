@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from torch import autograd
 
 _HAS_CUPY_KERNELS = False
 try:
@@ -53,90 +52,114 @@ def _torch_sparse_linear(feature_indices, weight, bias):
     return output + bias
 
 
-class _CudaSparseLinearFunction(autograd.Function):
-    @staticmethod
-    def forward(ctx, feature_indices, weight, bias):
-        ctx.save_for_backward(feature_indices, weight, bias)
+@torch.library.custom_op("nnue::sparse_linear", mutates_args=(), device_types="cuda")
+def _cuda_sparse_linear(
+    feature_indices: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Opaque CUDA operation; fake and autograd registrations enable compilation."""
+    assert len(feature_indices.shape) == 2
+    assert feature_indices.dtype == torch.int32
 
-        assert len(feature_indices.shape) == 2
-        assert feature_indices.dtype == torch.int32
+    assert len(weight.shape) == 2
+    assert weight.dtype == torch.float32
 
-        assert len(weight.shape) == 2
-        assert weight.dtype == torch.float32
+    assert len(bias.shape) == 1
+    assert bias.dtype == torch.float32
 
-        assert len(bias.shape) == 1
-        assert bias.dtype == torch.float32
+    assert feature_indices.is_cuda
+    assert weight.is_cuda
+    assert bias.is_cuda
 
-        assert feature_indices.is_cuda
-        assert weight.is_cuda
-        assert bias.is_cuda
+    assert weight.device == feature_indices.device
+    assert bias.device == feature_indices.device
 
-        assert weight.device == feature_indices.device
-        assert bias.device == feature_indices.device
+    assert feature_indices.is_contiguous()
+    assert weight.is_contiguous()
+    assert bias.is_contiguous()
 
-        assert feature_indices.is_contiguous()
-        assert weight.is_contiguous()
-        assert bias.is_contiguous()
+    device = feature_indices.device
+    batch_size = feature_indices.shape[0]
+    max_active_features = feature_indices.shape[1]
+    output_size = weight.shape[1]
 
-        device = feature_indices.device
-        batch_size = feature_indices.shape[0]
-        max_active_features = feature_indices.shape[1]
-        output_size = weight.shape[1]
+    output = torch.empty(
+        batch_size,
+        output_size,
+        dtype=torch.float32,
+        device=device,
+    )
 
-        output = torch.empty(
-            batch_size,
-            output_size,
-            dtype=torch.float32,
-            device=device,
-        )
+    kernel = make_sparse_input_linear_forward_kernel(max_active_features, output_size)
+    kernel(
+        grid=(batch_size,),
+        args=(
+            feature_indices.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            output.data_ptr(),
+        ),
+    )
 
-        kernel = make_sparse_input_linear_forward_kernel(
-            max_active_features, output_size
-        )
-        kernel(
-            grid=(batch_size,),
-            args=(
-                feature_indices.data_ptr(),
-                weight.data_ptr(),
-                bias.data_ptr(),
-                output.data_ptr(),
-            ),
-        )
+    return output
 
-        return output
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        assert not ctx.needs_input_grad[0]
+@_cuda_sparse_linear.register_fake
+def _sparse_linear_fake(feature_indices, weight, bias):
+    return weight.new_empty((feature_indices.shape[0], weight.shape[1]))
 
-        grad_output = grad_output.contiguous()
 
-        feature_indices, weight, _bias = ctx.saved_tensors
+@torch.library.custom_op(
+    "nnue::sparse_linear_backward", mutates_args=(), device_types="cuda"
+)
+def _cuda_sparse_linear_backward(
+    feature_indices: torch.Tensor, weight: torch.Tensor, grad_output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_output = grad_output.contiguous()
 
-        device = feature_indices.device
-        batch_size = feature_indices.shape[0]
-        max_active_features = feature_indices.shape[1]
-        output_size = weight.shape[1]
+    device = feature_indices.device
+    batch_size = feature_indices.shape[0]
+    max_active_features = feature_indices.shape[1]
+    output_size = weight.shape[1]
 
-        weight_grad = torch.zeros(
-            weight.shape[0], weight.shape[1], dtype=torch.float32, device=device
-        )
-        bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
+    weight_grad = torch.zeros(
+        weight.shape[0], weight.shape[1], dtype=torch.float32, device=device
+    )
+    bias_grad = torch.zeros(output_size, dtype=torch.float32, device=device)
 
-        kernel = make_sparse_input_linear_backward_kernel(
-            max_active_features, output_size
-        )
-        kernel(
-            grid=(batch_size,),
-            args=(
-                feature_indices.data_ptr(),
-                weight_grad.data_ptr(),
-                bias_grad.data_ptr(),
-                grad_output.data_ptr(),
-            ),
-        )
+    kernel = make_sparse_input_linear_backward_kernel(max_active_features, output_size)
+    kernel(
+        grid=(batch_size,),
+        args=(
+            feature_indices.data_ptr(),
+            weight_grad.data_ptr(),
+            bias_grad.data_ptr(),
+            grad_output.data_ptr(),
+        ),
+    )
+    return weight_grad, bias_grad
 
-        return None, weight_grad, bias_grad
+
+@_cuda_sparse_linear_backward.register_fake
+def _sparse_linear_backward_fake(feature_indices, weight, grad_output):
+    return torch.empty_like(weight), weight.new_empty((weight.shape[1],))
+
+
+def _sparse_linear_setup_context(ctx, inputs, output):
+    feature_indices, weight, _bias = inputs
+    ctx.save_for_backward(feature_indices, weight)
+
+
+def _sparse_linear_backward(ctx, grad_output):
+    feature_indices, weight = ctx.saved_tensors
+    weight_grad, bias_grad = _cuda_sparse_linear_backward(
+        feature_indices, weight, grad_output
+    )
+    return None, weight_grad, bias_grad
+
+
+_cuda_sparse_linear.register_autograd(
+    _sparse_linear_backward, setup_context=_sparse_linear_setup_context
+)
 
 
 # Allowed modes: "auto", "fused", "sparse", "torch"
@@ -157,7 +180,7 @@ class SparseLinearFunction:
                 and weight.is_cuda
                 and bias.is_cuda
             ):
-                return _CudaSparseLinearFunction.apply(feature_indices, weight, bias)
+                return _cuda_sparse_linear(feature_indices, weight, bias)
             return _torch_sparse_linear(feature_indices, weight, bias)
 
         elif backend == "sparse":
@@ -167,7 +190,7 @@ class SparseLinearFunction:
                 raise RuntimeError(
                     "Sparse CUDA kernel requested but tensors are not on CUDA."
                 )
-            return _CudaSparseLinearFunction.apply(feature_indices, weight, bias)
+            return _cuda_sparse_linear(feature_indices, weight, bias)
 
         elif backend == "torch":
             return _torch_sparse_linear(feature_indices, weight, bias)

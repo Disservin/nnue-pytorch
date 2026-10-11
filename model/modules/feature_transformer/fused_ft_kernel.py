@@ -19,7 +19,6 @@ def _num_threads(l1_half: int, target: int) -> int:
 _fused_double_ft_forward_kernel_cache = {}
 
 
-@torch.compiler.disable(recursive=False)
 def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
     l1_half = l1_size // 2
     target = (
@@ -165,7 +164,6 @@ BACKWARD_TILE_SIZE = 4
 _fused_double_ft_backward_kernel_cache = {}
 
 
-@torch.compiler.disable(recursive=False)
 def make_fused_double_ft_backward_kernel(
     max_active_indices: int, l1_size: int, tile_size: int = BACKWARD_TILE_SIZE
 ):
@@ -303,7 +301,6 @@ void fused_double_ft_backward(
         )
         kernel.compile()
 
-        @torch.compiler.disable
         def launch(grid, args):
             stream = cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
             kernel(
