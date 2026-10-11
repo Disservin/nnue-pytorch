@@ -22,7 +22,8 @@ from model.modules.feature_transformer.double_ft_functions import (
         ((8, 9), 4095, "auto", False),
         ((9, 0), 1024, "auto", True),
         ((9, 0), 1023, "auto", False),
-        ((8, 0), 131072, "auto", False),
+        ((8, 0), 4096, "auto", True),
+        ((8, 0), 4095, "auto", False),
         ((8, 0), 131072, "aggregated", True),
         ((8, 9), 131072, "scatter", False),
         ((9, 0), 131072, "scatter", False),
@@ -33,6 +34,24 @@ def test_backward_dispatch(monkeypatch, capability, batch, mode, expected):
     monkeypatch.setattr(torch.version, "hip", None)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
     assert fused._use_aggregated_backward(1024, batch, 288, torch.device("cuda:0"), mode=mode) == expected
+
+
+@pytest.mark.parametrize(
+    "capability,batch,expected",
+    [
+        ((8, 0), 131072, 12),
+        ((8, 0), 8192, 12),
+        ((8, 0), 8191, 8),
+        ((8, 9), 131072, 14),
+        ((8, 9), 32768, 14),
+        ((8, 9), 32767, 8),
+        ((9, 0), 131072, 8),
+    ],
+)
+def test_aggregated_tile_size(capability, batch, expected):
+    assert fused._aggregated_tile_size(1024, batch, 288, capability) == expected
+    # The row mask is 32 bits, so tiles above 16 positions are out of range.
+    assert fused._aggregated_tile_size(1024, batch, 288, capability) <= 16
 
 
 @pytest.mark.parametrize("width,active", [(96, 33), (1154, 33), (8192, 33), (1024, 0), (1024, 289)])
