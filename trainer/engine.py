@@ -15,6 +15,8 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from .checkpoint_writer import _save_with_aliases
+
 
 def init_distributed(
     backend: str | None = None,
@@ -224,7 +226,7 @@ class SimpleTrainer:
     # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, *, aliases: tuple[str, ...] = ()):
         """Save a checkpoint.
 
         The checkpoint contains the epoch, global step, model state (which
@@ -232,6 +234,7 @@ class SimpleTrainer:
         scheduler states.  The file is written only on rank 0, but the save
         hooks are run on every rank so that in-flight state (e.g. weight
         clipping, optimizer eval mode) stays consistent across processes.
+        Aliases publish the same snapshot under additional filenames.
         """
         unwrapped = _unwrap_module(self.model)
         checkpoint = {
@@ -256,9 +259,9 @@ class SimpleTrainer:
                 # Snapshot into the writer's persistent host buffers and
                 # serialize on the background thread (training keeps
                 # mutating GPU state).
-                self.checkpoint_writer.submit(checkpoint, path)
+                self.checkpoint_writer.submit(checkpoint, path, aliases=aliases)
             else:
-                torch.save(checkpoint, path)
+                _save_with_aliases(checkpoint, path, aliases)
 
     def flush_checkpoints(self) -> None:
         """Block until every asynchronous checkpoint write is on disk."""

@@ -348,17 +348,19 @@ class CheckpointManager(Callback):
         )
 
         saved = []
+        last_path = os.path.join(dirpath, "last.ckpt")
         if should_save_periodic:
             periodic_path = os.path.join(
                 dirpath,
                 f"epoch={trainer.current_epoch}-step={trainer.global_step}.ckpt",
             )
-            trainer.save_checkpoint(periodic_path)
+            aliases = (last_path,) if self.save_last else ()
+            trainer.save_checkpoint(periodic_path, aliases=aliases)
             saved.append(periodic_path)
 
         if self.save_last:
-            last_path = os.path.join(dirpath, "last.ckpt")
-            trainer.save_checkpoint(last_path)
+            if not should_save_periodic:
+                trainer.save_checkpoint(last_path)
             saved.append(last_path)
             self._last_save_epoch = trainer.current_epoch
 
