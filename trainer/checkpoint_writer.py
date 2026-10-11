@@ -12,6 +12,10 @@ rank-0 RSS ratchets from 6.5 to 18.7 GiB over 50 epochs).  If both
 buffer sets are busy (a write still in flight and one queued), the
 checkpoint is saved synchronously instead of stalling.
 
+A periodic checkpoint can also be published as last.ckpt via an atomic hard
+link, avoiding a second host snapshot and a second serialization of the same
+state. Filesystems without hard links use an atomic file copy.
+
 A not-yet-started write to a path is replaced when a newer checkpoint
 for the same path is submitted, so ``last.ckpt`` always holds the
 newest fully-written epoch; distinct paths (periodic checkpoints) are
@@ -25,6 +29,7 @@ checkpoints; the error is re-raised by ``flush()``.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from typing import Any
 
@@ -61,9 +66,10 @@ class AsyncCheckpointWriter:
         self._cv = threading.Condition()
         # Jobs (snapshot dict, path, buffer-set index), FIFO; a submit
         # for a path replaces a queued job for the same path.
-        self._jobs: list[tuple[Any, str, int]] = []
+        self._jobs: list[tuple[Any, str, int, tuple[str, ...]]] = []
         self._writing = False
         self._writing_path: str | None = None
+        self._writing_targets: set[str] = set()
         self._error: BaseException | None = None
         self._failed = False
         # Buffer sets: list of {key: host tensor}; free set = indices
@@ -78,12 +84,12 @@ class AsyncCheckpointWriter:
 
     # -- producer side (trainer thread) ------------------------------
 
-    def submit(self, ckpt: Any, path: str) -> None:
-        """Snapshot ``ckpt`` to host buffers and queue the write."""
+    def submit(self, ckpt: Any, path: str, *, aliases: tuple[str, ...] = ()) -> None:
+        """Snapshot once and publish the same checkpoint at all target paths."""
         if self._failed:
             # Background writing failed earlier: keep checkpoints
             # flowing with a synchronous save.
-            _atomic_save(cpu_snapshot(ckpt), path)
+            _save_with_aliases(cpu_snapshot(ckpt), path, aliases)
             return
         with self._cv:
             if self._error is not None:
@@ -107,17 +113,23 @@ class AsyncCheckpointWriter:
             # clobber the newer synchronous write: wait for it to drain
             # and drop any queued job for the same path.
             with self._cv:
-                self._cv.wait_for(
-                    lambda: self._writing_path != path
-                    and all(p != path for _, p, _ in self._jobs),
+                targets = {path, *aliases}
+                drained = self._cv.wait_for(
+                    lambda: not targets.intersection(self._writing_targets)
+                    and all(
+                        not targets.intersection((p, *links))
+                        for _, p, _, links in self._jobs
+                    ),
                     timeout=600.0,
                 )
+                if not drained:
+                    raise RuntimeError("checkpoint writer targets did not drain (600s)")
                 for j_idx in range(len(self._jobs) - 1, -1, -1):
-                    _c, p, i = self._jobs[j_idx]
+                    _c, p, i, _links = self._jobs[j_idx]
                     if p == path:
                         self._free.add(i)
                         self._jobs.pop(j_idx)
-            _atomic_save(cpu_snapshot(ckpt), path)
+            _save_with_aliases(cpu_snapshot(ckpt), path, aliases)
             return
         try:
             snapshot = self._snapshot(ckpt, idx)
@@ -129,12 +141,12 @@ class AsyncCheckpointWriter:
             # buffers are complete before the writer thread reads them.
             torch.cuda.current_stream().synchronize()
         with self._cv:
-            for j_idx, (c, p, i) in enumerate(self._jobs):
+            for j_idx, (c, p, i, _links) in enumerate(self._jobs):
                 if p == path:
                     self._free.add(i)
                     self._jobs.pop(j_idx)
                     break
-            self._jobs.append((snapshot, path, idx))
+            self._jobs.append((snapshot, path, idx, aliases))
             self._cv.notify_all()
 
     def _snapshot(self, obj: Any, idx: int, prefix: str = "") -> Any:
@@ -196,11 +208,12 @@ class AsyncCheckpointWriter:
             with self._cv:
                 while not self._jobs:
                     self._cv.wait()
-                ckpt, path, idx = self._jobs.pop(0)
+                ckpt, path, idx, aliases = self._jobs.pop(0)
                 self._writing = True
                 self._writing_path = path
+                self._writing_targets = {path, *aliases}
             try:
-                _atomic_save(ckpt, path)
+                _save_with_aliases(ckpt, path, aliases)
             except BaseException as e:  # noqa: BLE001
                 with self._cv:
                     self._error = e
@@ -208,6 +221,7 @@ class AsyncCheckpointWriter:
                     self._jobs = []
                     self._writing = False
                     self._writing_path = None
+                    self._writing_targets.clear()
                     self._free = set(range(len(self._pool)))
                     self._cv.notify_all()
                 print(
@@ -219,6 +233,7 @@ class AsyncCheckpointWriter:
                 with self._cv:
                     self._writing = False
                     self._writing_path = None
+                    self._writing_targets.clear()
                     self._free.add(idx)
                     self._cv.notify_all()
 
@@ -237,3 +252,44 @@ def _atomic_save(ckpt: Any, path: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _save_with_aliases(ckpt: Any, path: str, aliases: tuple[str, ...]) -> None:
+    """Serialize once; replacing an alias later leaves the history intact."""
+    aliases = tuple(dict.fromkeys(alias for alias in aliases if alias != path))
+    if not aliases:
+        _atomic_save(ckpt, path)
+        return
+    staged = f"{path}.tmp"
+    temporary_aliases = []
+    try:
+        _atomic_save(ckpt, staged)
+        for alias in aliases:
+            tmp = f"{alias}.tmp"
+            temporary_aliases.append((tmp, alias))
+            # A crash may leave a temporary hard link to an older history
+            # file. Remove it before a copy fallback can overwrite that inode.
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            # Periodic and last checkpoints share a directory. A hard link
+            # avoids another GiB of serialization, I/O and page-cache pressure.
+            # Replacing last.ckpt on the next save does not modify this inode.
+            try:
+                os.link(staged, tmp)
+            except OSError:
+                # Filesystems without hard links retain the same file format
+                # and atomic publication, without taking another GPU snapshot.
+                shutil.copyfile(staged, tmp)
+        # Prepare aliases before publishing the periodic file: retention on
+        # the training thread can delete it as soon as it becomes visible.
+        os.replace(staged, path)
+        for tmp, alias in temporary_aliases:
+            os.replace(tmp, alias)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+        for tmp, _alias in temporary_aliases:
+            if os.path.exists(tmp):
+                os.remove(tmp)
