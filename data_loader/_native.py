@@ -13,6 +13,16 @@ from .config import (
     CDataloaderSkipConfig,
 )
 
+try:
+    from ._cuda_transport import unpack_sparse_indices
+except (ImportError, OSError, RuntimeError):
+    unpack_sparse_indices = None
+
+# Packing pays off for large batches with substantial padding. Keep the measured
+# crossover conservative so small batches retain the simple dense copy.
+_COMPACT_MIN_BYTES = 32 * 1024 * 1024
+_COMPACT_MIN_RATIO = 2
+
 
 def _pin_and_move(
     t: torch.Tensor, device, use_pinned_memory=False, dtype=None, *, copy_mode="memcpy"
@@ -73,25 +83,69 @@ class SparseBatch(ctypes.Structure):
         ("queen_bucket", ctypes.POINTER(ctypes.c_int)),
     ]
 
+    def _move_indices(self, device, use_pinned_memory):
+        """Copy indices into owned storage before the native batch is released."""
+        size, max_active = self.size, self.max_active_features
+        total_ints = size * (2 * max_active + 2)
+        packed_size = (
+            3 * size
+            + 2
+            + self.num_active_white_features
+            + self.num_active_black_features
+        )
+        pack = c_lib.pack_sparse_batch
+        if (
+            use_pinned_memory
+            and torch.device(device).type == "cuda"
+            and torch.version.hip is None
+            and unpack_sparse_indices is not None
+            # Only pointers returned by the native ABI carry private row counts.
+            and isinstance(self._b_base_, NativeSparseBatchPointer)
+            and total_ints * ctypes.sizeof(ctypes.c_int) >= _COMPACT_MIN_BYTES
+            and packed_size * _COMPACT_MIN_RATIO < total_ints
+        ):
+            # The native row counts avoid rescanning all IDs. Copy active IDs
+            # directly into owned pinned storage before releasing the batch.
+            packed = torch.empty(
+                packed_size, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            if not pack(ctypes.byref(self), packed.data_ptr(), packed_size):
+                raise RuntimeError("Native sparse batch packing failed")
+            packed_gpu = packed.to(device=device, non_blocking=True)
+            int_block_gpu = unpack_sparse_indices(
+                packed_gpu,
+                size,
+                max_active,
+                self.num_active_white_features,
+                self.num_active_black_features,
+            )
+            queen_bucket_cpu = torch.from_numpy(
+                np.ctypeslib.as_array(self.queen_bucket, shape=(size,))
+            )
+            queen_bucket_gpu = _pin_and_move(
+                queen_bucket_cpu, device, use_pinned_memory
+            )
+            int_block_gpu = torch.cat((int_block_gpu, queen_bucket_gpu))
+        else:
+            int_block_cpu = torch.from_numpy(
+                np.ctypeslib.as_array(self.white, shape=(total_ints,))
+            )
+            int_block_gpu = _pin_and_move(int_block_cpu, device, use_pinned_memory)
+
+        return int_block_gpu
+
     def get_tensors(self, device, use_pinned_memory=False):
         size = self.size
         max_active = self.max_active_features
 
-        # We only transfer:
-        # - float block: is_white, outcome, score (3 * size floats)
-        # - int block: white, black, piece_count, queen_bucket (2 * size * max_active + 2 * size ints)
+        # Transfer float values and restore dense indices, piece counts, and queen buckets.
         total_floats = size * 3
-        total_ints = size * max_active * 2 + 2 * size
 
         float_block_cpu = torch.from_numpy(
             np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
         )
-        int_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.white, shape=(total_ints,))
-        )
-
         float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
-        int_block_gpu = _pin_and_move(int_block_cpu, device, use_pinned_memory)
+        int_block_gpu = self._move_indices(device, use_pinned_memory)
 
         us = float_block_gpu[0:size].view(size, 1)
         outcome = float_block_gpu[size : 2 * size].view(size, 1)
@@ -138,6 +192,15 @@ class SparseBatch(ctypes.Structure):
             piece_count,
             queen_bucket,
         )
+
+
+class NativeSparseBatchPointer(ctypes._Pointer):
+    """Pointer returned by the ABI, whose allocation includes private C++ fields.
+
+    ctypes.pointer(SparseBatch()) deliberately produces a different pointer type.
+    """
+
+    _type_ = SparseBatch
 
 
 class Fen(ctypes.Structure):
@@ -193,6 +256,13 @@ class CDataLoaderAPI:
         raise FileNotFoundError("Cannot find data_loader shared library.")
 
     def _define_prototypes(self):
+        self.pack_sparse_batch = self.dll.pack_sparse_batch
+        self.pack_sparse_batch.restype = ctypes.c_bool
+        self.pack_sparse_batch.argtypes = [
+            ctypes.POINTER(SparseBatch),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
         # EXPORT FenBatchStream* CDECL create_fen_batch_stream(
         #     int concurrency,
         #     int num_files,
@@ -254,7 +324,7 @@ class CDataLoaderAPI:
         self.dll.destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
 
         # EXPORT SparseBatch* CDECL fetch_next_sparse_batch(Stream<SparseBatch>* stream)
-        self.dll.fetch_next_sparse_batch.restype = ctypes.POINTER(SparseBatch)
+        self.dll.fetch_next_sparse_batch.restype = NativeSparseBatchPointer
         self.dll.fetch_next_sparse_batch.argtypes = [ctypes.c_void_p]
 
         # EXPORT SparseBatch* get_sparse_batch_from_fens(
@@ -265,7 +335,7 @@ class CDataLoaderAPI:
         #    int* plies,
         #    int* results
         # )
-        self.dll.get_sparse_batch_from_fens.restype = ctypes.POINTER(SparseBatch)
+        self.dll.get_sparse_batch_from_fens.restype = NativeSparseBatchPointer
         self.dll.get_sparse_batch_from_fens.argtypes = [
             ctypes.c_char_p,
             ctypes.c_int,
@@ -313,7 +383,7 @@ class CDataLoaderAPI:
         ]
 
 
-type SparseBatchPtr = ctypes._Pointer[SparseBatch]
+type SparseBatchPtr = NativeSparseBatchPointer
 type FenBatchPtr = ctypes._Pointer[FenBatch]
 
 try:
