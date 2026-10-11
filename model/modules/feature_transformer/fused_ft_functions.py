@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-from torch import autograd
 
 _HAS_CUPY_KERNELS = False
 try:
@@ -42,104 +41,147 @@ def _use_aggregated_backward(l1_size, batch_size, max_active_features, device, *
     )
 
 
-class FusedDoubleFtFunction(autograd.Function):
-    @staticmethod
-    def forward(ctx, us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size):
-        ctx.max_ft_activation = float(max_ft_activation)
-        ctx.l1_size = int(l1_size)
+@torch.library.custom_op("nnue::fused_double_ft", mutates_args=(), device_types="cuda")
+def _fused_double_ft(
+    us: torch.Tensor, them: torch.Tensor, white_indices: torch.Tensor,
+    black_indices: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+    max_ft_activation: float, l1_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return activations and the auxiliary clamp values needed by backward."""
+    assert l1_size % 2 == 0
 
-        assert l1_size % 2 == 0
+    assert us.is_cuda and them.is_cuda
+    assert white_indices.is_cuda and black_indices.is_cuda
+    assert weight.is_cuda and bias.is_cuda
+    assert us.device == them.device == white_indices.device == black_indices.device == weight.device == bias.device
 
-        assert us.is_cuda and them.is_cuda
-        assert white_indices.is_cuda and black_indices.is_cuda
-        assert weight.is_cuda and bias.is_cuda
-        assert us.device == them.device == white_indices.device == black_indices.device == weight.device == bias.device
+    assert us.dtype == torch.float32 and them.dtype == torch.float32
+    assert white_indices.dtype == torch.int32 and black_indices.dtype == torch.int32
+    assert weight.dtype == torch.float32 and bias.dtype == torch.float32
 
-        assert us.dtype == torch.float32 and them.dtype == torch.float32
-        assert white_indices.dtype == torch.int32 and black_indices.dtype == torch.int32
-        assert weight.dtype == torch.float32 and bias.dtype == torch.float32
+    assert white_indices.ndim == 2 and black_indices.ndim == 2
+    assert len(weight.shape) == 2
+    assert len(bias.shape) == 1
+    assert weight.shape[1] == bias.shape[0]
+    assert white_indices.shape == black_indices.shape
 
-        assert white_indices.ndim == 2 and black_indices.ndim == 2
-        assert len(weight.shape) == 2
-        assert len(bias.shape) == 1
-        assert weight.shape[1] == bias.shape[0]
-        assert white_indices.shape == black_indices.shape
+    assert us.is_contiguous() and them.is_contiguous()
+    assert white_indices.is_contiguous() and black_indices.is_contiguous()
+    assert weight.is_contiguous() and bias.is_contiguous()
 
-        assert us.is_contiguous() and them.is_contiguous()
-        assert white_indices.is_contiguous() and black_indices.is_contiguous()
-        assert weight.is_contiguous() and bias.is_contiguous()
+    batch_size = white_indices.shape[0]
+    max_active_features = white_indices.shape[1]
+    l1_half = l1_size // 2
 
-        batch_size = white_indices.shape[0]
-        max_active_features = white_indices.shape[1]
-        l1_half = l1_size // 2
+    l0_ = torch.empty(batch_size, l1_size, dtype=torch.float32, device=us.device)
+    clamped_out = torch.empty(batch_size, 4, l1_half, dtype=torch.float32, device=us.device)
 
-        l0_ = torch.empty(batch_size, l1_size, dtype=torch.float32, device=us.device)
-        clamped_out = torch.empty(batch_size, 4, l1_half, dtype=torch.float32, device=us.device)
-
-        output_size = bias.shape[0]
-        kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
-        kernel(
-            grid=(batch_size,),
-            args=(
-                us.data_ptr(),
-                them.data_ptr(),
-                white_indices.data_ptr(),
-                black_indices.data_ptr(),
-                weight.data_ptr(),
-                bias.data_ptr(),
-                np.float32(max_ft_activation),
-                l0_.data_ptr(),
-                clamped_out.data_ptr(),
-                np.int32(output_size),
-            )
+    output_size = bias.shape[0]
+    kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
+    kernel(
+        grid=(batch_size,),
+        args=(
+            us.data_ptr(),
+            them.data_ptr(),
+            white_indices.data_ptr(),
+            black_indices.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            np.float32(max_ft_activation),
+            l0_.data_ptr(),
+            clamped_out.data_ptr(),
+            np.int32(output_size),
         )
+    )
+    return l0_, clamped_out
 
-        ctx.save_for_backward(us, them, white_indices, black_indices, weight, bias, clamped_out)
-        return l0_
+
+@_fused_double_ft.register_fake
+def _fused_double_ft_fake(us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size):
+    batch = white_indices.shape[0]
+    return us.new_empty((batch, l1_size)), us.new_empty((batch, 4, l1_size // 2))
+
+
+@torch.library.custom_op("nnue::fused_double_ft_backward", mutates_args=(), device_types="cuda")
+def _fused_double_ft_backward(
+    us: torch.Tensor, them: torch.Tensor, white_indices: torch.Tensor,
+    black_indices: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+    clamped_out: torch.Tensor, grad_l0: torch.Tensor,
+    max_ft_activation: float, l1_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    grad_l0 = grad_l0.contiguous()
+
+    batch_size = white_indices.shape[0]
+    max_active_features = white_indices.shape[1]
+    output_size = bias.shape[0]
+
+    grad_weight = torch.zeros(weight.shape[0], output_size, dtype=torch.float32, device=us.device)
+    grad_bias = torch.zeros(output_size, dtype=torch.float32, device=us.device)
+
+    # Feature extractors guarantee unique IDs within each perspective.
+    # Keep direct scatter for unsupported shapes/devices and small batches.
+    if _use_aggregated_backward(l1_size, batch_size, max_active_features, us.device):
+        aggregated_ft_backward(
+            us, them, white_indices, black_indices, grad_l0, clamped_out,
+            grad_weight, grad_bias, max_ft_activation,
+        )
+        return grad_weight, grad_bias
+
+    kernel = make_fused_double_ft_backward_kernel(max_active_features, l1_size)
+    grid_size = (batch_size + BACKWARD_TILE_SIZE - 1) // BACKWARD_TILE_SIZE
+    kernel(
+        grid=(grid_size,),
+        args=(
+            us.data_ptr(),
+            them.data_ptr(),
+            white_indices.data_ptr(),
+            black_indices.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            np.float32(max_ft_activation),
+            grad_l0.data_ptr(),
+            clamped_out.data_ptr(),
+            grad_weight.data_ptr(),
+            grad_bias.data_ptr(),
+            np.int32(batch_size),
+            np.int32(output_size),
+        )
+    )
+    return grad_weight, grad_bias
+
+
+@_fused_double_ft_backward.register_fake
+def _fused_double_ft_backward_fake(us, them, white_indices, black_indices, weight, bias, clamped_out, grad_l0, max_ft_activation, l1_size):
+    return torch.empty_like(weight), torch.empty_like(bias)
+
+
+def _fused_double_ft_setup_context(ctx, inputs, output):
+    us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size = inputs
+    _result, clamped_out = output
+    ctx.save_for_backward(us, them, white_indices, black_indices, weight, bias, clamped_out)
+    ctx.max_ft_activation = max_ft_activation
+    ctx.l1_size = l1_size
+    ctx.mark_non_differentiable(clamped_out)
+
+
+def _fused_double_ft_autograd_backward(ctx, grad_l0, _grad_clamped):
+    us, them, white_indices, black_indices, weight, bias, clamped_out = ctx.saved_tensors
+    grad_weight, grad_bias = _fused_double_ft_backward(
+        us, them, white_indices, black_indices, weight, bias,
+        clamped_out, grad_l0, ctx.max_ft_activation, ctx.l1_size,
+    )
+    return None, None, None, None, grad_weight, grad_bias, None, None
+
+
+_fused_double_ft.register_autograd(_fused_double_ft_autograd_backward, setup_context=_fused_double_ft_setup_context)
+
+
+class FusedDoubleFtFunction:
+    """Compatibility facade for the registered CUDA operator."""
 
     @staticmethod
-    def backward(ctx, grad_l0):
-        us, them, white_indices, black_indices, weight, bias, clamped_out = ctx.saved_tensors
-        max_ft_activation = ctx.max_ft_activation
-        l1_size = ctx.l1_size
-
-        grad_l0 = grad_l0.contiguous()
-
-        batch_size = white_indices.shape[0]
-        max_active_features = white_indices.shape[1]
-        output_size = bias.shape[0]
-
-        grad_weight = torch.zeros(weight.shape[0], output_size, dtype=torch.float32, device=us.device)
-        grad_bias = torch.zeros(output_size, dtype=torch.float32, device=us.device)
-
-        # Feature extractors guarantee unique IDs within each perspective.
-        # Keep direct scatter for unsupported shapes/devices and small batches.
-        if _use_aggregated_backward(l1_size, batch_size, max_active_features, us.device):
-            aggregated_ft_backward(
-                us, them, white_indices, black_indices, grad_l0, clamped_out,
-                grad_weight, grad_bias, max_ft_activation,
-            )
-            return None, None, None, None, grad_weight, grad_bias, None, None
-
-        kernel = make_fused_double_ft_backward_kernel(max_active_features, l1_size)
-        grid_size = (batch_size + BACKWARD_TILE_SIZE - 1) // BACKWARD_TILE_SIZE
-        kernel(
-            grid=(grid_size,),
-            args=(
-                us.data_ptr(),
-                them.data_ptr(),
-                white_indices.data_ptr(),
-                black_indices.data_ptr(),
-                weight.data_ptr(),
-                bias.data_ptr(),
-                np.float32(max_ft_activation),
-                grad_l0.data_ptr(),
-                clamped_out.data_ptr(),
-                grad_weight.data_ptr(),
-                grad_bias.data_ptr(),
-                np.int32(batch_size),
-                np.int32(output_size),
-            )
-        )
-
-        return None, None, None, None, grad_weight, grad_bias, None, None
+    def apply(us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size):
+        return _fused_double_ft(
+            us, them, white_indices, black_indices, weight, bias,
+            max_ft_activation, l1_size,
+        )[0]

@@ -140,7 +140,6 @@ extern "C" __global__ void ft_aggregate_backward(const float *us, const float *t
     return pack, aggregate, maxids, h * 8, threads
 
 
-@torch.compiler.disable
 def aggregated_ft_backward(
     us, them, white, black, grad, clamped, grad_weight, grad_bias, maxact
 ):

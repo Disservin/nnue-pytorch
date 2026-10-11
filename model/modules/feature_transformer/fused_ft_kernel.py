@@ -17,7 +17,6 @@ def _num_threads(l1_half: int, target: int) -> int:
 
 _fused_double_ft_forward_kernel_cache = {}
 
-@torch.compiler.disable(recursive=False)
 def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
     l1_half = l1_size // 2
     target = 256 if l1_size % 128 == 0 and torch.version.hip is None and torch.cuda.get_device_capability() == (9, 0) else _FORWARD_THREADS
@@ -129,7 +128,6 @@ BACKWARD_TILE_SIZE = 4
 
 _fused_double_ft_backward_kernel_cache = {}
 
-@torch.compiler.disable(recursive=False)
 def make_fused_double_ft_backward_kernel(max_active_indices: int, l1_size: int, tile_size: int = BACKWARD_TILE_SIZE):
     l1_half = l1_size // 2
     # On H100, four 128-thread blocks per position tile outperform a single
