@@ -191,3 +191,76 @@ def test_ft_custom_operator_contract(backend, batch_size):
                 rtol=1e-3, atol=1e-5,
             )
     stream.synchronize()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+def test_fp16_weight_stream_matches_fp32_bitwise():
+    """Reading the fake-quantized FT weight as fp16 must not change any value.
+
+    k/256 weights inside the 127/256 clip range are exact in fp16, so the fp16
+    launch has to reproduce the fp32 launch bit for bit; the only difference is
+    that it reads half the bytes from the weight matrix.
+    """
+    from model.modules.feature_transformer import fused_ft_kernel as kernels
+    from model.modules.feature_transformer.fused_ft_functions import _fused_double_ft
+
+    l1, active, inputs, batch = 1024, 288, 4096, 37
+    if not kernels.forward_reads_fp16_weights(active, l1):
+        pytest.skip("fp16 weight stream needs the four-column launch geometry")
+
+    torch.manual_seed(11)
+    rows = torch.arange(batch, device="cuda", dtype=torch.int32).view(-1, 1)
+    columns = torch.arange(active, device="cuda", dtype=torch.int32)
+    white = (rows * 3 + columns * 7) % inputs
+    black = (rows * 5 + columns * 11) % inputs
+    white[rows[:, 0] % 5 == 0, 120:] = -1
+    black[rows[:, 0] % 7 == 0, 200:] = -1
+    us = torch.rand(batch, 1, device="cuda")
+    them = 1 - us
+
+    # Fake-quantized weights: integer steps of 1/256, clipped like the extractors do.
+    scale = 256.0
+    weight = torch.randint(-127, 128, (inputs, l1), device="cuda") / scale
+    bias = torch.randint(-127, 128, (l1,), device="cuda") / scale
+
+    kernels._fused_double_ft_forward_kernel_cache.clear()
+    kernels._fused_double_ft_forward_fp16_kernel_cache.clear()
+
+    # clamped activations are written straight from the weight sums, so they
+    # pin the fp16 weight stream itself, not just the post-product output.
+    l0_fp32, clamped_fp32 = _fused_double_ft(
+        us, them, white, black, weight, bias, 1.0, l1, False
+    )
+    assert kernels._fused_double_ft_forward_fp16_kernel_cache == {}
+    l0_fp16, clamped_fp16 = _fused_double_ft(
+        us, them, white, black, weight, bias, 1.0, l1, True
+    )
+    assert kernels._fused_double_ft_forward_fp16_kernel_cache
+
+    assert torch.equal(clamped_fp16, clamped_fp32)
+    assert torch.equal(l0_fp16, l0_fp32)
+
+    # The fp16 copy is internal to the op; autograd still sees the fp32 weight.
+    narrow_weight = weight.clone().requires_grad_()
+    out = double_feature_transform(
+        us, them, white, black, narrow_weight, bias, 1.0, l1, "fused", fp16_weights=True
+    )
+    assert torch.equal(out, l0_fp32)
+    grad = torch.autograd.grad(out.sum(), narrow_weight)[0]
+    assert grad.shape == weight.shape and torch.isfinite(grad).all()
+
+
+def test_fp16_weight_gate_requires_power_of_two_scale():
+    from model.quantize import QuantizationConfig, QuantizationManager
+
+    assert QuantizationManager(QuantizationConfig()).ft_weights_are_fp16_exact
+    # A non power-of-two grid cannot land on the fp16 grid in general.
+    assert not QuantizationManager(
+        QuantizationConfig(ft_quantized_one=100.0)
+    ).ft_weights_are_fp16_exact
+    assert not QuantizationManager(
+        QuantizationConfig(ft_quantized_one=1.5)
+    ).ft_weights_are_fp16_exact

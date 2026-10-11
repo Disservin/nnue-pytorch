@@ -163,6 +163,23 @@ class QuantizationManager:
         weight_scale = self.weight_scales_dict[key]
         return _fake_quantize_weights(tensor, weight_scale)
 
+    @property
+    def ft_weights_are_fp16_exact(self) -> bool:
+        """Whether fake-quantized FT weights survive an fp16 round trip.
+
+        Quantized FT weights are k / ft_quantized_one with |k| <= 127 (the
+        extractors clamp them to +/- max_threat_weight = +/- 127 /
+        ft_quantized_one), and fp16 resolves every integer up to 2**11.  A
+        power-of-two scale therefore puts them exactly on the fp16 grid, which
+        is what lets the forward stream the weight as fp16 bit-identically and
+        read half the bytes.
+        """
+        scale = self.ft_quantized_one
+        if not float(scale).is_integer():
+            return False
+        scale = int(scale)
+        return scale > 0 and (scale & (scale - 1)) == 0 and self.max_threat_weight * scale < 2**11
+
     def generate_weight_clipping_config(
         self, model: "NNUEModel"
     ) -> list[WeightClippingConfig]:

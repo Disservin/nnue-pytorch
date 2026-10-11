@@ -6,13 +6,17 @@ try:
     from .aggregated_ft_kernel import aggregated_ft_backward
     from .fused_ft_kernel import (
         BACKWARD_TILE_SIZE,
+        forward_reads_fp16_weights,
         make_fused_double_ft_backward_kernel,
+        make_fused_double_ft_forward_fp16_kernel,
         make_fused_double_ft_forward_kernel,
     )
 
     _HAS_CUPY_KERNELS = True
 except (ImportError, OSError, RuntimeError):
     BACKWARD_TILE_SIZE = 1
+    forward_reads_fp16_weights = None
+    make_fused_double_ft_forward_fp16_kernel = None
 
 
 def _use_aggregated_backward(
@@ -66,8 +70,15 @@ def _fused_double_ft(
     bias: torch.Tensor,
     max_ft_activation: float,
     l1_size: int,
+    fp16_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return activations and the auxiliary clamp values needed by backward."""
+    """Return activations and the auxiliary clamp values needed by backward.
+
+    ``fp16_weights`` selects the half-precision weight stream.  It is only
+    valid for fake-quantized weights (k / 2**n grid), which the caller checks;
+    the fp16 copy is an implementation detail of the opaque op, so gradients
+    keep flowing to the fp32 weight unchanged.
+    """
     assert l1_size % 2 == 0
 
     assert us.is_cuda and them.is_cuda
@@ -106,7 +117,15 @@ def _fused_double_ft(
     )
 
     output_size = bias.shape[0]
-    kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
+    if (
+        fp16_weights
+        and forward_reads_fp16_weights is not None
+        and forward_reads_fp16_weights(max_active_features, l1_size)
+    ):
+        weight = weight.to(torch.float16)
+        kernel = make_fused_double_ft_forward_fp16_kernel(max_active_features, l1_size)
+    else:
+        kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
     kernel(
         grid=(batch_size,),
         args=(
@@ -127,7 +146,15 @@ def _fused_double_ft(
 
 @_fused_double_ft.register_fake
 def _fused_double_ft_fake(
-    us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size
+    us,
+    them,
+    white_indices,
+    black_indices,
+    weight,
+    bias,
+    max_ft_activation,
+    l1_size,
+    fp16_weights=False,
 ):
     batch = white_indices.shape[0]
     return us.new_empty((batch, l1_size)), us.new_empty((batch, 4, l1_size // 2))
@@ -222,9 +249,17 @@ def _fused_double_ft_backward_fake(
 
 
 def _fused_double_ft_setup_context(ctx, inputs, output):
-    us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size = (
-        inputs
-    )
+    (
+        us,
+        them,
+        white_indices,
+        black_indices,
+        weight,
+        bias,
+        max_ft_activation,
+        l1_size,
+        _fp16_weights,
+    ) = inputs
     _result, clamped_out = output
     ctx.save_for_backward(
         us, them, white_indices, black_indices, weight, bias, clamped_out
@@ -250,7 +285,7 @@ def _fused_double_ft_autograd_backward(ctx, grad_l0, _grad_clamped):
         ctx.max_ft_activation,
         ctx.l1_size,
     )
-    return None, None, None, None, grad_weight, grad_bias, None, None
+    return None, None, None, None, grad_weight, grad_bias, None, None, None
 
 
 _fused_double_ft.register_autograd(
@@ -263,7 +298,15 @@ class FusedDoubleFtFunction:
 
     @staticmethod
     def apply(
-        us, them, white_indices, black_indices, weight, bias, max_ft_activation, l1_size
+        us,
+        them,
+        white_indices,
+        black_indices,
+        weight,
+        bias,
+        max_ft_activation,
+        l1_size,
+        fp16_weights=False,
     ):
         return _fused_double_ft(
             us,
@@ -274,4 +317,5 @@ class FusedDoubleFtFunction:
             bias,
             max_ft_activation,
             l1_size,
+            fp16_weights,
         )[0]

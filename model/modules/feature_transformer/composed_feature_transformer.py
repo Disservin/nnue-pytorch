@@ -128,6 +128,9 @@ class ComposedFeatureTransformer(nn.Module):
             ft_max_act,
             self.l1_size,
             backend,
+            fp16_weights=(
+                fake_quantize_weights and self.quantization.ft_weights_are_fp16_exact
+            ),
         )
 
         if fake_quantize_acts:
