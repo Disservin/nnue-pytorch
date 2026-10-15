@@ -1,6 +1,7 @@
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -99,3 +100,109 @@ def test_fused_double_ft(l1, batch_size, max_active):
 
     torch.testing.assert_close(grad_weight_fused, weight.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(grad_bias_fused, bias.grad, atol=1e-4, rtol=1e-3)
+
+
+def _launch_forward(kernel, us, them, white, black, weight, bias, max_act, l1_size):
+    batch = us.shape[0]
+    l0 = torch.empty(batch, l1_size, dtype=torch.float32, device="cuda")
+    clamped = torch.empty(
+        batch, 4, l1_size // 2, dtype=torch.float32, device="cuda"
+    )
+    kernel(
+        grid=(batch,),
+        args=(
+            us.data_ptr(),
+            them.data_ptr(),
+            white.data_ptr(),
+            black.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            np.float32(max_act),
+            l0.data_ptr(),
+            clamped.data_ptr(),
+            np.int32(bias.shape[0]),
+        ),
+    )
+    return l0, clamped
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+@pytest.mark.parametrize("l1", [512, 1024, 2048, 4096])
+@pytest.mark.parametrize("max_active", [96, 288])
+def test_four_column_forward_matches_scalar_launch(l1, max_active):
+    """The four-column launch reproduces the scalar kernel bit for bit.
+
+    Both cover the same columns in the same accumulation order, so any
+    difference is a column-routing or clamp bug rather than rounding.
+    """
+    from model.modules.feature_transformer.fused_ft_kernel import (
+        make_fused_double_ft_forward_strided_kernel,
+        make_fused_double_ft_forward_vec4_kernel,
+    )
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    num_inputs = 100
+    batch_size = 37
+    us = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+    them = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+
+    white = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    black = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    # Unequal perspective lengths, empty rows and padding.
+    for row in range(batch_size):
+        white[row, (row * 17) % max_active :] = -1
+        black[row, (row * 13 + 5) % max_active :] = -1
+
+    weight = torch.randn(num_inputs, l1, dtype=torch.float32, device="cuda")
+    bias = torch.randn(l1, dtype=torch.float32, device="cuda")
+
+    scalar = make_fused_double_ft_forward_strided_kernel(max_active, l1)
+    vec4 = make_fused_double_ft_forward_vec4_kernel(max_active, l1)
+
+    l0_scalar, clamped_scalar = _launch_forward(
+        scalar, us, them, white, black, weight, bias, 0.99609375, l1
+    )
+    l0_vec4, clamped_vec4 = _launch_forward(
+        vec4, us, them, white, black, weight, bias, 0.99609375, l1
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(l0_vec4, l0_scalar, rtol=0, atol=0)
+    torch.testing.assert_close(clamped_vec4, clamped_scalar, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+def test_forward_kernel_geometry_selection():
+    """The four-column launch needs a whole number of columns per thread."""
+    from model.modules.feature_transformer.fused_ft_kernel import (
+        _forward_vec4_threads,
+        make_fused_double_ft_forward_kernel,
+        make_fused_double_ft_forward_strided_kernel,
+        make_fused_double_ft_forward_vec4_kernel,
+    )
+
+    assert _forward_vec4_threads(512) == 128
+    assert _forward_vec4_threads(1536) == 384
+    # Too few threads to fill a block, and widths the launch cannot split.
+    assert _forward_vec4_threads(128) is None
+    assert _forward_vec4_threads(6) is None
+
+    capability = torch.cuda.get_device_capability()
+    expected = (
+        make_fused_double_ft_forward_vec4_kernel
+        if capability == (8, 0)
+        else make_fused_double_ft_forward_strided_kernel
+    )
+    assert make_fused_double_ft_forward_kernel(288, 1024) is expected(288, 1024)

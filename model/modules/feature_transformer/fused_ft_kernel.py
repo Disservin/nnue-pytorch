@@ -7,6 +7,15 @@ from .sparse_linear_kernel import _kernel_with_threads
 # Backward has its own launch geometry.
 _FORWARD_THREADS = 128
 
+# us * a + them * b, with the rounding pinned to one fused multiply-add.  The
+# compiler otherwise picks the addend from scheduling context, which makes two
+# launches of the same accumulation disagree by an ulp.
+_FT_MIX_HELPER = r"""
+__device__ inline float ft_mix(float us_val, float a, float them_val, float b) {
+    return __fmaf_rn(us_val, a, __fmul_rn(them_val, b));
+}
+"""
+
 
 def _num_threads(l1_half: int, target: int) -> int:
     """Largest divisor of l1_half that is <= target."""
@@ -20,7 +29,8 @@ _fused_double_ft_forward_kernel_cache = {}
 
 
 @torch.compiler.disable(recursive=False)
-def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
+def make_fused_double_ft_forward_strided_kernel(max_active_indices: int, l1_size: int):
+    """One column per thread slice, addressed with scalar loads."""
     l1_half = l1_size // 2
     target = _FORWARD_THREADS
     if torch.version.hip is None:
@@ -37,7 +47,8 @@ def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
     key = (max_active_indices, l1_size, num_threads)
     if key not in _fused_double_ft_forward_kernel_cache:
         kernel = cp.RawKernel(
-            r"""
+            _FT_MIX_HELPER
+            + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
 typedef long long int64_t;
@@ -131,10 +142,10 @@ void fused_double_ft_forward(
             + r"""; ++s) {
         uint32_t i = s * n_threads + tid;
 
-        float l0_w0 = us_val * w0[s] + them_val * b0[s];
-        float l0_w1 = us_val * w1[s] + them_val * b1[s];
-        float l0_b0 = us_val * b0[s] + them_val * w0[s];
-        float l0_b1 = us_val * b1[s] + them_val * w1[s];
+        float l0_w0 = ft_mix(us_val, w0[s], them_val, b0[s]);
+        float l0_w1 = ft_mix(us_val, w1[s], them_val, b1[s]);
+        float l0_b0 = ft_mix(us_val, b0[s], them_val, w0[s]);
+        float l0_b1 = ft_mix(us_val, b1[s], them_val, w1[s]);
 
         if (l0_w0 < 0.0f) l0_w0 = 0.0f; else if (l0_w0 > max_ft_act) l0_w0 = max_ft_act;
         if (l0_w1 < 0.0f) l0_w1 = 0.0f; else if (l0_w1 > max_ft_act) l0_w1 = max_ft_act;
@@ -160,6 +171,154 @@ void fused_double_ft_forward(
             kernel, (num_threads,)
         )
     return _fused_double_ft_forward_kernel_cache[key]
+
+
+# Four consecutive columns per thread: each half is then one 128-bit load
+# instead of four scalar ones.  The measured A100 forward is limited by the
+# number of gather requests rather than by bytes read, so this pays there;
+# devices with their own measured launch keep it.
+_FORWARD_VEC4_COLUMNS = 4
+_FORWARD_VEC4_MIN_THREADS = 64
+
+_fused_double_ft_forward_vec4_kernel_cache = {}
+
+
+def _forward_vec4_threads(l1_half: int) -> int | None:
+    """Threads for the four-column launch, or None when the width is unusable."""
+    if l1_half % _FORWARD_VEC4_COLUMNS:
+        return None
+    num_threads = l1_half // _FORWARD_VEC4_COLUMNS
+    return num_threads if num_threads >= _FORWARD_VEC4_MIN_THREADS else None
+
+
+@torch.compiler.disable(recursive=False)
+def make_fused_double_ft_forward_vec4_kernel(max_active_indices: int, l1_size: int):
+    l1_half = l1_size // 2
+    num_threads = _forward_vec4_threads(l1_half)
+    if num_threads is None:
+        raise ValueError(f"l1_size {l1_size} does not support the four-column launch")
+
+    key = (max_active_indices, l1_size)
+    if key not in _fused_double_ft_forward_vec4_kernel_cache:
+        kernel = cp.RawKernel(
+            _FT_MIX_HELPER
+            + r"""
+typedef unsigned int uint32_t;
+typedef int int32_t;
+typedef long long int64_t;
+
+extern "C" __global__
+void fused_double_ft_forward_vec4(
+    const float* __restrict__ us,
+    const float* __restrict__ them,
+    const int32_t* __restrict__ white_indices,
+    const int32_t* __restrict__ black_indices,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float          max_ft_act,
+          float* __restrict__ l0_out,
+          float* __restrict__ clamped_out,
+    const int32_t        output_size
+) {
+    const int32_t block_idx = blockIdx.x;
+    const uint32_t col = threadIdx.x * """
+            + str(_FORWARD_VEC4_COLUMNS)
+            + r""";
+
+    const float us_val = __ldg(&us[block_idx]);
+    const float them_val = __ldg(&them[block_idx]);
+
+    const int32_t* const w_idx_row = white_indices + (size_t)block_idx * """
+            + str(max_active_indices)
+            + r""";
+    const int32_t* const b_idx_row = black_indices + (size_t)block_idx * """
+            + str(max_active_indices)
+            + r""";
+
+    const int32_t l1_size = """
+            + str(l1_size)
+            + r""";
+    const int32_t l1_half = """
+            + str(l1_half)
+            + r""";
+
+    // The two halves are neighbours in the row, so each thread covers the same
+    // four columns of both.  Per column the accumulation order is unchanged.
+    float4 w0 = *reinterpret_cast<const float4*>(&bias[col]);
+    float4 w1 = *reinterpret_cast<const float4*>(&bias[col + l1_half]);
+    float4 b0 = w0;
+    float4 b1 = w1;
+
+    for (int k = 0; k < """
+            + str(max_active_indices)
+            + r"""; ++k) {
+        const int wi = w_idx_row[k], bi = b_idx_row[k];
+        if (wi == -1 && bi == -1) break;
+        if (wi >= 0) {
+            const float* const row = weight + (size_t)(unsigned)wi * l1_size;
+            const float4 v0 = *reinterpret_cast<const float4*>(row + col);
+            const float4 v1 = *reinterpret_cast<const float4*>(row + col + l1_half);
+            w0.x += v0.x; w0.y += v0.y; w0.z += v0.z; w0.w += v0.w;
+            w1.x += v1.x; w1.y += v1.y; w1.z += v1.z; w1.w += v1.w;
+        }
+        if (bi >= 0) {
+            const float* const row = weight + (size_t)(unsigned)bi * l1_size;
+            const float4 v0 = *reinterpret_cast<const float4*>(row + col);
+            const float4 v1 = *reinterpret_cast<const float4*>(row + col + l1_half);
+            b0.x += v0.x; b0.y += v0.y; b0.z += v0.z; b0.w += v0.w;
+            b1.x += v1.x; b1.y += v1.y; b1.z += v1.z; b1.w += v1.w;
+        }
+    }
+
+    float l0_w0[4] = {ft_mix(us_val, w0.x, them_val, b0.x), ft_mix(us_val, w0.y, them_val, b0.y),
+                      ft_mix(us_val, w0.z, them_val, b0.z), ft_mix(us_val, w0.w, them_val, b0.w)};
+    float l0_w1[4] = {ft_mix(us_val, w1.x, them_val, b1.x), ft_mix(us_val, w1.y, them_val, b1.y),
+                      ft_mix(us_val, w1.z, them_val, b1.z), ft_mix(us_val, w1.w, them_val, b1.w)};
+    float l0_b0[4] = {ft_mix(us_val, b0.x, them_val, w0.x), ft_mix(us_val, b0.y, them_val, w0.y),
+                      ft_mix(us_val, b0.z, them_val, w0.z), ft_mix(us_val, b0.w, them_val, w0.w)};
+    float l0_b1[4] = {ft_mix(us_val, b1.x, them_val, w1.x), ft_mix(us_val, b1.y, them_val, w1.y),
+                      ft_mix(us_val, b1.z, them_val, w1.z), ft_mix(us_val, b1.w, them_val, w1.w)};
+
+    #pragma unroll
+    for (uint32_t s = 0; s < """
+            + str(_FORWARD_VEC4_COLUMNS)
+            + r"""; ++s) {
+        float v0 = l0_w0[s], v1 = l0_w1[s], v2 = l0_b0[s], v3 = l0_b1[s];
+        if (v0 < 0.0f) v0 = 0.0f; else if (v0 > max_ft_act) v0 = max_ft_act;
+        if (v1 < 0.0f) v1 = 0.0f; else if (v1 > max_ft_act) v1 = max_ft_act;
+        if (v2 < 0.0f) v2 = 0.0f; else if (v2 > max_ft_act) v2 = max_ft_act;
+        if (v3 < 0.0f) v3 = 0.0f; else if (v3 > max_ft_act) v3 = max_ft_act;
+
+        const uint32_t i = col + s;
+        l0_out[(size_t)block_idx * l1_size + i] = v0 * v1;
+        l0_out[(size_t)block_idx * l1_size + l1_half + i] = v2 * v3;
+
+        const uint32_t clamp_base = block_idx * 4 * l1_half;
+        clamped_out[clamp_base + 0 * l1_half + i] = v0;
+        clamped_out[clamp_base + 1 * l1_half + i] = v1;
+        clamped_out[clamp_base + 2 * l1_half + i] = v2;
+        clamped_out[clamp_base + 3 * l1_half + i] = v3;
+    }
+}
+""",
+            "fused_double_ft_forward_vec4",
+        )
+        kernel.compile()
+        _fused_double_ft_forward_vec4_kernel_cache[key] = _kernel_with_threads(
+            kernel, (num_threads,)
+        )
+    return _fused_double_ft_forward_vec4_kernel_cache[key]
+
+
+@torch.compiler.disable(recursive=False)
+def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
+    """Forward kernel for the current device."""
+    if torch.version.hip is None and torch.cuda.get_device_capability() == (8, 0):
+        if _forward_vec4_threads(l1_size // 2) is not None:
+            return make_fused_double_ft_forward_vec4_kernel(
+                max_active_indices, l1_size
+            )
+    return make_fused_double_ft_forward_strided_kernel(max_active_indices, l1_size)
 
 
 BACKWARD_TILE_SIZE = 4
