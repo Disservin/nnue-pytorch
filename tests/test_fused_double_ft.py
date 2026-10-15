@@ -206,3 +206,138 @@ def test_forward_kernel_geometry_selection():
         else make_fused_double_ft_forward_strided_kernel
     )
     assert make_fused_double_ft_forward_kernel(288, 1024) is expected(288, 1024)
+
+
+def _k_grid_weight(num_inputs, l1, k_max):
+    """A fake-quantized FT weight: exactly the integers k / 256 it can hold."""
+    k = torch.randint(
+        -k_max, k_max + 1, (num_inputs, l1), dtype=torch.int64, device="cuda"
+    )
+    k[0, 0], k[0, 1], k[1, 0], k[1, 1] = k_max, -k_max, 1, -1
+    return (k.to(torch.float32) / 256.0).contiguous()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+@pytest.mark.parametrize("l1", [512, 1024, 2048])
+@pytest.mark.parametrize("stream_dtype", [torch.int8, torch.int16])
+def test_narrow_weight_stream_matches_fp32_kernel(l1, stream_dtype):
+    """The integer stream scales back to the fp32 grid value for value."""
+    from model.modules.feature_transformer.fused_ft_kernel import (
+        make_fused_double_ft_forward_vec4_kernel,
+        narrow_ft_weight,
+    )
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    k_max = torch.iinfo(stream_dtype).max
+    num_inputs, max_active, batch_size = 100, 288, 37
+    us = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+    them = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+    white = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    black = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    for row in range(batch_size):
+        white[row, (row * 17) % max_active :] = -1
+        black[row, (row * 13 + 5) % max_active :] = -1
+
+    weight = _k_grid_weight(num_inputs, l1, k_max)
+    bias = torch.randn(l1, dtype=torch.float32, device="cuda")
+    narrow = narrow_ft_weight(weight, stream_dtype, 256.0)
+
+    # The cast must land on the grid, including the extremes it can store.
+    assert narrow[0, 0].item() == k_max
+    assert narrow[0, 1].item() == -k_max
+    assert torch.equal(narrow.float(), weight * 256.0)
+
+    l0_wide, clamped_wide = _launch_forward(
+        make_fused_double_ft_forward_vec4_kernel(max_active, l1),
+        us,
+        them,
+        white,
+        black,
+        weight,
+        bias,
+        0.99609375,
+        l1,
+    )
+    l0_narrow, clamped_narrow = _launch_forward(
+        make_fused_double_ft_forward_vec4_kernel(max_active, l1, stream_dtype, 256.0),
+        us,
+        them,
+        white,
+        black,
+        narrow,
+        bias,
+        0.99609375,
+        l1,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(l0_narrow, l0_wide, rtol=0, atol=0)
+    torch.testing.assert_close(clamped_narrow, clamped_wide, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+def test_narrow_weight_stream_matches_fp32_forward():
+    """Asking for the stream leaves the fused forward bit for bit unchanged."""
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    l1, max_active, batch_size, num_inputs = 1024, 288, 17, 128
+    us = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+    them = torch.randn(batch_size, 1, dtype=torch.float32, device="cuda")
+    white = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    black = torch.randint(
+        0, num_inputs, (batch_size, max_active), dtype=torch.int32, device="cuda"
+    )
+    white[:, -3:] = -1
+    black[:, -5:] = -1
+    weight = _k_grid_weight(num_inputs, l1, 127)
+    bias = torch.randn(l1, dtype=torch.float32, device="cuda")
+
+    kwargs = (us, them, white, black, weight, bias, 0.99609375, l1)
+    l0_wide = double_feature_transform(*kwargs, backend="fused")
+    l0_narrow = double_feature_transform(
+        *kwargs, backend="fused", weight_stream=(torch.int8, 256.0)
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(l0_narrow, l0_wide, rtol=0, atol=0)
+
+
+def test_ft_weight_stream_dtype_gate():
+    """Only feature sets whose clipped integers fit the stream are streamed."""
+    from model.modules.features import get_feature_cls
+    from model.quantize import QuantizationConfig, QuantizationManager
+
+    manager = QuantizationManager(QuantizationConfig())
+    assert manager.ft_weight_stream_dtype([torch.int8]) == torch.int8
+    assert manager.ft_weight_stream_dtype([torch.int8, torch.int16]) == torch.int16
+    assert manager.ft_weight_stream_dtype([torch.int8, torch.int32]) is None
+    assert manager.ft_weight_stream_dtype([]) is None
+
+    # The production feature set carries one int16-clipped extractor, so it
+    # streams as int16 rather than int8.
+    production = [
+        cls(1024).EXPORT_WEIGHT_DTYPE
+        for cls in get_feature_cls("Full_Threats+PP_3Wide+HalfKAv2_hm^")
+    ]
+    assert production == [torch.int8, torch.int8, torch.int16]
+    assert manager.ft_weight_stream_dtype(production) == torch.int16
+
+    # k / scale has to be exact in fp32 for the scale-back to be lossless.
+    for scale in (100.0, 256.5, -256.0):
+        other = QuantizationManager(QuantizationConfig(ft_quantized_one=scale))
+        assert other.ft_weight_stream_dtype([torch.int8]) is None

@@ -44,6 +44,11 @@ class ComposedFeatureTransformer(nn.Module):
 
         self.HASH = self._compute_hash()
 
+        # Exact narrow stream for the fake-quantized FT weight (None = fp32).
+        self.FT_WEIGHT_STREAM_DTYPE = quantization.ft_weight_stream_dtype(
+            f.EXPORT_WEIGHT_DTYPE for f in features
+        )
+
         self.quantization = quantization
 
         self._reset_bias()
@@ -128,6 +133,11 @@ class ComposedFeatureTransformer(nn.Module):
             ft_max_act,
             self.l1_size,
             backend,
+            (
+                (self.FT_WEIGHT_STREAM_DTYPE, self.quantization.ft_quantized_one)
+                if fake_quantize_weights and self.FT_WEIGHT_STREAM_DTYPE is not None
+                else None
+            ),
         )
 
         if fake_quantize_acts:

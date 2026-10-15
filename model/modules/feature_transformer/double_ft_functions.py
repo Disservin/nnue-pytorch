@@ -14,7 +14,14 @@ def double_feature_transform(
     max_ft_activation: float,
     l1_size: int,
     backend: str = "auto",
+    weight_stream: tuple[torch.dtype, float] | None = None,
 ) -> torch.Tensor:
+    """Merge both perspectives.
+
+    ``weight_stream`` is an optional (dtype, scale) pair asking the fused
+    backend to read the fake-quantized FT weight as integers of that dtype
+    scaled by 1/scale.  It only changes how the same values are stored.
+    """
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
     all_cuda = (
@@ -50,6 +57,7 @@ def double_feature_transform(
             bias,
             max_ft_activation,
             l1_size,
+            weight_stream,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":

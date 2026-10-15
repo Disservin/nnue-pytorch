@@ -125,6 +125,32 @@ class QuantizationManager:
         info = torch.iinfo(dtype)
         return -info.max / self.ft_quantized_one, info.max / self.ft_quantized_one
 
+    def ft_weight_stream_dtype(self, export_weight_dtypes) -> torch.dtype | None:
+        """Narrowest exact integer stream for the fake-quantized FT weight.
+
+        Each feature clips its weights to get_ft_weight_bounds(EXPORT_WEIGHT_DTYPE),
+        so round(weight * ft_quantized_one) stays inside that dtype's integer
+        range.  A power-of-two scale makes k / scale exact in fp32, which is
+        what lets the forward read the integer grid k at the narrowest width
+        that holds every feature and scale it back exactly.
+        """
+        scale = self.ft_quantized_one
+        if not float(scale).is_integer():
+            return None
+        scale = int(scale)
+        if scale <= 0 or scale & (scale - 1):
+            return None
+        widest = 0
+        for dtype in export_weight_dtypes:
+            widest = max(widest, torch.iinfo(dtype).max)
+        if widest == 0:
+            return None
+        if widest <= torch.iinfo(torch.int8).max:
+            return torch.int8
+        if widest <= torch.iinfo(torch.int16).max:
+            return torch.int16
+        return None
+
     def clip_ft_act(self, preact):
         return torch.clamp(preact, 0.0, self.max_ft_activation)
 

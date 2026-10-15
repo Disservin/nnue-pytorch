@@ -7,8 +7,10 @@ try:
     from .aggregated_ft_kernel import aggregated_ft_backward
     from .fused_ft_kernel import (
         BACKWARD_TILE_SIZE,
+        forward_reads_narrow_stream,
         make_fused_double_ft_backward_kernel,
         make_fused_double_ft_forward_kernel,
+        narrow_ft_weight,
     )
 
     _HAS_CUPY_KERNELS = True
@@ -71,6 +73,7 @@ class FusedDoubleFtFunction(autograd.Function):
         bias,
         max_ft_activation,
         l1_size,
+        weight_stream=None,
     ):
         ctx.max_ft_activation = float(max_ft_activation)
         ctx.l1_size = int(l1_size)
@@ -113,7 +116,26 @@ class FusedDoubleFtFunction(autograd.Function):
         )
 
         output_size = bias.shape[0]
-        kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
+
+        # ``weight`` is already the fake-quantized k / scale grid.  When the
+        # caller allows it, read that grid back from the narrowest exact integer
+        # stream, which is a quarter of the bytes for an int8-clipped feature
+        # set.  The cast is local to the forward; gradients keep flowing to the
+        # fp32 weight, and the values the kernel accumulates are identical.
+        stream_dtype, stream_scale = weight_stream or (None, 0.0)
+        if stream_dtype is not None and not forward_reads_narrow_stream(
+            max_active_features, l1_size
+        ):
+            stream_dtype, stream_scale = None, 0.0
+        streamed_weight = (
+            narrow_ft_weight(weight, stream_dtype, stream_scale)
+            if stream_dtype is not None
+            else weight
+        )
+
+        kernel = make_fused_double_ft_forward_kernel(
+            max_active_features, l1_size, stream_dtype, stream_scale
+        )
         kernel(
             grid=(batch_size,),
             args=(
@@ -121,7 +143,7 @@ class FusedDoubleFtFunction(autograd.Function):
                 them.data_ptr(),
                 white_indices.data_ptr(),
                 black_indices.data_ptr(),
-                weight.data_ptr(),
+                streamed_weight.data_ptr(),
                 bias.data_ptr(),
                 np.float32(max_ft_activation),
                 l0_.data_ptr(),
@@ -177,7 +199,7 @@ class FusedDoubleFtFunction(autograd.Function):
                 max_ft_activation,
                 tile_size=tile_size,
             )
-            return None, None, None, None, grad_weight, grad_bias, None, None
+            return None, None, None, None, grad_weight, grad_bias, None, None, None
 
         kernel = make_fused_double_ft_backward_kernel(max_active_features, l1_size)
         grid_size = (batch_size + BACKWARD_TILE_SIZE - 1) // BACKWARD_TILE_SIZE
@@ -200,4 +222,4 @@ class FusedDoubleFtFunction(autograd.Function):
             ),
         )
 
-        return None, None, None, None, grad_weight, grad_bias, None, None
+        return None, None, None, None, grad_weight, grad_bias, None, None, None

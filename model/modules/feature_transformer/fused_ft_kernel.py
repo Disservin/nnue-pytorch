@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 import torch
 
 from .sparse_linear_kernel import _kernel_with_threads
@@ -191,17 +192,73 @@ def _forward_vec4_threads(l1_half: int) -> int | None:
     return num_threads if num_threads >= _FORWARD_VEC4_MIN_THREADS else None
 
 
+_NARROW_STREAM_TYPES = {
+    torch.int8: ("signed char", "char4", -127, 127),
+    torch.int16: ("short", "short4", -32767, 32767),
+}
+
+
+def forward_reads_narrow_stream(max_active_indices: int, l1_size: int) -> bool:
+    """Whether this device can read the weight narrower than fp32."""
+    return (
+        torch.version.hip is None
+        and torch.cuda.get_device_capability() == (8, 0)
+        and _forward_vec4_threads(l1_size // 2) is not None
+    )
+
+
+def _weight_stream_helper(stream_dtype, stream_scale: float) -> str:
+    """C preamble that types the weight and loads four lanes of it.
+
+    ``stream_dtype`` is None for the fp32 stream.  The stream stores the integer
+    grid k of the fake-quantized weight, so the load scales it back by 1/scale:
+    exact while the scale is a power of two, which the caller guarantees.
+    """
+    if stream_dtype is None:
+        return (
+            "typedef float FT_WEIGHT_T;\n"
+            "__device__ inline float4 ft_load4(const FT_WEIGHT_T* p) {\n"
+            "    return *reinterpret_cast<const float4*>(p);\n"
+            "}\n"
+        )
+    if stream_dtype not in _NARROW_STREAM_TYPES:
+        raise ValueError(f"unsupported weight stream dtype {stream_dtype}")
+    scale = float(stream_scale)
+    if scale <= 0 or not scale.is_integer() or int(scale) & (int(scale) - 1):
+        raise ValueError(f"weight stream scale {stream_scale!r} is not a power of two")
+    ctype, vec, _lo, _hi = _NARROW_STREAM_TYPES[stream_dtype]
+    inverse = 1.0 / scale
+    lanes = "".join(
+        f"\n    out.{c} = (float)v.{c} * k;" for c in ("x", "y", "z", "w")
+    )
+    return (
+        f"typedef {ctype} FT_WEIGHT_T;\n"
+        f"__device__ inline float4 ft_load4(const FT_WEIGHT_T* p) {{\n"
+        f"    const {vec} v = *reinterpret_cast<const {vec}*>(p);\n"
+        f"    const float k = {inverse!r}f;\n"
+        f"    float4 out;{lanes}\n"
+        "    return out;\n"
+        "}\n"
+    )
+
+
 @torch.compiler.disable(recursive=False)
-def make_fused_double_ft_forward_vec4_kernel(max_active_indices: int, l1_size: int):
+def make_fused_double_ft_forward_vec4_kernel(
+    max_active_indices: int,
+    l1_size: int,
+    stream_dtype: torch.dtype | None = None,
+    stream_scale: float = 0.0,
+):
     l1_half = l1_size // 2
     num_threads = _forward_vec4_threads(l1_half)
     if num_threads is None:
         raise ValueError(f"l1_size {l1_size} does not support the four-column launch")
 
-    key = (max_active_indices, l1_size)
+    key = (max_active_indices, l1_size, stream_dtype)
     if key not in _fused_double_ft_forward_vec4_kernel_cache:
         kernel = cp.RawKernel(
             _FT_MIX_HELPER
+            + _weight_stream_helper(stream_dtype, stream_scale)
             + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -213,7 +270,7 @@ void fused_double_ft_forward_vec4(
     const float* __restrict__ them,
     const int32_t* __restrict__ white_indices,
     const int32_t* __restrict__ black_indices,
-    const float* __restrict__ weight,
+    const FT_WEIGHT_T* __restrict__ weight,
     const float* __restrict__ bias,
     const float          max_ft_act,
           float* __restrict__ l0_out,
@@ -255,16 +312,16 @@ void fused_double_ft_forward_vec4(
         const int wi = w_idx_row[k], bi = b_idx_row[k];
         if (wi == -1 && bi == -1) break;
         if (wi >= 0) {
-            const float* const row = weight + (size_t)(unsigned)wi * l1_size;
-            const float4 v0 = *reinterpret_cast<const float4*>(row + col);
-            const float4 v1 = *reinterpret_cast<const float4*>(row + col + l1_half);
+            const FT_WEIGHT_T* const row = weight + (size_t)(unsigned)wi * l1_size;
+            const float4 v0 = ft_load4(row + col);
+            const float4 v1 = ft_load4(row + col + l1_half);
             w0.x += v0.x; w0.y += v0.y; w0.z += v0.z; w0.w += v0.w;
             w1.x += v1.x; w1.y += v1.y; w1.z += v1.z; w1.w += v1.w;
         }
         if (bi >= 0) {
-            const float* const row = weight + (size_t)(unsigned)bi * l1_size;
-            const float4 v0 = *reinterpret_cast<const float4*>(row + col);
-            const float4 v1 = *reinterpret_cast<const float4*>(row + col + l1_half);
+            const FT_WEIGHT_T* const row = weight + (size_t)(unsigned)bi * l1_size;
+            const float4 v0 = ft_load4(row + col);
+            const float4 v1 = ft_load4(row + col + l1_half);
             b0.x += v0.x; b0.y += v0.y; b0.z += v0.z; b0.w += v0.w;
             b1.x += v1.x; b1.y += v1.y; b1.z += v1.z; b1.w += v1.w;
         }
@@ -311,14 +368,76 @@ void fused_double_ft_forward_vec4(
 
 
 @torch.compiler.disable(recursive=False)
-def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
+def make_fused_double_ft_forward_kernel(
+    max_active_indices: int,
+    l1_size: int,
+    stream_dtype: torch.dtype | None = None,
+    stream_scale: float = 0.0,
+):
     """Forward kernel for the current device."""
-    if torch.version.hip is None and torch.cuda.get_device_capability() == (8, 0):
-        if _forward_vec4_threads(l1_size // 2) is not None:
-            return make_fused_double_ft_forward_vec4_kernel(
-                max_active_indices, l1_size
-            )
+    if forward_reads_narrow_stream(max_active_indices, l1_size):
+        return make_fused_double_ft_forward_vec4_kernel(
+            max_active_indices, l1_size, stream_dtype, stream_scale
+        )
+    if stream_dtype is not None:
+        raise ValueError(
+            f"no narrow weight stream launch for l1_size {l1_size} on this device"
+        )
     return make_fused_double_ft_forward_strided_kernel(max_active_indices, l1_size)
+
+
+_narrow_weight_kernel_cache = {}
+
+
+@torch.compiler.disable(recursive=False)
+def make_narrow_ft_weight_kernel(stream_dtype, stream_scale: float):
+    """Cast the fake-quantized FT weight to the integer stream the forward reads.
+
+    The weight is already k / scale, so one rounding per element lands exactly
+    on the integer grid; the clamp only guards the stored integer range (the
+    extractors clip the weight to get_ft_weight_bounds of the export dtype).
+    """
+    ctype, _vec, lo, hi = _NARROW_STREAM_TYPES[stream_dtype]
+    key = (stream_dtype, float(stream_scale))
+    if key not in _narrow_weight_kernel_cache:
+        kernel = cp.RawKernel(
+            "typedef int int32_t;\ntypedef "
+            + ctype
+            + " FT_WEIGHT_T;\n"
+            + r"""
+extern "C" __global__ void ft_weight_narrow(
+    const float* __restrict__ in, FT_WEIGHT_T* __restrict__ out, const int32_t n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int k = __float2int_rn(in[i] * """
+            + repr(float(stream_scale))
+            + r"""f);
+    out[i] = (FT_WEIGHT_T)(k < """
+            + str(lo)
+            + r""" ? """
+            + str(lo)
+            + r""" : (k > """
+            + str(hi)
+            + r""" ? """
+            + str(hi)
+            + r""" : k));
+}
+""",
+            "ft_weight_narrow",
+        )
+        kernel.compile()
+        _narrow_weight_kernel_cache[key] = _kernel_with_threads(kernel, (256,))
+    return _narrow_weight_kernel_cache[key]
+
+
+def narrow_ft_weight(weight: torch.Tensor, stream_dtype, stream_scale: float):
+    """One pass over the weight into the narrow integer stream."""
+    out = torch.empty(weight.shape, dtype=stream_dtype, device=weight.device)
+    kernel = make_narrow_ft_weight_kernel(stream_dtype, stream_scale)
+    n = weight.numel()
+    kernel(((n + 255) // 256,), (weight.data_ptr(), out.data_ptr(), np.int32(n)))
+    return out
 
 
 BACKWARD_TILE_SIZE = 4
