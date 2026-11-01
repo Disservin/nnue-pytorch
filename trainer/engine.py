@@ -66,6 +66,8 @@ def is_one_cycle(scheduler: Any) -> bool:
         return False
     if isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
         return True
+    if getattr(scheduler, "per_step", False):
+        return True
     # The project wraps OneCycleLR in SafeOneCycleLR.
     name = scheduler.__class__.__name__
     return "OneCycleLR" in name
@@ -136,6 +138,10 @@ class SimpleTrainer:
         self.should_stop: bool = False
 
         self.current_epoch: int = 0
+        # True once every batch of current_epoch has been trained. Saved in
+        # checkpoints so a resume continues with the next epoch instead of
+        # training the finished one a second time.
+        self.epoch_finished: bool = False
         self.global_step: int = 0
         self.num_training_batches: int | None = None
         self.num_val_batches: int | None = None
@@ -244,6 +250,7 @@ class SimpleTrainer:
         unwrapped = _unwrap_module(self.model)
         checkpoint = {
             "epoch": self.current_epoch,
+            "epoch_finished": self.epoch_finished,
             "global_step": self.global_step,
             "state_dict": unwrapped.state_dict(),
             "lr_schedulers": [sch.state_dict() for sch in self._schedulers],
@@ -279,7 +286,11 @@ class SimpleTrainer:
 
         unwrapped = _unwrap_module(self.model)
         unwrapped.load_state_dict(checkpoint["state_dict"])
-        self.current_epoch = checkpoint.get("epoch", 0)
+        saved_epoch = checkpoint.get("epoch", 0)
+        # Checkpoints without the flag were written at epoch end (the regular
+        # path), so treat them as finished.
+        self.epoch_finished = bool(checkpoint.get("epoch_finished", True))
+        self.current_epoch = saved_epoch + 1 if self.epoch_finished else saved_epoch
         self.global_step = checkpoint.get("global_step", 0)
 
         # Restore scheduler states if they were saved.
@@ -302,6 +313,11 @@ class SimpleTrainer:
             len(train_loader) if hasattr(train_loader, "__len__") else None
         )
 
+        if self.current_epoch >= self.max_epochs:
+            # Resumed from a checkpoint that already trained every epoch;
+            # running the end-of-training hooks would rewrite last.ckpt.
+            return
+
         self._call_callbacks("on_fit_start", self)
         self._call_callbacks("on_train_start", self)
 
@@ -322,6 +338,7 @@ class SimpleTrainer:
         self._call_callbacks("on_fit_end", self)
 
     def _train_epoch(self, train_loader):
+        self.epoch_finished = False
         self.model.train()
 
         if hasattr(self.model, "on_train_epoch_start"):
@@ -385,6 +402,15 @@ class SimpleTrainer:
 
             self._call_callbacks("on_train_batch_end", self, batch, batch_idx, outputs)
 
+        self.epoch_finished = True
+
+        # Step epoch-interval schedulers (e.g. StepLR) before the epoch-end
+        # hooks, so the checkpoint written there already holds the scheduler
+        # state for the next epoch.
+        for sch in self._schedulers:
+            if not is_one_cycle(sch):
+                sch.step()
+
         # Compute and log epoch-level training loss before the model resets it.
         train_loss_epoch = self.model.loss_metrics["train_loss_epoch"].compute().item()
         self.callback_metrics["train_loss_epoch"] = train_loss_epoch
@@ -396,11 +422,6 @@ class SimpleTrainer:
         if hasattr(self.model, "on_train_epoch_end"):
             self.model.on_train_epoch_end()
         self._call_callbacks("on_train_epoch_end", self)
-
-        # Step epoch-interval schedulers (e.g. StepLR) once per epoch.
-        for sch in self._schedulers:
-            if not is_one_cycle(sch):
-                sch.step()
 
     # ------------------------------------------------------------------
     # Validation loop

@@ -1,6 +1,6 @@
 from .adamw_wrapper import AdamWConfig, AdamWWrapper
 from .config import OptimizerConfig
-from .lr_scheduler import LRSchedulerConfig, SafeOneCycleLR
+from .lr_scheduler import LRSchedulerConfig, SafeOneCycleLR, WSDLR
 from .rangerlite_wrapper import RangerLiteConfig, RangerLiteWrapper
 from .schedulefree_wrapper import ScheduleFreeConfig, ScheduleFreeWrapper
 
@@ -14,4 +14,5 @@ __all__ = [
     "SafeOneCycleLR",
     "ScheduleFreeConfig",
     "ScheduleFreeWrapper",
+    "WSDLR",
 ]
