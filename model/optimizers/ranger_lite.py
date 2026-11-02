@@ -8,6 +8,7 @@
 
 import collections
 import math
+import os
 import warnings
 
 import torch
@@ -21,6 +22,8 @@ except Exception:  # noqa: BLE001
     cp = None
     np = None
     _HAS_CUPY = False
+
+_FUSE_LOOKAHEAD = os.environ.get("NNUE_FUSE_LOOKAHEAD", "1") != "0"
 
 
 class _RangerLiteFusedKernels:
@@ -46,6 +49,7 @@ typedef long long int64_t;
 extern "C" __global__ void ranger_lite_update_pnm(
     float* __restrict__ p,
     const float* __restrict__ grad,
+    const float* __restrict__ grad_scale,
     float* __restrict__ grad_ma,
     float* __restrict__ neg_grad_ma,
     float* __restrict__ variance_ma,
@@ -61,10 +65,14 @@ extern "C" __global__ void ranger_lite_update_pnm(
     float lr_div_bc1,
     float eps,
     int64_t step,
-    float wd_factor
+    float wd_factor,
+    float* __restrict__ la_params,
+    float la_alpha,
+    float la_beta
 ) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float g = grad[i];
+        if (grad_scale != nullptr) g = __fmul_rn(g, *grad_scale);
         float vm = variance_ma[i] * beta2 + g * g * one_minus_beta2;
         variance_ma[i] = vm;
         float denom = sqrtf(vm / bias_correction2) + eps;
@@ -81,6 +89,10 @@ extern "C" __global__ void ranger_lite_update_pnm(
             new_p = new_p * (1.0f - wd_factor);
         }
         new_p = new_p - lr_div_bc1 * (pnm_val / denom);
+        if (la_params != nullptr) {
+            new_p = __fmaf_rn(la_beta, la_params[i], __fmul_rn(new_p, la_alpha));
+            la_params[i] = new_p;
+        }
         p[i] = new_p;
 
         if (step & 1LL) {
@@ -94,6 +106,7 @@ extern "C" __global__ void ranger_lite_update_pnm(
 extern "C" __global__ void ranger_lite_update_adam(
     float* __restrict__ p,
     const float* __restrict__ grad,
+    const float* __restrict__ grad_scale,
     float* __restrict__ grad_ma,
     float* __restrict__ variance_ma,
     int64_t n,
@@ -104,10 +117,14 @@ extern "C" __global__ void ranger_lite_update_adam(
     float one_minus_beta1,
     float lr_div_bc1,
     float eps,
-    float wd_factor
+    float wd_factor,
+    float* __restrict__ la_params,
+    float la_alpha,
+    float la_beta
 ) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float g = grad[i];
+        if (grad_scale != nullptr) g = __fmul_rn(g, *grad_scale);
         float vm = variance_ma[i] * beta2 + g * g * one_minus_beta2;
         variance_ma[i] = vm;
         float denom = sqrtf(vm / bias_correction2) + eps;
@@ -120,6 +137,10 @@ extern "C" __global__ void ranger_lite_update_adam(
             new_p = new_p * (1.0f - wd_factor);
         }
         new_p = new_p - lr_div_bc1 * (gm / denom);
+        if (la_params != nullptr) {
+            new_p = __fmaf_rn(la_beta, la_params[i], __fmul_rn(new_p, la_alpha));
+            la_params[i] = new_p;
+        }
         p[i] = new_p;
     }
 }
@@ -338,9 +359,15 @@ class RangerLite(torch.optim.Optimizer):
                 or not state["neg_grad_ma"].is_contiguous()
             ):
                 return False
+            if self.lookahead_active and (
+                state["lookahead_params"].dtype != torch.float32
+                or state["lookahead_params"].device != p.device
+                or not state["lookahead_params"].is_contiguous()
+            ):
+                return False
         return True
 
-    def _fused_update_group(self, group):
+    def _fused_update_group(self, group, grad_scale=None, lookahead_merge=False):
         """Apply the fused full update kernel (variance + moment + param)."""
         _RangerLiteFusedKernels._compile()
         beta1, beta2 = group["betas"]
@@ -355,6 +382,9 @@ class RangerLite(torch.optim.Optimizer):
         noise_norm = math.sqrt((1.0 + pnm_factor) ** 2 + pnm_factor**2)
 
         wd_factor = decay * lr if not self.use_stable_weight_decay else 0.0
+        scale_ptr = np.uint64(grad_scale.data_ptr() if grad_scale is not None else 0)
+        la_alpha = np.float32(self.lookahead_alpha)
+        la_beta = np.float32(1.0 - self.lookahead_alpha)
 
         for p in group["params"]:
             if p.grad is None:
@@ -371,6 +401,7 @@ class RangerLite(torch.optim.Optimizer):
             g_arr = cp.from_dlpack(torch.to_dlpack(grad))
             gm_arr = cp.from_dlpack(torch.to_dlpack(state["grad_ma"]))
             vm_arr = cp.from_dlpack(torch.to_dlpack(state["variance_ma"]))
+            la_ptr = np.uint64(state["lookahead_params"].data_ptr() if lookahead_merge else 0)
 
             block = 512
             grid = (p.numel() + block - 1) // block
@@ -383,6 +414,7 @@ class RangerLite(torch.optim.Optimizer):
                 args = (
                     p_arr,
                     g_arr,
+                    scale_ptr,
                     gm_arr,
                     ngm_arr,
                     vm_arr,
@@ -399,6 +431,9 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(eps),
                     np.int64(step),
                     np.float32(wd_factor),
+                    la_ptr,
+                    la_alpha,
+                    la_beta,
                 )
                 _RangerLiteFusedKernels._pnm_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -409,6 +444,7 @@ class RangerLite(torch.optim.Optimizer):
                 args = (
                     p_arr,
                     g_arr,
+                    scale_ptr,
                     gm_arr,
                     vm_arr,
                     np.int64(p.numel()),
@@ -420,6 +456,9 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(lr_div_bc1),
                     np.float32(eps),
                     np.float32(wd_factor),
+                    la_ptr,
+                    la_alpha,
+                    la_beta,
                 )
                 _RangerLiteFusedKernels._adam_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -541,7 +580,7 @@ class RangerLite(torch.optim.Optimizer):
         return x.norm(dim=dim, keepdim=True, p=2.0)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure=None, grad_scale=None):
         loss = None
         if closure is not None and isinstance(closure, collections.abc.Callable):
             with torch.enable_grad():
@@ -569,12 +608,29 @@ class RangerLite(torch.optim.Optimizer):
         # fused kernel that updates variance, moments and parameters at once.
         if not needs_variance_sum:
             all_fusable = all(self._can_fuse_group_full(g) for g in self.param_groups)
+            if grad_scale is not None:
+                all_fusable = all_fusable and grad_scale.dtype == torch.float32 and grad_scale.numel() == 1 and grad_scale.device == first_param.device and all(
+                    p.grad is None or p.device == grad_scale.device
+                    for g in self.param_groups for p in g["params"]
+                )
             if all_fusable:
+                la_merge = (
+                    self.lookahead_active and _FUSE_LOOKAHEAD
+                    and self.lookahead_step + 1 >= self.lookahead_mergetime
+                )
                 for group in self.param_groups:
-                    self._fused_update_group(group)
-                if self.lookahead_active:
+                    self._fused_update_group(group, grad_scale, la_merge)
+                if la_merge:
+                    self.lookahead_step = 0
+                elif self.lookahead_active:
                     self.lookahead_process_step()
                 return loss
+
+        if grad_scale is not None:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.mul_(grad_scale.to(p.grad.device))
 
         # Fast path B: every group that has work can use the phase-2 fused kernel.
         # We run a fused variance kernel per parameter, reduce the debiased sums,
