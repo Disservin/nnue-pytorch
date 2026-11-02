@@ -5,6 +5,7 @@ from torch import nn
 
 from ...quantize import QuantizationManager
 from ..features.input_feature import InputFeature
+from . import fused_weight_quant as _fwq
 from .double_ft_functions import double_feature_transform
 
 
@@ -66,8 +67,16 @@ class ComposedFeatureTransformer(nn.Module):
         self,
         fake_quantize_weights: bool = False,
     ):
-        merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
         b = self.bias
+        if fake_quantize_weights and _fwq.ENABLED:
+            segs = _fwq.segments_of(self.features)
+            if _fwq.usable(segs):
+                merged = _fwq.merge_and_fake_quantize(
+                    segs, self.quantization.weight_scales_dict["ft_weight"]
+                )
+                b = self.quantization.fake_quantize_weights(b, "ft_bias")
+                return merged, b
+        merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
         if fake_quantize_weights:
             merged = self.quantization.fake_quantize_weights(merged, "ft_weight")
             b = self.quantization.fake_quantize_weights(b, "ft_bias")
