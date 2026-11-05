@@ -364,6 +364,65 @@ struct PP_3Wide {
     }
 };
 
+// An enemy slider aimed at a king with exactly one non-king piece between them, ignoring other
+// enemy sliders on the king's lines. Must match Features::KingPins in Stockfish.
+struct KingPins {
+    static constexpr std::string_view NAME = "King_Pins";
+
+    static constexpr int NUM_SQ              = 64;
+    static constexpr int NUM_SLIDERS         = 3;
+    static constexpr int NUM_BLOCKERS        = 10;
+    static constexpr int INPUTS              = 2 * NUM_SLIDERS * NUM_BLOCKERS * NUM_SQ;
+    static constexpr int MAX_ACTIVE_FEATURES = 30;
+
+    static std::pair<int, int>
+    fill_features_sparse(const TrainingDataEntry& e, int* features, Color color) {
+        auto&     pos    = e.pos;
+        const int orient = static_cast<int>(
+          FullThreats::OrientTBL[static_cast<int>(color)][static_cast<int>(pos.kingSquare(color))]);
+        const Color colors[2] = {Color::White, Color::Black};
+        int         k         = 0;
+
+        for (Color king : colors)
+        {
+            const Color  enemy  = king == Color::White ? Color::Black : Color::White;
+            const Square kingSq = pos.kingSquare(king);
+            const auto   queens = pos.piecesBB(Piece(PieceType::Queen, enemy));
+
+            Bitboard snipers =
+              (bb::pseudoAttacks<PieceType::Rook>(kingSq)
+               & (pos.piecesBB(Piece(PieceType::Rook, enemy)) | queens))
+              | (bb::pseudoAttacks<PieceType::Bishop>(kingSq)
+                 & (pos.piecesBB(Piece(PieceType::Bishop, enemy)) | queens));
+            const Bitboard occupancy = pos.piecesBB() ^ snipers;
+
+            for (Square sniper : snipers)
+            {
+                const Bitboard b = bb::between(kingSq, sniper) & occupancy;
+                if (b.count() != 1)
+                    continue;
+
+                const Square square  = b.first();
+                const Piece  blocker = pos.pieceAt(square);
+                if (blocker.type() == PieceType::King)
+                    continue;
+
+                const int king_id   = king != color;
+                const int slider_id = static_cast<int>(pos.pieceAt(sniper).type())
+                                    - static_cast<int>(PieceType::Bishop);
+                const int blocker_id =
+                  static_cast<int>(blocker.type()) * 2 + (blocker.color() != color);
+
+                const int plane = (king_id * NUM_SLIDERS + slider_id) * NUM_BLOCKERS + blocker_id;
+
+                features[k++] = plane * NUM_SQ + (static_cast<int>(square) ^ orient);
+            }
+        }
+
+        return {k, INPUTS};
+    }
+};
+
 struct ComposedFeatureExtractor: IFeatureExtractor {
     std::vector<std::unique_ptr<IFeatureExtractor>> extractors;
     int                                             m_inputs;
@@ -420,6 +479,8 @@ static std::unique_ptr<IFeatureExtractor> make_single_extractor(std::string_view
         return std::make_unique<SimpleExtractor<FullThreats>>();
     if (name == "PP_3Wide")
         return std::make_unique<SimpleExtractor<PP_3Wide>>();
+    if (name == "King_Pins")
+        return std::make_unique<SimpleExtractor<KingPins>>();
     if (name == "K32H3")
         return std::make_unique<SimpleExtractor<K32H3>>();
     return nullptr;

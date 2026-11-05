@@ -8,12 +8,14 @@ import tyro
 from .full_threats import FullThreats
 from .input_feature import InputFeature
 from .k32h3 import K32H3
+from .king_pins import KingPins
 from .pp_3wide import PP3Wide
 
 _FEATURE_COMPONENTS: dict[str, type[InputFeature]] = {
     "K32H3^": K32H3,
     "Full_Threats": FullThreats,
     "PP_3Wide": PP3Wide,
+    "King_Pins": KingPins,
 }
 
 DEFAULT_FEATURES = "Full_Threats+PP_3Wide+K32H3^"
@@ -56,6 +58,7 @@ __all__ = [
     "FeatureConfig",
     "FullThreats",
     "InputFeature",
+    "KingPins",
     "PP3Wide",
     "add_feature_args",
     "get_available_features",
