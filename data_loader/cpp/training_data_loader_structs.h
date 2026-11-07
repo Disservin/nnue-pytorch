@@ -31,6 +31,7 @@ struct DataloaderIOConfig {
     int balance_window_mb;  // sliding window (MiB) for read balancing; <= 0 selects the default
     int
       shuffle_buffer_entries;  // per-worker decode+shuffle buffer (entries); <= 0 selects the default
+    int label_average_plies;  // average each score with this many following plies; 0 = off
 };
 
 struct DataloaderFileStats {

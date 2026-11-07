@@ -146,6 +146,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "thread_safe_types.h"
 #include "binpack.h"
 #include "training_data_entry.h"
+#include "label_averaging.h"
 #include "unique_counter.h"
 #include "compressed_hash.h"
 
@@ -375,6 +376,7 @@ namespace binpack
             m_numRunningWorkers(concurrency),
             m_cyclic(cyclic),
             m_skipPredicate(std::move(skipPredicate)),
+            m_labelAveragePlies(std::clamp(io_config.label_average_plies, 0, ChainLabelAverager::MaxPlies)),
             m_counter(counter),
             m_rank(rank),
             m_world_size(world_size)
@@ -726,32 +728,58 @@ namespace binpack
 
                 bool isEnd = fetchNextChunkFromSharedQueue(m_chunkReader, m_chunk);
 
+                // Applies the filters to one entry and stores it if kept. When
+                // labels are averaged the filters still see the original score.
+                // Returns false if the stream was stopped.
+                const auto store = [&](const TrainingDataEntry& e, const ChainLabelAverager* averager) {
+                    if (m_skipPredicate && m_skipPredicate(e))
+                        return true;
+
+                    scratch.emplace_back(e);
+                    if (averager)
+                        scratch.back().score = averager->averaged_front_score();
+
+                    if (m_counter)
+                    {
+                        keyBuffer.push_back(nnue::hash::hash(e.pos));
+                        if (keyBuffer.size() >= keyFlushThreshold)
+                            flushAll();
+                    }
+                    return scratch.size() < kWorkerScratchEntries || m_pool->append(scratch);
+                };
+
+                ChainLabelAverager averager(m_labelAveragePlies);
+
                 while(!isEnd && !m_stopFlag.load())
                 {
                     const auto e = m_chunkReader.next(m_chunk);
                     if (m_counter) ++preskip_count;
 
-                    if (!m_chunkReader.hasNext(m_chunk))
+                    const bool chunkEnded = !m_chunkReader.hasNext(m_chunk);
+                    if (chunkEnded)
                     {
                         isEnd = fetchNextChunkFromSharedQueue(m_chunkReader, m_chunk);
                     }
 
-                    if (!m_skipPredicate || !m_skipPredicate(e))
+                    if (m_labelAveragePlies == 0)
                     {
-                        scratch.emplace_back(e);
-                        if (m_counter)
+                        if (!store(e, nullptr))
                         {
-                            keyBuffer.push_back(nnue::hash::hash(e.pos));
-                            if (keyBuffer.size() >= keyFlushThreshold)
-                                flushAll();
+                            flushAll();
+                            return; // stopped
                         }
-                        if (scratch.size() >= kWorkerScratchEntries)
+                        continue;
+                    }
+
+                    averager.push(e);
+                    while (averager.ready(chunkEnded))
+                    {
+                        const bool running = store(averager.front(), &averager);
+                        averager.pop();
+                        if (!running)
                         {
-                            if (!m_pool->append(scratch))
-                            {
-                                flushAll();
-                                return; // stopped
-                            }
+                            flushAll();
+                            return; // stopped
                         }
                     }
                 }
@@ -912,6 +940,7 @@ namespace binpack
         // Per File Lock
         std::vector<std::unique_ptr<std::timed_mutex>> m_fileMutexes;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        int m_labelAveragePlies;
         nnue::UniquePositionCounter* m_counter = nullptr;
 
         // ---- Read balancing: sliding window + per-file claims ----

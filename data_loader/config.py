@@ -72,17 +72,24 @@ class DataloaderIOConfig:
     per decode worker, so this no longer dominates host memory. Smaller
     values trade mixing depth for memory. <= 0 selects the default."""
 
+    label_average_plies: int = 0
+    """Train on each position's score averaged, as win probabilities, with the
+    scores of this many following plies of the same game. The binpacks aren't
+    modified, and the filters still see the original score. 0 = disabled."""
+
 
 class CDataloaderIOConfig(ctypes.Structure):
     _fields_ = [
         ("balance_window_mb", ctypes.c_int),
         ("shuffle_buffer_entries", ctypes.c_int),
+        ("label_average_plies", ctypes.c_int),
     ]
 
     def __init__(self, config: DataloaderIOConfig):
         super().__init__(
             balance_window_mb=config.balance_window_mb,
             shuffle_buffer_entries=config.shuffle_buffer_entries,
+            label_average_plies=config.label_average_plies,
         )
 
 
