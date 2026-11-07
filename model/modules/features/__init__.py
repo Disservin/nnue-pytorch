@@ -5,7 +5,7 @@ from typing import Annotated
 
 import tyro
 
-from .full_threats import FullThreats
+from .full_threats import FullThreats, FullThreatsFactorized
 from .input_feature import InputFeature
 from .k32h3 import K32H3
 from .pp_3wide import PP3Wide
@@ -13,6 +13,7 @@ from .pp_3wide import PP3Wide
 _FEATURE_COMPONENTS: dict[str, type[InputFeature]] = {
     "K32H3^": K32H3,
     "Full_Threats": FullThreats,
+    "Full_Threats^": FullThreatsFactorized,
     "PP_3Wide": PP3Wide,
 }
 
@@ -55,6 +56,7 @@ __all__ = [
     "K32H3",
     "FeatureConfig",
     "FullThreats",
+    "FullThreatsFactorized",
     "InputFeature",
     "PP3Wide",
     "add_feature_args",
