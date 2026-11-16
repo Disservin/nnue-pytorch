@@ -64,6 +64,10 @@ one graph. An attempt to compile the entire sharded forward timed out a
 four-rank NCCL correctness test with uneven local batches, so this option is
 not enabled. The tests did not establish the cause of that timeout.
 
+The measured FT merge, tail and loss compilation are now the default for
+CUDA sharded AdamW steps. The distributed forward remains eager; use the
+benchmark's `--eager-sharded` switch for an uncompiled comparison.
+
 The asynchronous prototype submits collectives in the same order on all ranks
 using one process group. It exchanges the next native-packed batch after the
 current forward and before backward, waits before using the result, and keeps
@@ -80,3 +84,68 @@ capture labels asynchronous preparation and completion. Such gaps can include
 profiler effects or untraced operations, and the phase of the next launch does
 not prove what caused a gap. The gap summaries are in
 `nsys_gap_summary.json`, with hardware-source and filesystem metadata omitted.
+
+## Upstream-recipe approximation
+
+On four H100 GPUs, a later live-loader comparison used a checksum-verified
+training binpack from the upstream recipe and the recipe's full remapping
+binpack. The generated table retained 92 of the 192 raw layer stacks. The
+benchmark used the recipe's model dimensions, feature set, position filters,
+one-cycle AdamW parameters, sample jitter, per-step dense weight clipping,
+shuffle-buffer size and one PyTorch CPU thread per rank. It ran after the
+fake-quantization warmup, with a global batch of 131072. **Batch-level lambda
+jitter was disabled in both modes**, because the sharded runner does not yet
+support it; this is therefore not an exact training run. It used one training
+file rather than the full multi-file mixture.
+
+The host allocation had 64 CPUs. Upstream's 32 loader workers per rank would
+produce 128 loader workers, so the comparison instead used 8, 12 or 16 per
+rank. Each number below is a 600-step live window; positions vary between
+runs.
+
+| Trainer | Loader workers/rank | Positions/s | Peak allocated/GPU |
+| --- | ---: | ---: | ---: |
+| Compiled DDP | 12 | 4.80–4.81M | 4.08 GiB |
+| Compiled sharded | 8 | 4.04M | 1.73 GiB |
+| Compiled sharded | 12 | 4.66–4.73M | 1.73 GiB |
+| Compiled sharded, async features | 12 | 4.72M | 1.99 GiB |
+| Compiled sharded | 16 | 4.68M | 1.73 GiB |
+| Compiled DDP | 16 | 5.89M | 4.08 GiB |
+
+The earlier benchmarks used weaker default filtering, a smaller shuffle
+buffer, four PyTorch threads per rank, and did not include the same per-step
+weight clipping and scheduler. Thus the earlier higher throughput is not
+directly comparable. Controlled ablations are needed to determine the cause
+of the difference. The upstream remapping table used here is saved in
+`nettest_stack_remap.txt`; the corresponding benchmark requires explicit
+acknowledgment that batch jitter is disabled.
+
+On a separate four-H200 NVL system with 64 allocated CPUs and 128 visible
+hardware threads, a same-node follow-up used 16 loader workers per rank. DDP
+reached 8.49–8.71M positions/s and compiled sharding 7.60–7.94M; one
+asynchronous sharded run reached 8.02M. One-variable sharded controls reached
+8.22–8.51M when per-step weight clipping was disabled, 7.78–7.85M with the
+earlier benchmark's filters, 7.82–7.93M with four PyTorch CPU threads per
+rank, and 7.89–8.13M with the smaller shuffle buffer. These ranges are from
+two 600-step runs per configuration, except the baseline has three and the
+asynchronous variant one. The filter, thread-count and shuffle
+results overlap the baseline range; disabling weight clipping changed
+training behavior and is only a diagnostic.
+
+With the same H200 workload and settings, the `--eager-sharded` opt-out
+reached 6.41–6.88M positions/s in two runs. Thus the default compilation
+improved this comparison, although the windows still show variability.
+
+With 12 loader workers per rank on the H200 system, one DDP run reached 6.91M
+positions/s and a rank spent 5.60 seconds acquiring batches during an
+11.38-second measurement window. Its 16-worker run spent substantially less
+host time acquiring batches and reached 8.49M, indicating that loader
+imbalance can significantly limit throughput. Host acquisition time does not
+measure all GPU-side waits. The H200 and H100 systems differ, so these results
+do not isolate the cause of the H100 slowdown.
+
+Restricting the H200 job to 32 physical cores / 64 hardware threads on the
+same node yielded 8.38M positions/s for DDP and 6.99M for sharding with 16
+loader workers per rank (one run each). At 12 workers, the respective figures
+were 7.44M and 7.47M. CPU affinity and concurrent activity can affect these
+results; the restricted-core run is not a reproduction of the H100 host.
