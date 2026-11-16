@@ -31,7 +31,7 @@ def summarize(path):
     ranges = [(s, e, tid, text or strings.get(text_id, ""))
               for s, e, tid, text, text_id in con.execute(
                   "SELECT start,end,globalTid,text,textId FROM NVTX_EVENTS WHERE end IS NOT NULL"
-              ) if (text or strings.get(text_id, "")).startswith("phase:")]
+              ) if (text or strings.get(text_id, "")).startswith(("phase:", "step:"))]
     events.sort()
     merged_end = events[0][1]
     busy = 0

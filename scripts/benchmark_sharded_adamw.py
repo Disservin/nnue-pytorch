@@ -7,6 +7,7 @@ gradient synchronization, clipping, and the optimizer update.
 
 import argparse
 from contextlib import nullcontext
+import functools
 import json
 import os
 import statistics
@@ -88,6 +89,8 @@ def main():
                         help="Override the upstream loader shuffle-buffer size")
     parser.add_argument("--nettest-ablate-weight-clipping", action="store_true",
                         help="Skip per-step weight clipping for a controlled comparison")
+    parser.add_argument("--ablate-gradient-clipping", action="store_true",
+                        help="Skip gradient-norm clipping; diagnostic only, not equivalent training")
     parser.add_argument("--live-loader", action="store_true",
                         help="Include asynchronous binpack loading in each timed step")
     parser.add_argument("--throughput-window", action="store_true",
@@ -273,6 +276,11 @@ def main():
         active = 64
     if native_requested and not args.live_loader:
         batch = pack_saved_batch(batch)
+    def phase(name):
+        if args.nsys_capture:
+            return torch.cuda.nvtx.range(name)
+        return torch.profiler.record_function(name) if args.profile else nullcontext()
+
     if args.mode == "ddp":
         if args.compile_ddp:
             torch._dynamo.config.cache_size_limit = 64
@@ -300,9 +308,6 @@ def main():
             ddp.register_comm_hook(dist.group.WORLD,
                                    make_diagnostic_hook(nnue.model, args.ddp_gradient_mode, bucket_info))
 
-        def phase(name):
-            return torch.profiler.record_function(name) if args.profile else nullcontext()
-
         def train_step():
             nonlocal ddp_step
             bucket_info.clear()
@@ -310,20 +315,24 @@ def main():
             us, them, white, black, _, _, stacks = batch
             with phase("step:ddp_forward"):
                 output = ddp(us, them, white, black, stacks, True, True)
+            with phase("step:ddp_loss"):
                 loss = nnue.compute_loss_with_scorenet(output, batch, ddp_step if args.nettest_settings else 0)
             with phase("step:ddp_backward"):
                 loss.backward()
             with phase("step:ddp_clip"):
-                torch.nn.utils.clip_grad_norm_(nnue.model.parameters(), 2.0)
+                if not args.ablate_gradient_clipping:
+                    torch.nn.utils.clip_grad_norm_(nnue.model.parameters(), 2.0)
             with phase("step:ddp_optimizer"):
                 optimizer.step()
             if args.nettest_settings:
                 from trainer.engine import is_one_cycle
-                for scheduler in schedulers:
-                    if is_one_cycle(scheduler):
-                        scheduler.step()
+                with phase("step:ddp_scheduler"):
+                    for scheduler in schedulers:
+                        if is_one_cycle(scheduler):
+                            scheduler.step()
                 if not args.nettest_ablate_weight_clipping:
-                    nnue.model.clip_weights(include_input=False)
+                    with phase("step:ddp_weight_clip"):
+                        nnue.model.clip_weights(include_input=False)
             ddp_step += 1
             return loss.detach()
     else:
@@ -339,14 +348,28 @@ def main():
         if os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1":
             nnue.enable_compiled_loss()
         runner = ShardedAdamWStep(
-            nnue, gradient_clip_val=2.0,
+            nnue, gradient_clip_val=None if args.ablate_gradient_clipping else 2.0,
             compile_model=False if args.eager_sharded or profile_compile else None,
         )
+        if args.nsys_capture:
+            def mark_method(obj, name, label):
+                original = getattr(obj, name)
+                @functools.wraps(original)
+                def marked(*call_args, **call_kwargs):
+                    with phase(label):
+                        return original(*call_args, **call_kwargs)
+                setattr(obj, name, marked)
+
+            mark_method(nnue.model.input, "merged_weight_and_bias", "step:sharded_ft_merge")
+            mark_method(nnue.model.layer_stacks, "forward_from_l1", "step:sharded_tail")
+            mark_method(nnue, "compute_loss_components_with_scorenet", "step:sharded_loss")
 
         def train_step(global_batch=None, after_forward=None):
-            result = runner.step(batch, global_batch=global_batch, after_forward=after_forward)
+            with phase("step:sharded_train"):
+                result = runner.step(batch, global_batch=global_batch, after_forward=after_forward)
             if args.nettest_settings and not args.nettest_ablate_weight_clipping:
-                nnue.model.clip_weights(include_input=False)
+                with phase("step:sharded_weight_clip"):
+                    nnue.model.clip_weights(include_input=False)
             return result
 
     if args.throughput_window:
@@ -370,7 +393,8 @@ def main():
         def one_step(index):
             nonlocal batch, pipeline_batch, pipeline_pending
             if not args.async_features:
-                batch = live_loader[index + 1]
+                with phase("step:loader_acquire"):
+                    batch = live_loader[index + 1]
                 return train_step()
             batch = pipeline_batch
             nvtx = (torch.cuda.nvtx.range("phase:async_feature_finish")
@@ -410,7 +434,8 @@ def main():
                 before.record()
             if args.measure_loader_wait:
                 wait_started = time.perf_counter()
-            batch = live_loader[args.warmup + i + 1]
+            with phase("step:loader_acquire"):
+                batch = live_loader[args.warmup + i + 1]
             if args.measure_loader_wait:
                 host_loader_wait.append(time.perf_counter() - wait_started)
             if args.measure_input_device_wait:
@@ -459,6 +484,7 @@ def main():
                               "features": config.features,
                               "nettest_filter_ablation": args.nettest_ablate_filters,
                               "nettest_weight_clipping_ablation": args.nettest_ablate_weight_clipping,
+                              "gradient_clipping_ablation": args.ablate_gradient_clipping,
                               "torch_threads_per_rank": torch.get_num_threads(),
                               "shuffle_buffer_entries": loader_io.shuffle_buffer_entries,
                               "loader_workers_per_rank": args.loader_workers,
