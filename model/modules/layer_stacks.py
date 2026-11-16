@@ -32,7 +32,12 @@ def stack_count(keys: list[str]) -> int:
 
 class LayerStacks(nn.Module):
     def __init__(
-        self, count: int, config: LayerStacksConfig, quantization: QuantizationManager
+        self,
+        count: int,
+        config: LayerStacksConfig,
+        quantization: QuantizationManager,
+        *,
+        l1_factory=None,
     ):
         super().__init__()
 
@@ -60,8 +65,10 @@ class LayerStacks(nn.Module):
         # there's a non-linearity and factorization breaks.
         # This is by design. The weights in the further layers should be
         # able to diverge a lot.
-        self.l1 = FactorizedStackedLinear(
-            2 * self.L1 // 2, self.L2, raw_count, quantization, "ls_l1"
+        self.l1 = (
+            FactorizedStackedLinear(self.L1, self.L2, raw_count, quantization, "ls_l1")
+            if l1_factory is None
+            else l1_factory(self.L1, self.L2, raw_count, quantization)
         )
         self.l2 = StackedLinear(self.L2 * 2, self.L3, raw_count, quantization, "ls_l2")
 
@@ -91,6 +98,19 @@ class LayerStacks(nn.Module):
         fake_quantize_weights: bool = True,
     ):
         l1c_ = self.l1(x, ls_indices, fake_quantize_weights)
+
+        return self.forward_from_l1(
+            l1c_, ls_indices, fake_quantize_acts, fake_quantize_weights
+        )
+
+    def forward_from_l1(
+        self,
+        l1c_: torch.Tensor,
+        ls_indices: torch.Tensor,
+        fake_quantize_acts: bool = True,
+        fake_quantize_weights: bool = True,
+    ):
+        """Run the local data-parallel tail after the L1 linear sum and bias."""
 
         # Extract the short-path skip connection before fake quantization
         l1x_out = l1c_[:, -2].view(-1, 1) - l1c_[:, -1].view(-1, 1)

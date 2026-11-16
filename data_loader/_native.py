@@ -30,6 +30,38 @@ class SparseBatch(ctypes.Structure):
         ("packed", ctypes.POINTER(ctypes.c_int)),
     ]
 
+    def get_packed_tensors(self, device, use_pinned_memory=False):
+        """Return the seven-field sharded batch with owned native packed IDs.
+
+        The dictionary in the white-indices slot is intended only for the
+        sharded loader; ordinary data-parallel consumers use get_tensors.
+        """
+        n, width = self.size, self.max_active_features
+        nw, nb = self.num_active_white_features, self.num_active_black_features
+        pin = bool(use_pinned_memory and torch.cuda.is_available())
+        packed = copy_to_device(
+            torch.from_numpy(np.ctypeslib.as_array(self.packed, shape=(3 * n + 2 + nw + nb,))),
+            device,
+            use_pinned_memory,
+        )
+        floats = torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(3 * n,)))
+        floats = copy_to_device(floats, device, use_pinned_memory)
+        us = floats[:n].view(n, 1)
+        outcome = floats[n:2*n].view(n, 1)
+        score = floats[2*n:3*n].view(n, 1)
+        if pin and not us.is_cuda:
+            them = torch.empty_like(us, pin_memory=True)
+            them.fill_(1.0)
+            them.sub_(us)
+            stacks = torch.empty(n, dtype=torch.int64, pin_memory=True)
+            stacks.copy_(packed[2*(n+1)+nw+nb:])
+        else:
+            them = 1.0 - us
+            stacks = packed[2*(n+1)+nw+nb:].to(torch.int64)
+        native = {"format": "native_offsets_v1", "packed": packed,
+                  "size": n, "width": width, "nw": nw, "nb": nb}
+        return us, them, native, None, outcome, score, stacks
+
     def get_tensors(
         self,
         device: str | torch.device,

@@ -19,6 +19,31 @@ from .config import (
 )
 
 
+
+# A packed sharded batch (SparseBatchProvider(packed_sharded=True)) holds a dict and None
+# among its tensors.
+def _recursive_to_device(obj, device, non_blocking=False):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device=device, non_blocking=non_blocking)
+    if isinstance(obj, dict):
+        return {k: _recursive_to_device(v, device, non_blocking) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_recursive_to_device(v, device, non_blocking) for v in obj)
+    return obj
+
+
+def _recursive_record_stream(obj, stream):
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            obj.record_stream(stream)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _recursive_record_stream(value, stream)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            _recursive_record_stream(value, stream)
+
+
 class FenBatchProvider:
     """Batches of FEN strings from one binpack."""
 
@@ -83,6 +108,7 @@ class SparseBatchProvider:
         use_pinned_memory: bool = False,
         device: str | torch.device = "cpu",
         ls_keys: str = DEFAULT_LS_KEYS,
+        packed_sharded: bool = False,
     ):
         self.feature_set = feature_set
         self.filenames = filenames
@@ -96,6 +122,8 @@ class SparseBatchProvider:
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.ls_keys = ls_keys
+        # Return the packed IDs as-is for the sharded model (get_packed_tensors).
+        self.packed_sharded = packed_sharded
         # Time spent waiting for the C++ decoder workers, summed over all callers.
         self.native_fetch_s = 0.0
         self._stream = None
@@ -136,9 +164,12 @@ class SparseBatchProvider:
             raise StopIteration
         try:
             # Copies everything off the native batch before it is freed.
-            return v.contents.get_tensors(
-                self.device, use_pinned_memory=self.use_pinned_memory
+            convert = (
+                v.contents.get_packed_tensors
+                if self.packed_sharded
+                else v.contents.get_tensors
             )
+            return convert(self.device, use_pinned_memory=self.use_pinned_memory)
         finally:
             stream.destroy_sparse_batch(v)
 
@@ -356,8 +387,8 @@ class DevicePrefetcher:
                                 stats.add_producer(producer_fetch_s=fetch_s)
                                 finish()
                                 break
-                            item = tuple(
-                                t.to(prefetch_device, non_blocking=True) for t in item
+                            item = _recursive_to_device(
+                                tuple(item), prefetch_device, non_blocking=True
                             )
                             if prefetch_hook is not None:
                                 try:
@@ -461,8 +492,7 @@ class DevicePrefetcher:
         if isinstance(item, _ReadyBatch):
             current_stream = torch.cuda.current_stream(device=self._prefetch_device)
             current_stream.wait_event(item.ready_event)
-            for t in item.tensors:
-                t.record_stream(current_stream)
+            _recursive_record_stream(item.tensors, current_stream)
             return item.tensors
         return item
 

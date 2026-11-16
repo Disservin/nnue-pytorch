@@ -20,6 +20,7 @@
 #include "lib/nnue_training_data_stream.h"
 #include "lib/unique_counter.h"
 #include "training_data_loader_structs.h"
+#include "compact_board.h"
 
 struct IFeatureExtractor {
     virtual ~IFeatureExtractor()                                               = default;
@@ -28,6 +29,8 @@ struct IFeatureExtractor {
     virtual std::pair<int, int> fill_features_sparse(const struct binpack::TrainingDataEntry& e,
                                                      int*         features,
                                                      chess::Color color) const = 0;
+    virtual std::pair<int, int> fill_features_compact(const CompactFeatureBoard& board,
+                                                      int* features, chess::Color color) const = 0;
 };
 
 std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name);
@@ -38,10 +41,12 @@ struct LayerStackKeys {
     struct Key {
         int states;
         int (*value)(const chess::Position& pos);
+        int (*compact_value)(const CompactFeatureBoard& pos);
     };
     std::vector<Key> keys;
 
     int index(const chess::Position& pos) const;
+    int index(const CompactFeatureBoard& pos) const;
 };
 
 std::optional<LayerStackKeys> get_layer_stack_keys(std::string_view names);
@@ -75,6 +80,9 @@ struct SparseBatch final {
                 const LayerStackKeys&                                 ls_keys,
                 const std::vector<struct binpack::TrainingDataEntry>& entries,
                 std::shared_ptr<SparseBatchBufferPool>                buffer_pool = nullptr);
+    // Decode compact records directly into their final feature rows.
+    SparseBatch(const IFeatureExtractor& feature_set, const LayerStackKeys& ls_keys,
+                const std::uint8_t* records, std::size_t count, int workers, bool direct);
     ~SparseBatch();
 
     // See unpack_sparse_batch.
