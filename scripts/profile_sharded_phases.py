@@ -49,9 +49,6 @@ if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
 if os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1":
     from experimental_bias_add import bucketed_bias_add
     sharded_l1._add_local_bias = bucketed_bias_add
-if os.environ.get("NNUE_PROFILE_FOREACH_CLIP") == "1":
-    from experimental_foreach_clip import foreach_sharded_clip
-    trainer.clip_sharded_grad_norm_ = foreach_sharded_clip
 if os.environ.get("NNUE_PROFILE_FT_BACKWARD") in ("direct", "aggregated"):
     mode = os.environ["NNUE_PROFILE_FT_BACKWARD"]
     def ft_selector(width, batch, active, device):
