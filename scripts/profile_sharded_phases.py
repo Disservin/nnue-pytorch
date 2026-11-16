@@ -63,10 +63,17 @@ if os.environ.get("NNUE_PROFILE_FT_BACKWARD") in ("direct", "aggregated"):
         ft_functions._aggregated_tile_size = lambda *args: tile
 wrap(model, "gather_packed_features", "phase:feature_gather_total")
 wrap(features, "_unpack_rows", "phase:feature_unpack")
-wrap(ComposedFeatureTransformer, "merged_weight_and_bias", "phase:ft_merge_quantize")
+profile_compile_override = any(os.environ.get(key) == "1" for key in (
+    "NNUE_PROFILE_COMPILE_FT_MERGE", "NNUE_PROFILE_COMPILE_TAIL", "NNUE_PROFILE_COMPILE_LOSS"
+))
+# The default runner compiles these bound methods per instance. Wrapping them
+# here would make full-graph compilation trace profiler/NVTX context managers.
+if profile_compile_override or "--eager-sharded" in sys.argv:
+    wrap(ComposedFeatureTransformer, "merged_weight_and_bias", "phase:ft_merge_quantize")
 wrap(ComposedFeatureTransformer, "forward", "phase:ft_forward_total")
 wrap(ShardedL1, "forward", "phase:sharded_l1_forward")
-wrap(LayerStacks, "forward_from_l1", "phase:tail_forward")
+if profile_compile_override or "--eager-sharded" in sys.argv:
+    wrap(LayerStacks, "forward_from_l1", "phase:tail_forward")
 wrap(backward, "global_weighted_loss", "phase:loss_denominator")
 wrap(backward, "synchronize_replicated_gradients", "phase:replica_grad_sync")
 wrap(trainer, "backward_weighted_loss", "phase:backward_total")
@@ -102,6 +109,7 @@ if os.environ.get("NNUE_PROFILE_CACHE_FEATURES") == "1":
 if os.environ.get("NNUE_PROFILE_SKIP_CLIP") == "1":
     trainer.clip_sharded_grad_norm_ = lambda *args, **kwargs: None
 
+os.environ["NNUE_PROFILE_WRAPPER"] = "1"
 runpy.run_path(os.path.join(os.path.dirname(__file__), "benchmark_sharded_adamw.py"),
                run_name="__main__")
 if gather_wall_times:

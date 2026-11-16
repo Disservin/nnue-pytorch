@@ -158,6 +158,22 @@ def test_reject_non_adamw():
         NNUE(config, sharding=(0, 1))
 
 
+def test_compilation_selection_on_cpu(monkeypatch):
+    monkeypatch.setattr(sharded_model_module, "get_feature_cls", lambda _: [_Feature])
+    calls = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: calls.append(kwargs) or fn)
+    eager = NNUE(_config(), sharding=(0, 1))
+    assert not ShardedAdamWStep(eager).compile_model
+    assert not calls
+    requested = NNUE(_config(), sharding=(0, 1))
+    monkeypatch.setattr(requested, "enable_compiled_loss", lambda: calls.append("loss"))
+    assert ShardedAdamWStep(requested, compile_model=True).compile_model
+    assert calls == [{"fullgraph": True}, {}, "loss"]
+    invalid = NNUE(_config(), sharding=(0, 1))
+    with pytest.raises(TypeError, match="compile_model"):
+        ShardedAdamWStep(invalid, compile_model="yes")
+
+
 def test_real_features_allocate_only_shard_width():
     config = _config()
     config.features = "Full_Threats+PP_3Wide+K32H3^"
