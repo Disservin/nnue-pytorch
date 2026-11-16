@@ -70,9 +70,24 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument(
-        "--binpack", help="Use one native-loader batch rather than synthetic features"
+        "--binpack", nargs="+", help="Use native-loader binpack files rather than synthetic features"
     )
-    parser.add_argument("--loader-workers", type=int, default=8)
+    parser.add_argument("--loader-workers", type=int,
+                        help="Native loader workers per rank (default: 8; nettest settings: 32)")
+    parser.add_argument("--nettest-settings", action="store_true",
+                        help="Use the upstream nettest model, optimizer and filter settings")
+    parser.add_argument("--nettest-remap-data", help="Nettest's stack-remapping binpack")
+    parser.add_argument("--nettest-remap-cache", help="Read or create a cached stack-remapping table")
+    parser.add_argument("--nettest-disable-batch-jitter", action="store_true",
+                        help="Acknowledge the sharded runner cannot yet match nettest batch jitter")
+    parser.add_argument("--nettest-ablate-filters", action="store_true",
+                        help="Use the earlier benchmark's filtering for a controlled comparison")
+    parser.add_argument("--nettest-torch-threads", type=int,
+                        help="Override nettest's one PyTorch CPU thread per rank")
+    parser.add_argument("--nettest-shuffle-entries", type=int,
+                        help="Override the upstream loader shuffle-buffer size")
+    parser.add_argument("--nettest-ablate-weight-clipping", action="store_true",
+                        help="Skip per-step weight clipping for a controlled comparison")
     parser.add_argument("--live-loader", action="store_true",
                         help="Include asynchronous binpack loading in each timed step")
     parser.add_argument("--throughput-window", action="store_true",
@@ -94,6 +109,8 @@ def main():
         action="store_true",
         help="Compile the DDP model and loss as train.py does",
     )
+    parser.add_argument("--eager-sharded", action="store_true",
+                        help="Disable the default compilation of sharded local components")
     parser.add_argument(
         "--profile", action="store_true", help="Profile one additional step"
     )
@@ -105,8 +122,32 @@ def main():
     parser.add_argument("--ddp-freeze-weights", action="store_true",
                         help="Set DDP optimizer learning rates to zero for fixed-weight diagnostics")
     args = parser.parse_args()
+    if args.nettest_settings and not args.nettest_disable_batch_jitter:
+        raise ValueError("nettest's batch jitter is unsupported; explicitly pass --nettest-disable-batch-jitter")
+    if args.nettest_settings and not args.nettest_remap_data and not (
+        args.nettest_remap_cache and os.path.isfile(args.nettest_remap_cache)
+    ):
+        raise ValueError("nettest settings require --nettest-remap-data or an existing remap cache")
+    if args.nettest_settings and (not args.live_loader or args.global_batch not in (131072, 65536)):
+        raise ValueError("nettest settings require a live batch of 131072 or 65536")
+    if not args.nettest_settings and (args.nettest_ablate_filters or args.nettest_torch_threads is not None
+                                      or args.nettest_shuffle_entries is not None or args.nettest_ablate_weight_clipping):
+        raise ValueError("nettest ablations require --nettest-settings")
+    if args.nettest_torch_threads is not None and args.nettest_torch_threads < 1:
+        raise ValueError("--nettest-torch-threads must be positive")
+    if args.nettest_shuffle_entries is not None and args.nettest_shuffle_entries < 1:
+        raise ValueError("--nettest-shuffle-entries must be positive")
+    if args.loader_workers is None:
+        args.loader_workers = 32 if args.nettest_settings else 8
     if args.compile_ddp and args.mode != "ddp":
         raise ValueError("--compile-ddp applies only to the DDP baseline")
+    if args.eager_sharded and args.mode != "sharded":
+        raise ValueError("--eager-sharded applies only to sharded mode")
+    profile_compile = any(os.environ.get(key) == "1" for key in (
+        "NNUE_PROFILE_COMPILE_FT_MERGE", "NNUE_PROFILE_COMPILE_TAIL", "NNUE_PROFILE_COMPILE_LOSS"
+    ))
+    if args.eager_sharded and profile_compile:
+        raise ValueError("--eager-sharded cannot be combined with profiling compilation overrides")
     if args.ddp_gradient_mode != "normal" and args.mode != "ddp":
         raise ValueError("DDP communication diagnostics require ddp mode")
     if args.ddp_freeze_weights and (args.mode != "ddp" or args.live_loader):
@@ -139,19 +180,48 @@ def main():
     world = dist.get_world_size()
     if args.global_batch % world:
         raise ValueError("global batch must be divisible by the process count")
-    torch.set_num_threads(4)
+    torch.set_num_threads((args.nettest_torch_threads or 1) if args.nettest_settings else 4)
     torch.backends.cuda.matmul.allow_tf32 = True
-    config = NNUEConfig(
-        model_config=ModelConfig(L1=1024, L2=32, L3=32),
-        optimizer_config=OptimizerConfig(
-            optimizer_name="adamw", adamw_fused=True, factorized_weight_decay=4e-5
-        ),
-    )
-    torch.manual_seed(2026)
+    if args.nettest_settings:
+        from nettest_benchmark_settings import make_nettest_settings
+        from model.modules.layer_stacks import STACK_KEY_STATES, stack_count, stack_keys
+        from model.modules.stack_table import count_stacks, fallback_table, table_to_str
+        keys = stack_keys(ModelConfig().ls_keys)
+        if args.nettest_remap_cache and os.path.isfile(args.nettest_remap_cache):
+            cached = [None]
+            if rank == 0:
+                with open(args.nettest_remap_cache, encoding="utf-8") as cache:
+                    cached[0] = cache.read().strip()
+            dist.broadcast_object_list(cached, src=0)
+            remap = cached[0]
+        else:
+            counts = count_stacks(args.nettest_remap_data, ModelConfig().ls_keys,
+                                  stack_count(keys), args.loader_workers)
+            total_counts = torch.from_numpy(counts).to(device=rank)
+            dist.all_reduce(total_counts)
+            remap = table_to_str(fallback_table(total_counts.cpu().numpy(), keys, STACK_KEY_STATES, 50))
+            if args.nettest_remap_cache and rank == 0:
+                with open(args.nettest_remap_cache, "x", encoding="utf-8") as cache:
+                    cache.write(remap + "\n")
+        config, loader_config, loader_io = make_nettest_settings(remap)
+        if args.nettest_ablate_filters:
+            loader_config = DataloaderSkipConfig()
+        if args.nettest_shuffle_entries is not None:
+            loader_io.shuffle_buffer_entries = args.nettest_shuffle_entries
+    else:
+        config = NNUEConfig(
+            model_config=ModelConfig(L1=1024, L2=32, L3=32),
+            optimizer_config=OptimizerConfig(
+                optimizer_name="adamw", adamw_fused=True, factorized_weight_decay=4e-5
+            ),
+        )
+        loader_config = DataloaderSkipConfig()
+        loader_io = DataloaderIOConfig(shuffle_buffer_entries=131072)
+    torch.manual_seed(1 if args.nettest_settings else 2026)
     nnue = NNUE(
         config,
-        max_epoch=2,
-        num_batches_per_epoch=100,
+        max_epoch=560 if args.nettest_settings else 2,
+        num_batches_per_epoch=1073741824 // args.global_batch if args.nettest_settings else 100,
         sharding=(rank, world) if args.mode == "sharded" else None,
     ).cuda(rank)
     live_loader = None
@@ -160,10 +230,10 @@ def main():
         raise ValueError("native packed benchmark input requires sharded mode")
     if args.live_loader:
         dataset = SparseBatchDataset(
-            nnue.model.input_feature_name, [args.binpack], args.global_batch // world,
-            num_workers=args.loader_workers, config=DataloaderSkipConfig(),
+            nnue.model.input_feature_name, args.binpack, args.global_batch // world,
+            num_workers=args.loader_workers, config=loader_config,
             ddp_config=DataloaderDDPConfig(rank=rank, world_size=world),
-            io_config=DataloaderIOConfig(shuffle_buffer_entries=131072),
+            io_config=loader_io,
             packed_sharded=native_requested,
         )
         live_loader = FixedNumBatchesDataset(dataset, num_batches=args.warmup + args.steps + 2,
@@ -181,12 +251,12 @@ def main():
     elif args.binpack:
         provider = SparseBatchProvider(
             nnue.model.input_feature_name,
-            [args.binpack],
+            args.binpack,
             args.global_batch // world,
             num_workers=args.loader_workers,
-            config=DataloaderSkipConfig(),
+            config=loader_config,
             ddp_config=DataloaderDDPConfig(rank=rank, world_size=world),
-            io_config=DataloaderIOConfig(shuffle_buffer_entries=131072),
+            io_config=loader_io,
             device=torch.device("cuda", rank),
         )
         batch = next(provider)
@@ -208,7 +278,10 @@ def main():
             torch._dynamo.config.cache_size_limit = 64
             nnue.model = torch.compile(nnue.model, backend="inductor")
             nnue.enable_compiled_loss()
-        optimizer = nnue.configure_optimizers()[0][0]
+        optimizers, scheduler_specs = nnue.configure_optimizers()
+        optimizer = optimizers[0]
+        schedulers = [s.get("scheduler", s) if isinstance(s, dict) else s for s in scheduler_specs]
+        ddp_step = 0
         if args.ddp_freeze_weights:
             for group in optimizer.param_groups:
                 group["lr"] = 0.0
@@ -231,26 +304,50 @@ def main():
             return torch.profiler.record_function(name) if args.profile else nullcontext()
 
         def train_step():
+            nonlocal ddp_step
             bucket_info.clear()
             optimizer.zero_grad(set_to_none=True)
             us, them, white, black, _, _, stacks = batch
             with phase("step:ddp_forward"):
                 output = ddp(us, them, white, black, stacks, True, True)
-                loss = nnue.compute_loss_with_scorenet(output, batch, 0)
+                loss = nnue.compute_loss_with_scorenet(output, batch, ddp_step if args.nettest_settings else 0)
             with phase("step:ddp_backward"):
                 loss.backward()
             with phase("step:ddp_clip"):
                 torch.nn.utils.clip_grad_norm_(nnue.model.parameters(), 2.0)
             with phase("step:ddp_optimizer"):
                 optimizer.step()
+            if args.nettest_settings:
+                from trainer.engine import is_one_cycle
+                for scheduler in schedulers:
+                    if is_one_cycle(scheduler):
+                        scheduler.step()
+                if not args.nettest_ablate_weight_clipping:
+                    nnue.model.clip_weights(include_input=False)
+            ddp_step += 1
             return loss.detach()
     else:
+        if profile_compile and os.environ.get("NNUE_PROFILE_WRAPPER") != "1":
+            if os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1":
+                nnue.model.input.merged_weight_and_bias = torch.compile(
+                    nnue.model.input.merged_weight_and_bias, fullgraph=True
+                )
+            if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
+                nnue.model.layer_stacks.forward_from_l1 = torch.compile(
+                    nnue.model.layer_stacks.forward_from_l1
+                )
         if os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1":
             nnue.enable_compiled_loss()
-        runner = ShardedAdamWStep(nnue, gradient_clip_val=2.0)
+        runner = ShardedAdamWStep(
+            nnue, gradient_clip_val=2.0,
+            compile_model=False if args.eager_sharded or profile_compile else None,
+        )
 
         def train_step(global_batch=None, after_forward=None):
-            return runner.step(batch, global_batch=global_batch, after_forward=after_forward)
+            result = runner.step(batch, global_batch=global_batch, after_forward=after_forward)
+            if args.nettest_settings and not args.nettest_ablate_weight_clipping:
+                nnue.model.clip_weights(include_input=False)
+            return result
 
     if args.throughput_window:
         pipeline_batch = pipeline_pending = feature_stream = None
@@ -356,10 +453,23 @@ def main():
             print(json.dumps({"mode": args.mode, "world_size": world,
                               "global_batch": args.global_batch, "steps": args.steps,
                               "live_loader": True, "throughput_window": True,
+                              "nettest_settings": args.nettest_settings,
+                              "nettest_batch_jitter_disabled": args.nettest_settings,
+                              "nettest_quantization_phase": "post_warmup" if args.nettest_settings else None,
+                              "features": config.features,
+                              "nettest_filter_ablation": args.nettest_ablate_filters,
+                              "nettest_weight_clipping_ablation": args.nettest_ablate_weight_clipping,
+                              "torch_threads_per_rank": torch.get_num_threads(),
+                              "shuffle_buffer_entries": loader_io.shuffle_buffer_entries,
+                              "loader_workers_per_rank": args.loader_workers,
+                              "stored_layer_stacks": nnue.model.layer_stacks.count,
                               "async_features": args.async_features,
-                              "compiled": args.compile_ddp, "gpu": torch.cuda.get_device_name(rank),
-                              "compiled_sharded_tail": os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1" if args.mode == "sharded" else None,
-                              "compiled_sharded_loss": os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1" if args.mode == "sharded" else None,
+                              "compiled": (args.compile_ddp if args.mode == "ddp" else
+                                           runner.compile_model or profile_compile),
+                              "gpu": torch.cuda.get_device_name(rank),
+                              "compiled_sharded_ft_merge": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1") if args.mode == "sharded" else None,
+                              "compiled_sharded_tail": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1") if args.mode == "sharded" else None,
+                              "compiled_sharded_loss": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1") if args.mode == "sharded" else None,
                               "elapsed_seconds": elapsed.item(),
                               "positions_per_second": args.global_batch * args.steps / elapsed.item(),
                               "host_loader_wait_by_rank": wait_by_rank,
@@ -410,7 +520,11 @@ def main():
                     "live_loader": args.live_loader,
                     "loader_wait_seconds": loader_wait_times if args.live_loader else None,
                     "training_seconds": training_times if args.live_loader else None,
-                    "compiled": args.compile_ddp,
+                    "compiled": (args.compile_ddp if args.mode == "ddp" else
+                                 runner.compile_model or profile_compile),
+                    "compiled_sharded_ft_merge": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1") if args.mode == "sharded" else None,
+                    "compiled_sharded_tail": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1") if args.mode == "sharded" else None,
+                    "compiled_sharded_loss": (runner.compile_model or os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1") if args.mode == "sharded" else None,
                     "ddp_gradient_mode": args.ddp_gradient_mode if args.mode == "ddp" else None,
                     "ddp_freeze_weights": args.ddp_freeze_weights if args.mode == "ddp" else None,
                     "ddp_buckets": list(bucket_info.values()) if args.mode == "ddp" else None,

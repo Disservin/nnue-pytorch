@@ -40,8 +40,8 @@ def main():
     torch.manual_seed(2026)
     candidate = NNUE(cfg, max_epoch=2, num_batches_per_epoch=100, sharding=(rank, world)).cuda(rank)
     candidate.load_state_dict(baseline.state_dict())
-    runner0 = ShardedAdamWStep(baseline, gradient_clip_val=2.0)
-    runner1 = ShardedAdamWStep(candidate, gradient_clip_val=2.0)
+    runner0 = ShardedAdamWStep(baseline, gradient_clip_val=2.0, compile_model=False)
+    runner1 = ShardedAdamWStep(candidate, gradient_clip_val=2.0, compile_model=False)
     batch = tuple(t.cuda(rank) for t in torch.load(
         os.path.join(args.batch_dir, f"batch-{rank}-{args.batch}.pt"),
         map_location="cpu", weights_only=True))

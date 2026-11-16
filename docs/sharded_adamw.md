@@ -14,6 +14,15 @@ Every rank must call `step(local_loader_batch)` in the same order. The returned
 tensor is the global weighted loss. The caller is responsible for epoch-based
 scheduler steps and the existing weight-clipping callbacks.
 
+When the model is on CUDA, `ShardedAdamWStep` compiles FT weight merging, the
+post-L1 tail and the loss by default. The distributed forward and collectives
+remain eager. Pass `compile_model=False` to keep those local components eager;
+CPU runs default to eager, while `compile_model=True` explicitly enables
+compilation. Construct the runner after moving the model to its final device.
+Compilation is lazy, and different batch shapes or quantization settings may
+require additional warmup. Checkpoints can be loaded between eager and compiled
+runners.
+
 `state_dict()` is a normal shallow PyTorch snapshot: serialize or deep-copy it
 before further updates. Save a separate state for every process-group rank.
 `load_state_dict` requires the same rank, world size, configuration, parameter

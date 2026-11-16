@@ -15,7 +15,7 @@ from trainer.engine import is_one_cycle
 
 
 class ShardedAdamWStep:
-    def __init__(self, nnue, *, group=None, gradient_clip_val=2.0):
+    def __init__(self, nnue, *, group=None, gradient_clip_val=2.0, compile_model: bool | None = None):
         if not isinstance(nnue.model, ShardedNNUEModel):
             raise TypeError(
                 "ShardedAdamWStep requires a directly constructed sharded NNUE"
@@ -49,6 +49,10 @@ class ShardedAdamWStep:
             self.sharded
         ) + len(self.replicated):
             raise ValueError("sharded and replicated parameters must be disjoint")
+        device = next(nnue.parameters()).device
+        if compile_model is not None and not isinstance(compile_model, bool):
+            raise TypeError("compile_model must be a bool or None")
+        self.compile_model = device.type == "cuda" if compile_model is None else compile_model
         # Replicas may have been created with different process seeds. Broadcast
         # them before creating optimizer state; never broadcast shard weights.
         if self.world > 1:
@@ -58,6 +62,16 @@ class ShardedAdamWStep:
                     dist.broadcast(p, src=src, group=group)
                 for buffer in nnue.model.layer_stacks.buffers():
                     dist.broadcast(buffer, src=src, group=group)
+        if self.compile_model:
+            # Compile only the tested, local pieces. The distributed forward
+            # itself includes collectives and remains eager.
+            nnue.model.input.merged_weight_and_bias = torch.compile(
+                nnue.model.input.merged_weight_and_bias, fullgraph=True
+            )
+            nnue.model.layer_stacks.forward_from_l1 = torch.compile(
+                nnue.model.layer_stacks.forward_from_l1
+            )
+            nnue.enable_compiled_loss()
         optimizers, schedulers = nnue.configure_optimizers()
         if len(optimizers) != 1 or not isinstance(optimizers[0], torch.optim.AdamW):
             raise ValueError("expected exactly one AdamW optimizer")
