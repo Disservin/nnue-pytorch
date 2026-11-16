@@ -32,6 +32,15 @@ same system were 17.99–18.73 ms for DDP and 17.68 ms for sharding, but used
 per-step synchronization and a different input regime. GPU-side prefetch,
 feature exchange and execution overlap need further investigation.
 
+As a diagnostic, host timing around the sharded feature-gather call had
+per-rank medians of 1.30–2.17 ms over 832 live calls and 0.79 ms over 316
+fixed-input calls. The live window was asynchronous; fixed-input steps used
+per-step barriers and synchronization, so these are not strictly matched.
+Warmup is included, and occasional initial outliers make the mean unsuitable
+for estimating steady-state latency. The results point to extra time in or
+around feature distribution, but do not identify its underlying cause or
+account for the whole observed throughput gap.
+
 With eight loader workers per GPU, host batch-acquisition waits were sometimes
 large and highly imbalanced between ranks. Timings vary across runs and
 systems, so individual comparisons should not be taken as universal results.
