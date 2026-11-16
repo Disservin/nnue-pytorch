@@ -1,0 +1,153 @@
+{
+  "live_runs": [
+    {
+      "case": "ddp1",
+      "mode": "ddp",
+      "steps": 600,
+      "positions_per_second": 9447568.09345538,
+      "elapsed_seconds": 8.324173927307129,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "ddp2",
+      "mode": "ddp",
+      "steps": 600,
+      "positions_per_second": 8617117.10839516,
+      "elapsed_seconds": 9.12639331817627,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "long-new1",
+      "mode": "sharded",
+      "steps": 1800,
+      "positions_per_second": 7808572.4964523865,
+      "elapsed_seconds": 30.21417808532715,
+      "loader_wait_seconds_by_rank": [
+        0.7306443536654115,
+        2.8691547075286508,
+        1.0418712701648474,
+        0.4369984483346343
+      ],
+      "compiled": true
+    },
+    {
+      "case": "long-new2",
+      "mode": "sharded",
+      "steps": 1800,
+      "positions_per_second": 7880885.319668679,
+      "elapsed_seconds": 29.936941146850586,
+      "loader_wait_seconds_by_rank": [
+        0.770991119556129,
+        1.89235629606992,
+        0.6392420688644052,
+        0.5642350744456053
+      ],
+      "compiled": true
+    },
+    {
+      "case": "long-old1",
+      "mode": "sharded",
+      "steps": 1800,
+      "positions_per_second": 8049673.488737068,
+      "elapsed_seconds": 29.309213638305664,
+      "loader_wait_seconds_by_rank": [
+        0.3024450009688735,
+        0.2027918640524149,
+        0.35654666647315025,
+        0.2835758375003934
+      ],
+      "compiled": true
+    },
+    {
+      "case": "long-old2",
+      "mode": "sharded",
+      "steps": 1800,
+      "positions_per_second": 8108265.341673796,
+      "elapsed_seconds": 29.09741973876953,
+      "loader_wait_seconds_by_rank": [
+        0.20856346655637026,
+        0.29680997785180807,
+        0.5234169038012624,
+        0.28788588382303715
+      ],
+      "compiled": true
+    },
+    {
+      "case": "new3",
+      "mode": "sharded",
+      "steps": 600,
+      "positions_per_second": 9001238.693046516,
+      "elapsed_seconds": 8.736930847167969,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "old1",
+      "mode": "sharded",
+      "steps": 600,
+      "positions_per_second": 8629354.562309952,
+      "elapsed_seconds": 9.11345100402832,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "old2",
+      "mode": "sharded",
+      "steps": 600,
+      "positions_per_second": 8483156.395519892,
+      "elapsed_seconds": 9.270511627197266,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "shard1",
+      "mode": "sharded",
+      "steps": 600,
+      "positions_per_second": 8439706.065757422,
+      "elapsed_seconds": 9.318239212036133,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    },
+    {
+      "case": "shard2",
+      "mode": "sharded",
+      "steps": 600,
+      "positions_per_second": 8581973.917236147,
+      "elapsed_seconds": 9.163765907287598,
+      "loader_wait_seconds_by_rank": null,
+      "compiled": true
+    }
+  ],
+  "isolated_clip_runs": [
+    {
+      "case": "old",
+      "steps": 300,
+      "ms_per_step": 1.0126631458600361,
+      "sharded_tensors": 10,
+      "replicated_tensors": 21
+    },
+    {
+      "case": "new",
+      "steps": 300,
+      "ms_per_step": 0.2609802534182866,
+      "sharded_tensors": 10,
+      "replicated_tensors": 21
+    },
+    {
+      "case": "new",
+      "steps": 300,
+      "ms_per_step": 0.26519904534022015,
+      "sharded_tensors": 10,
+      "replicated_tensors": 21
+    },
+    {
+      "case": "old",
+      "steps": 300,
+      "ms_per_step": 0.9623422225316366,
+      "sharded_tensors": 10,
+      "replicated_tensors": 21
+    }
+  ]
+}
