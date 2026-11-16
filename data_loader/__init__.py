@@ -1,5 +1,7 @@
 from ._native import FenBatchPtr, SparseBatchPtr
+from .compact import CompactBatch, CompactBatchStream
 from .config import DataloaderHllConfig, DataloaderIOConfig, DataloaderSkipConfig
+from .distributed_features import GlobalFeatureBatch, gather_packed_features
 from .dataset import (
     FenBatchProvider,
     FixedNumBatchesDataset,
@@ -12,6 +14,10 @@ __all__ = [
     "DataloaderHllConfig",
     "DataloaderIOConfig",
     "DataloaderSkipConfig",
+    "CompactBatch",
+    "CompactBatchStream",
+    "GlobalFeatureBatch",
+    "gather_packed_features",
     "FenBatchProvider",
     "FenBatchPtr",
     "FixedNumBatchesDataset",

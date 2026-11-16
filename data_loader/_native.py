@@ -30,6 +30,43 @@ class SparseBatch(ctypes.Structure):
         ("layer_stack_index", ctypes.POINTER(ctypes.c_int)),
     ]
 
+    def get_packed_tensors(self, device, use_pinned_memory=False):
+        """Return the seven-field sharded batch with owned native packed IDs.
+
+        The dictionary in the white-indices slot is intended only for the
+        sharded loader; ordinary data-parallel consumers use get_tensors.
+        """
+        if not isinstance(self._b_base_, NativeSparseBatchPointer):
+            raise ValueError("packed sharded batches require native-owned SparseBatch")
+        n, width = self.size, self.max_active_features
+        nw, nb = self.num_active_white_features, self.num_active_black_features
+        size = 3 * n + 2 + nw + nb
+        pin = bool(use_pinned_memory and torch.cuda.is_available())
+        packed_host = torch.empty(size, dtype=torch.int32, pin_memory=pin)
+        if not c_lib.pack_sparse_batch(ctypes.byref(self), packed_host.data_ptr(), size):
+            raise RuntimeError("Native sparse batch packing failed")
+        if torch.device(device).type == "cpu":
+            packed = packed_host
+        else:
+            packed = packed_host.to(device=device, non_blocking=pin)
+        floats = torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(3 * n,)))
+        floats = _pin_and_move(floats, device, use_pinned_memory)
+        us = floats[:n].view(n, 1)
+        outcome = floats[n:2*n].view(n, 1)
+        score = floats[2*n:3*n].view(n, 1)
+        if pin and not us.is_cuda:
+            them = torch.empty_like(us, pin_memory=True)
+            them.fill_(1.0)
+            them.sub_(us)
+            stacks = torch.empty(n, dtype=torch.int64, pin_memory=True)
+            stacks.copy_(packed[2*(n+1)+nw+nb:])
+        else:
+            them = 1.0 - us
+            stacks = packed[2*(n+1)+nw+nb:].to(torch.int64)
+        native = {"format": "native_offsets_v1", "packed": packed,
+                  "size": n, "width": width, "nw": nw, "nb": nb}
+        return us, them, native, None, outcome, score, stacks
+
     def get_tensors(
         self,
         device: str | torch.device,

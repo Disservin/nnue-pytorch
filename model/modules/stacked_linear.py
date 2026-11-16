@@ -10,6 +10,32 @@ except (ImportError, OSError, RuntimeError):
     grouped_l1 = None
 
 
+def can_use_grouped_l1(x, weight, bias, count):
+    """Share the grouped-kernel eligibility rules across full and sharded L1."""
+    if (
+        grouped_l1 is None
+        or not x.is_cuda
+        or torch.version.hip is not None
+        or x.ndim != 2
+        or x.shape[0] == 0
+        or x.dtype != torch.float32
+        or weight.dtype != torch.float32
+        or bias.dtype != torch.float32
+        or torch.is_autocast_enabled()
+    ):
+        return False
+    width = x.shape[1]
+    outputs = bias.numel() // count if count else 0
+    return (
+        128 <= width <= 4096
+        and width % 128 == 0
+        and 1 <= outputs <= 128
+        and 1 <= count <= 256
+        and grouped_l1_preferred(count)
+        and torch.cuda.get_device_capability(x.device)[0] >= 8
+    )
+
+
 class StackedLinear(nn.Module):
     def __init__(
         self,
@@ -201,20 +227,9 @@ class FactorizedStackedLinear(StackedLinear):
         # crossover: 32). Keep the standard
         # path for missing dependencies and other workloads.
         if (
-            grouped_l1 is not None
-            and x.is_cuda
-            and torch.version.hip is None
-            and x.dtype == merged_weight.dtype == merged_bias.dtype == torch.float32
-            and not torch.is_autocast_enabled()
-            and 128 <= self.in_features <= 4096
-            and self.in_features % 128 == 0
-            and 1 <= self.out_features <= 128
-            and 1 <= self.count <= 256
-            and grouped_l1_preferred(self.count)
-            and x.ndim == 2
-            and x.shape[0] > 0
+            x.ndim == 2
             and x.shape[1] == self.in_features
-            and torch.cuda.get_device_capability(x.device)[0] >= 8
+            and can_use_grouped_l1(x, merged_weight, merged_bias, self.count)
         ):
             return grouped_l1(x, merged_weight, merged_bias, ls_indices, self.count)
 

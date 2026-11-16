@@ -180,6 +180,7 @@ def _sum_gradient_partials(
     N: tl.constexpr,
     SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     b = tl.program_id(0)
     i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -188,7 +189,7 @@ def _sum_gradient_partials(
         P + b * SPLIT * N * K + s[:, None] * N * K + i[None, :], i[None, :] < N * K, 0
     )
     tl.store(W + b * N * K + i, tl.sum(p, 0), i < N * K)
-    if tl.program_id(1) == 0:
+    if HAS_BIAS and tl.program_id(1) == 0:
         q = tl.load(Q + b * SPLIT * N + s[:, None] * N + i[None, :], i[None, :] < N, 0)
         tl.store(B + b * N + i, tl.sum(q, 0), i < N)
 
@@ -291,14 +292,20 @@ def _input_gradient(g, w, rows, counts, k, bm=32, bk=64):
     return out
 
 
-def _weight_and_bias_gradient(x, g, rows, counts, split=8, bm=32, bk=32):
+def _weight_and_bias_gradient(
+    x, g, rows, counts, split=8, bm=32, bk=32, *, need_bias=True
+):
     batch, k = x.shape
     n = g.shape[1]
     count = counts.numel()  # Tensor metadata; no GPU-to-CPU synchronization.
     p = torch.empty((count, split, n, k), device=x.device, dtype=x.dtype)
-    q = torch.empty((count, split, n), device=x.device, dtype=x.dtype)
     w = torch.empty((count * n, k), device=x.device, dtype=x.dtype)
-    b = torch.empty(count * n, device=x.device, dtype=x.dtype)
+    q = (
+        torch.empty((count, split, n), device=x.device, dtype=x.dtype)
+        if need_bias
+        else w
+    )
+    b = torch.empty(count * n, device=x.device, dtype=x.dtype) if need_bias else w
     _bucketed_weight_gradient[(tr.cdiv(k, bk), count, split)](
         x,
         g,
@@ -314,13 +321,22 @@ def _weight_and_bias_gradient(x, g, rows, counts, split=8, bm=32, bk=32):
         max(16, tr.next_power_of_2(n)),
         num_warps=4,
     )
-    _bucketed_bias_gradient[(count, split)](
-        g, rows, counts, q, batch, n, split, max(16, tr.next_power_of_2(n)), num_warps=4
-    )
+    if need_bias:
+        _bucketed_bias_gradient[(count, split)](
+            g,
+            rows,
+            counts,
+            q,
+            batch,
+            n,
+            split,
+            max(16, tr.next_power_of_2(n)),
+            num_warps=4,
+        )
     _sum_gradient_partials[(count, tr.cdiv(n * k, 128))](
-        p, q, w, b, k, n, split, 128, num_warps=4
+        p, q, w, b, k, n, split, 128, need_bias, num_warps=4
     )
-    return w, b
+    return w, b if need_bias else None
 
 
 class _GroupedLinear(torch.autograd.Function):
@@ -342,7 +358,14 @@ class _GroupedLinear(torch.autograd.Function):
             grad_output, weight, rows, counts, x.shape[1], 128, 64
         )
         grad_weight, grad_bias = _weight_and_bias_gradient(
-            x, grad_output, rows, counts, 16, 32, 32
+            x,
+            grad_output,
+            rows,
+            counts,
+            16,
+            32,
+            32,
+            need_bias=ctx.needs_input_grad[2],
         )
         return grad_input, grad_weight, grad_bias, None, None
 

@@ -138,6 +138,7 @@ class TrainingDataProvider:
         use_pinned_memory=False,
         device="cpu",
         ls_keys: str = DEFAULT_LS_KEYS,
+        packed_sharded=False,
     ):
         self.feature_set = feature_set.encode("utf-8")
         self.create_stream = create_stream
@@ -160,6 +161,7 @@ class TrainingDataProvider:
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.native_fetch_s = 0.0
+        self.packed_sharded = packed_sharded
 
         if batch_size:
             self.stream = self.create_stream(
@@ -175,7 +177,8 @@ class TrainingDataProvider:
                 ls_keys=ls_keys,
                 # Let the C++ workers build the packed transport layout when
                 # batches will take that path, instead of this thread.
-                prepack_indices=compact_transport_available(device, use_pinned_memory),
+                prepack_indices=packed_sharded
+                or compact_transport_available(device, use_pinned_memory),
             )
         else:
             self.stream = self.create_stream(
@@ -200,11 +203,11 @@ class TrainingDataProvider:
         self.native_fetch_s += time.perf_counter() - t0
 
         if v:
-            tensors = v.contents.get_tensors(
-                self.device, use_pinned_memory=self.use_pinned_memory
-            )
-            self.destroy_part(v)
-            return tensors
+            try:
+                convert = v.contents.get_packed_tensors if self.packed_sharded else v.contents.get_tensors
+                return convert(self.device, use_pinned_memory=self.use_pinned_memory)
+            finally:
+                self.destroy_part(v)
         else:
             raise StopIteration
 
@@ -239,6 +242,7 @@ class SparseBatchProvider(TrainingDataProvider):
         use_pinned_memory=False,
         device="cpu",
         ls_keys: str = DEFAULT_LS_KEYS,
+        packed_sharded=False,
     ):
         super().__init__(
             feature_set,
@@ -257,6 +261,7 @@ class SparseBatchProvider(TrainingDataProvider):
             use_pinned_memory,
             device,
             ls_keys,
+            packed_sharded,
         )
 
 
@@ -274,6 +279,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         io_config: DataloaderIOConfig | None = None,
         use_pinned_memory=False,
         ls_keys: str = DEFAULT_LS_KEYS,
+        packed_sharded=False,
     ):
         super().__init__()
         self.feature_set = feature_set
@@ -293,6 +299,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             io_config = DataloaderIOConfig()
         self.io_config = io_config
         self.use_pinned_memory = use_pinned_memory
+        self.packed_sharded = packed_sharded
         self.device = "cpu"
         self._cached_iter = None
         self._iter_lock = threading.Lock()
@@ -311,6 +318,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             use_pinned_memory=self.use_pinned_memory,
             device=self.device,
             ls_keys=self.ls_keys,
+            packed_sharded=self.packed_sharded,
         )
 
     def __iter__(self):
@@ -332,6 +340,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
                 # settings (a fresh provider would pick these up on creation).
                 self._cached_iter.use_pinned_memory = self.use_pinned_memory
                 self._cached_iter.device = self.device
+                self._cached_iter.packed_sharded = self.packed_sharded
             return self._cached_iter
 
 
