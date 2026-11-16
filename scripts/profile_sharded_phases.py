@@ -2,7 +2,10 @@
 import functools
 import os
 import runpy
+import json
+import statistics
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
@@ -65,6 +68,19 @@ wrap(backward, "synchronize_replicated_gradients", "phase:replica_grad_sync")
 wrap(trainer, "backward_weighted_loss", "phase:backward_total")
 wrap(trainer, "clip_sharded_grad_norm_", "phase:clip_total")
 
+gather_wall_times = []
+if os.environ.get("NNUE_PROFILE_GATHER_WALL") == "1":
+    original_gather_for_timing = model.gather_packed_features
+
+    @functools.wraps(original_gather_for_timing)
+    def timed_gather(*args, **kwargs):
+        started = time.perf_counter()
+        result = original_gather_for_timing(*args, **kwargs)
+        gather_wall_times.append((time.perf_counter() - started) * 1000)
+        return result
+
+    model.gather_packed_features = timed_gather
+
 # Measurement-only upper bound for eliminating feature distribution. The
 # benchmark must reuse one fixed batch and all ranks must enter the first call.
 if os.environ.get("NNUE_PROFILE_CACHE_FEATURES") == "1":
@@ -84,3 +100,11 @@ if os.environ.get("NNUE_PROFILE_SKIP_CLIP") == "1":
 
 runpy.run_path(os.path.join(os.path.dirname(__file__), "benchmark_sharded_adamw.py"),
                run_name="__main__")
+if gather_wall_times:
+    ordered = sorted(gather_wall_times)
+    print("GATHER_HOST_WALL " + json.dumps({
+        "rank": int(os.environ.get("RANK", "0")), "samples": len(ordered),
+        "median_ms": statistics.median(ordered),
+        "p95_ms": ordered[int(.95 * (len(ordered) - 1))],
+        "mean_ms": statistics.mean(ordered), "max_ms": ordered[-1],
+    }), flush=True)
