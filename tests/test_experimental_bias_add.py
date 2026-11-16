@@ -12,9 +12,10 @@ except (ImportError, OSError, RuntimeError):
                     or bucketed_bias_add is None,
                     reason="CUDA, CuPy and Triton are required")
 @pytest.mark.parametrize("batch", [0, 1, 3073, 32768])
-def test_bucketed_bias_add(batch):
+@pytest.mark.parametrize("count", [92, 192])
+def test_bucketed_bias_add(batch, count):
     torch.manual_seed(182)
-    count, width = 192, 32
+    width = 32
     values = torch.randn(batch, width, device="cuda", requires_grad=True)
     bias = torch.randn(count * width, device="cuda", requires_grad=True)
     # Include both a very common and sparsely populated bucket.

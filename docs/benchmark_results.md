@@ -149,3 +149,69 @@ same node yielded 8.38M positions/s for DDP and 6.99M for sharding with 16
 loader workers per rank (one run each). At 12 workers, the respective figures
 were 7.44M and 7.47M. CPU affinity and concurrent activity can affect these
 results; the restricted-core run is not a reproduction of the H100 host.
+
+### Four-GPU detailed profiling follow-up
+
+On four H200 NVL GPUs, the live-loader benchmark used the settings above,
+including batch 131072, 92 stored stacks and 16 workers per rank, with
+32 warmup and 600 measured steps per run. It uses one real binpack and the
+real stack remap rather than the complete training data mixture. Batch lambda
+jitter was disabled on both paths. Results are individual unprofiled windows:
+
+| Configuration | M positions/s | ms/global batch |
+| --- | ---: | ---: |
+| Compiled DDP | 8.30–8.51 (2) | 15.39–15.80 |
+| Compiled sharding, default clipping | 6.85, 7.68–7.80, 7.76 (4) | 16.81–19.14 |
+| Sharding, experimental foreach clipping | 8.40–8.50 (2) | 15.43–15.61 |
+| Sharding, gradient clipping disabled | 9.06–9.07 (2) | 14.45–14.47 |
+| DDP, gradient clipping disabled | 9.33 (1) | 14.05 |
+| Sharding, weight clipping disabled | 7.67–8.18 (2) | 16.02–17.09 |
+| Sharding, experimental bucketed L1 bias gradient | 8.02–8.29 (2) | 15.81–16.35 |
+| Sharding, asynchronous feature distribution | 7.37–7.82 (2) | 16.77–17.79 |
+| Sharding, direct FT backward | 7.09–7.37 (2) | 17.79–18.49 |
+
+The first sharded baseline was an unusually slow window; subsequent baselines
+bracketed the candidate runs. The clipping-disabled controls change training
+and are diagnostic only. Individual changes and differences between these
+windows are not additive. The FT-backward comparison is specific to this GPU,
+shape and the current automatically selected aggregated kernel. See
+`detailed_profile_results.json` for individual windows.
+
+Nsight Systems captured 100 live steps on each rank for compiled DDP, default
+sharding and foreach-clipping sharding. These traces are intrusive: the default
+sharded trace ran at 5.11M positions/s, so the unprofiled numbers above are the
+throughput evidence. The median host span for sharded gradient clipping was
+1.64–1.99 ms across ranks, with 193 attributed kernel launches per step;
+the experimental implementation reduced this to 0.61–0.74 ms and 27 launches.
+DDP's clipping span was 0.54–0.66 ms and 24 launches. These are nested host
+spans, not isolated GPU durations. They cannot be summed into a step breakdown.
+The experiment batches local gradient norm and scale operations, retaining
+the scalar cross-rank reduction and counting replicated parameters once.
+Four-rank tests compared norms and gradients for clipping, no clipping, zero
+and absent gradients on CPU and GPU, and compared multi-step AdamW loss and
+state on GPU. The experiment is opt-in via `NNUE_PROFILE_FOREACH_CLIP=1`, not
+the production default; broader validation is still required.
+
+The default sharded trace also showed a 5.08–5.84 ms median host span in
+replicated-gradient synchronization and a 1.52–2.40 ms median feature-gather
+span. These include asynchronous work and waits for earlier GPU operations;
+they do not establish the communication cost in isolation. In particular,
+replica synchronization checks gradient presence using a host read, after
+backward has been enqueued. DDP overlaps its gradient reductions with
+backpropagation. Sharding also needs L1 forward reduce-scatter and backward
+all-gather, so the two communication schedules differ. Investigating those
+dependencies and host synchronizations is a promising next step.
+
+The traced aggregated FT backward kernel averaged 3.44–3.46 ms per step
+across sharded ranks and 3.53–3.65 ms for DDP; traced FT feature packing was
+0.59 ms per sharded rank versus 0.15 ms per DDP rank. Each sharded rank sees
+the full batch, while each DDP rank sees a quarter; FT output width is divided
+across sharded ranks. These are device-kernel durations under instrumentation,
+may overlap other work, and are not additive estimates of exposed step time.
+They suggest reducing repeated full-batch feature preparation is worth
+investigating in addition to removing host synchronization.
+
+The trace's median host loader-acquisition span was 0.09–0.11 ms per rank in
+the sharded run; the 600-step baseline measured 0.11–0.17 seconds of host
+acquisition per rank. This does not include all GPU-side input waits. Raw
+traces and logs contain machine-specific metadata and should remain private.
