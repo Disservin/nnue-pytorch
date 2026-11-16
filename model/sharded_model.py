@@ -56,6 +56,11 @@ class ShardedNNUEModel(NNUEModel):
         self, batch, fake_quantize_acts=True, fake_quantize_weights=True, group=None
     ):
         global_batch = gather_packed_features(batch, group)
+        return self.forward_global_batch(global_batch, fake_quantize_acts, fake_quantize_weights, group)
+
+    def forward_global_batch(
+        self, global_batch, fake_quantize_acts=True, fake_quantize_weights=True, group=None
+    ):
         indices = self.layer_stacks.stack_remap[global_batch.layer_stack_indices]
         x = self.input(
             global_batch.us,
