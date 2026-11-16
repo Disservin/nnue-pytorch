@@ -16,6 +16,15 @@ except (ImportError, OSError, RuntimeError):
         return False
 
 
+def can_use_grouped_l1(x, weight, bias, count):
+    """Share the grouped-kernel dispatch across full and sharded layers."""
+    return (
+        grouped_l1 is not None
+        and grouped_l1_preferred(count)
+        and grouped_l1_applicable(x, weight, bias, count)
+    )
+
+
 class StackedLinear(nn.Module):
     def __init__(
         self,
@@ -206,9 +215,7 @@ class FactorizedStackedLinear(StackedLinear):
                 merged_bias, f"{self.layer_key}_bias"
             )
 
-        if grouped_l1_preferred(self.count) and grouped_l1_applicable(
-            x, merged_weight, merged_bias, self.count
-        ):
+        if can_use_grouped_l1(x, merged_weight, merged_bias, self.count):
             return grouped_l1(x, merged_weight, merged_bias, ls_indices, self.count)
 
         stacked_output = F.linear(x, merged_weight, merged_bias)

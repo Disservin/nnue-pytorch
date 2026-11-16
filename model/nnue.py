@@ -47,7 +47,8 @@ def remap_tablebase_score(
     return torch.where(is_mate, remapped_score, score)
 
 
-def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
+def calculate_sf_loss_components(scorenet, score, outcome, loss_params, actual_lambda):
+    """Return the weighted loss numerator and target-derived weight sum."""
     score = remap_tablebase_score(
         score,
         base=loss_params.tb_remap_base,
@@ -79,9 +80,14 @@ def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
     weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow(
         (pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2
     )
-    loss = (loss * weights).sum() / weights.sum()
+    return (loss * weights).sum(), weights.sum()
 
-    return loss
+
+def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
+    numerator, denominator = calculate_sf_loss_components(
+        scorenet, score, outcome, loss_params, actual_lambda
+    )
+    return numerator / denominator
 
 
 class NNUE(nn.Module):
@@ -91,13 +97,23 @@ class NNUE(nn.Module):
         max_epoch=None,
         num_batches_per_epoch=None,
         param_index=0,
+        sharding: tuple[int, int] | None = None,
     ):
         super().__init__()
 
-        self.model: NNUEModel = NNUEModel(
-            config.features,
-            config.model_config,
-        )
+        if sharding is None:
+            self.model: NNUEModel = NNUEModel(config.features, config.model_config)
+        else:
+            from .sharded_model import ShardedNNUEModel
+
+            if config.optimizer_config.optimizer_name.lower() != "adamw":
+                raise ValueError("sharded NNUE currently supports only AdamW")
+            self.model = ShardedNNUEModel(
+                config.features,
+                config.model_config,
+                rank=sharding[0],
+                world_size=sharding[1],
+            )
         self.config = config
         self.max_epoch = max_epoch
         self.num_batches_per_epoch = num_batches_per_epoch
@@ -117,6 +133,7 @@ class NNUE(nn.Module):
         # The loss runs as ~20 eager pointwise kernels per step outside the
         # compiled model; replaced by a compiled version on request.
         self._sf_loss_fn = calculate_sf_loss
+        self._sf_loss_components_fn = calculate_sf_loss_components
 
         self.loss_metrics = MetricCollection(
             {
@@ -131,6 +148,7 @@ class NNUE(nn.Module):
     def enable_compiled_loss(self) -> None:
         """Fuse the loss pointwise chain into compiled kernels."""
         self._sf_loss_fn = torch.compile(calculate_sf_loss)
+        self._sf_loss_components_fn = torch.compile(calculate_sf_loss_components)
 
     # --- setup optimizers and training hooks ---
     def configure_optimizers(self):
@@ -422,6 +440,27 @@ class NNUE(nn.Module):
     def compute_loss_with_scorenet(
         self, scorenet: Tensor, batch: tuple[Tensor, ...], current_step: int
     ):
+        scorenet, score, outcome, actual_lambda = self._loss_inputs(
+            scorenet, batch, current_step
+        )
+        return self._sf_loss_fn(
+            scorenet, score, outcome, self.config.loss_params, actual_lambda
+        )
+
+    def compute_loss_components_with_scorenet(
+        self, scorenet: Tensor, batch: tuple[Tensor, ...], current_step: int
+    ):
+        """Return local weighted numerator and denominator for sharded training."""
+        scorenet, score, outcome, actual_lambda = self._loss_inputs(
+            scorenet, batch, current_step
+        )
+        return self._sf_loss_components_fn(
+            scorenet, score, outcome, self.config.loss_params, actual_lambda
+        )
+
+    def _loss_inputs(
+        self, scorenet: Tensor, batch: tuple[Tensor, ...], current_step: int
+    ):
         (
             _us,
             _them,
@@ -452,8 +491,4 @@ class NNUE(nn.Module):
 
         self.current_lambda = actual_lambda.detach()
 
-        sf_loss = self._sf_loss_fn(
-            scorenet, score, outcome, self.config.loss_params, actual_lambda
-        )
-
-        return sf_loss
+        return scorenet, score, outcome, actual_lambda
