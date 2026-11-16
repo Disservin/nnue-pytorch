@@ -29,3 +29,15 @@ all-bucket multiplication. Feature gathering supports the existing padded
 loader tensors and an optional native-packed representation. Full
 training-pipeline and checkpoint conversion behavior have not yet been
 validated.
+
+The benchmark's `--async-features` option experiments with one-batch
+lookahead for native-packed loader batches. All ranks enqueue the next feature
+collectives in the same order on the existing process group after the current
+forward and before backward; a separate CUDA stream handles preparation. The
+pending object retains its buffers and the consuming stream waits before
+unpacking. The callback and pre-gathered batch arguments of `step` expose the
+building blocks for this experiment, not a complete production pipeline.
+Callers must coordinate collective ordering, batch order, stream lifetimes,
+errors and shutdown across all ranks. Do not advance model weights while
+preparing the current forward. See `benchmark_results.md` for measured cost
+and limitations.
