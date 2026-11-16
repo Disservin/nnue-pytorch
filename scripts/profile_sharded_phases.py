@@ -1,5 +1,6 @@
 """Run benchmark_sharded_adamw with labeled PyTorch profiler regions."""
 import functools
+from contextlib import nullcontext
 import os
 import runpy
 import json
@@ -27,7 +28,8 @@ def wrap(obj, name, label):
 
     @functools.wraps(original)
     def measured(*args, **kwargs):
-        with torch.profiler.record_function(label):
+        nvtx = torch.cuda.nvtx.range(label) if os.environ.get("NNUE_PROFILE_NVTX") == "1" else nullcontext()
+        with nvtx, torch.profiler.record_function(label):
             return original(*args, **kwargs)
     setattr(obj, name, measured)
 
@@ -41,6 +43,8 @@ if os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1":
     ComposedFeatureTransformer.merged_weight_and_bias = torch.compile(
         ComposedFeatureTransformer.merged_weight_and_bias, fullgraph=True
     )
+if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
+    LayerStacks.forward_from_l1 = torch.compile(LayerStacks.forward_from_l1)
 if os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1":
     from experimental_bias_add import bucketed_bias_add
     sharded_l1._add_local_bias = bucketed_bias_add

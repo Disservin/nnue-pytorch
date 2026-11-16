@@ -81,6 +81,10 @@ def main():
                         help="Record host-side batch acquisition time during throughput windows")
     parser.add_argument("--measure-input-device-wait", action="store_true",
                         help="Measure the GPU stream interval surrounding batch acquisition")
+    parser.add_argument("--async-features", action="store_true",
+                        help="Experimentally overlap next-batch feature exchange with backward")
+    parser.add_argument("--nsys-capture", action="store_true",
+                        help="Bracket the measured throughput window with CUDA profiler APIs")
     parser.add_argument(
         "--save-batch-dir", help="Save decoded rank batches for an identical comparison"
     )
@@ -123,6 +127,12 @@ def main():
         raise ValueError("--measure-loader-wait requires --throughput-window")
     if args.measure_input_device_wait and not args.throughput_window:
         raise ValueError("--measure-input-device-wait requires --throughput-window")
+    if args.nsys_capture and not args.throughput_window:
+        raise ValueError("--nsys-capture requires --throughput-window")
+    if args.async_features and (args.mode != "sharded" or not args.throughput_window
+                                or args.measure_loader_wait or args.measure_input_device_wait
+                                or os.environ.get("NNUE_BENCH_NATIVE_PACKED") != "1"):
+        raise ValueError("async features require sharded native-packed live throughput mode without wait diagnostics")
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")
@@ -235,23 +245,68 @@ def main():
                 optimizer.step()
             return loss.detach()
     else:
+        if os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1":
+            nnue.enable_compiled_loss()
         runner = ShardedAdamWStep(nnue, gradient_clip_val=2.0)
 
-        def train_step():
-            return runner.step(batch)
+        def train_step(global_batch=None, after_forward=None):
+            return runner.step(batch, global_batch=global_batch, after_forward=after_forward)
 
     if args.throughput_window:
+        pipeline_batch = pipeline_pending = feature_stream = None
+        total_pipeline_steps = args.warmup + args.steps
+        if args.async_features:
+            from data_loader.distributed_features import begin_native_packed_features
+            from data_loader.dataset import _recursive_record_stream
+            feature_stream = torch.cuda.Stream(device=rank)
+
+            def prepare(index):
+                nvtx = (torch.cuda.nvtx.range("phase:async_feature_prepare")
+                        if os.environ.get("NNUE_PROFILE_NVTX") == "1" else nullcontext())
+                with nvtx, torch.cuda.stream(feature_stream):
+                    local = live_loader[index]
+                    pending = begin_native_packed_features(local)
+                return local, pending
+
+            pipeline_batch, pipeline_pending = prepare(1)
+
+        def one_step(index):
+            nonlocal batch, pipeline_batch, pipeline_pending
+            if not args.async_features:
+                batch = live_loader[index + 1]
+                return train_step()
+            batch = pipeline_batch
+            nvtx = (torch.cuda.nvtx.range("phase:async_feature_finish")
+                    if os.environ.get("NNUE_PROFILE_NVTX") == "1" else nullcontext())
+            with nvtx:
+                features = pipeline_pending.finish()
+            _recursive_record_stream(batch, torch.cuda.current_stream(rank))
+            next_batch = next_pending = None
+
+            def start_next():
+                nonlocal next_batch, next_pending
+                if index + 1 < total_pipeline_steps:
+                    next_batch, next_pending = prepare(index + 2)
+
+            loss = train_step(features, start_next)
+            pipeline_batch, pipeline_pending = next_batch, next_pending
+            return loss
+
         for i in range(args.warmup):
-            batch = live_loader[i + 1]
-            last_loss = train_step()
+            last_loss = one_step(i)
         torch.cuda.synchronize()
         dist.barrier()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
+        if args.nsys_capture:
+            torch.cuda.cudart().cudaProfilerStart()
         started = time.perf_counter()
         host_loader_wait = []
         input_device_events = []
         for i in range(args.steps):
+            if args.async_features:
+                last_loss = one_step(args.warmup + i)
+                continue
             if args.measure_input_device_wait:
                 before = torch.cuda.Event(enable_timing=True)
                 after = torch.cuda.Event(enable_timing=True)
@@ -266,7 +321,10 @@ def main():
                 input_device_events.append((before, after))
             last_loss = train_step()
         torch.cuda.synchronize()
-        elapsed = torch.tensor(time.perf_counter() - started, device=rank)
+        finished = time.perf_counter()
+        if args.nsys_capture:
+            torch.cuda.cudart().cudaProfilerStop()
+        elapsed = torch.tensor(finished - started, device=rank)
         dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
         peak = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=rank)
         dist.all_reduce(peak, op=dist.ReduceOp.MAX)
@@ -298,7 +356,10 @@ def main():
             print(json.dumps({"mode": args.mode, "world_size": world,
                               "global_batch": args.global_batch, "steps": args.steps,
                               "live_loader": True, "throughput_window": True,
+                              "async_features": args.async_features,
                               "compiled": args.compile_ddp, "gpu": torch.cuda.get_device_name(rank),
+                              "compiled_sharded_tail": os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1" if args.mode == "sharded" else None,
+                              "compiled_sharded_loss": os.environ.get("NNUE_PROFILE_COMPILE_LOSS") == "1" if args.mode == "sharded" else None,
                               "elapsed_seconds": elapsed.item(),
                               "positions_per_second": args.global_batch * args.steps / elapsed.item(),
                               "host_loader_wait_by_rank": wait_by_rank,

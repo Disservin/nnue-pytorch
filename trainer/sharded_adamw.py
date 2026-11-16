@@ -67,11 +67,14 @@ class ShardedAdamWStep:
         ]
         self.global_step = 0
 
-    def step(self, batch):
+    def step(self, batch, *, global_batch=None, after_forward=None):
         """Run one local-batch forward/backward and return the global loss.
 
         Batches and the model must already be on the collective device. Epoch
         schedulers and weight-clipping callbacks remain the caller's responsibility.
+        ``global_batch`` and ``after_forward`` support experimental lookahead.
+        All ranks must use matching batches and enqueue any callback collectives
+        in the same order; the callback must not change model weights.
         """
         if not self.nnue.training:
             raise RuntimeError("sharded AdamW steps require training mode")
@@ -81,12 +84,16 @@ class ShardedAdamWStep:
             )
         self.optimizer.zero_grad(set_to_none=True)
         enabled = self.global_step >= self.nnue.config.fake_quant_warmup_steps
-        prediction = self.nnue.model.forward_batch(
-            batch,
+        forward = (self.nnue.model.forward_batch if global_batch is None
+                   else self.nnue.model.forward_global_batch)
+        prediction = forward(
+            batch if global_batch is None else global_batch,
             self.nnue.config.use_fake_act_quantization and enabled,
             self.nnue.config.use_fake_weight_quantization and enabled,
             self.group,
         )
+        if after_forward is not None:
+            after_forward()
         numerator, weight = self.nnue.compute_loss_components_with_scorenet(
             prediction, batch, self.global_step
         )

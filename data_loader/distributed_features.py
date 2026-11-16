@@ -60,7 +60,31 @@ def _use_fused_unpack(device):
     return device.type == "cuda" and torch.version.hip is None and unpack_distributed_rows is not None
 
 
-def _gather_native_packed_features(batch, group=None):
+class PendingNativeFeatures:
+    """Own buffers and collective work until an asynchronous gather is consumed."""
+
+    def __init__(self, gathered, dimensions, rank, work, keepalive, ready_event):
+        self.gathered = gathered
+        self.dimensions = dimensions
+        self.rank = rank
+        self.work = work
+        self.keepalive = keepalive
+        self.ready_event = ready_event
+        self._result = None
+
+    def finish(self):
+        if self._result is None:
+            if self.ready_event is not None:
+                torch.cuda.current_stream(self.gathered.device).wait_event(self.ready_event)
+            if self.work is not None:
+                self.work.wait()
+            if self.gathered.is_cuda:
+                self.gathered.record_stream(torch.cuda.current_stream(self.gathered.device))
+            self._result = _unpack_native_gathered(self.gathered, self.dimensions, self.rank)
+        return self._result
+
+
+def begin_native_packed_features(batch, group=None):
     """Distribute trusted native offsets; payload contents are not revalidated.
 
     The metadata and offsets must originate from native packing (or a caller
@@ -105,9 +129,21 @@ def _gather_native_packed_features(batch, group=None):
     padded[:payload.numel()] = payload
     gathered = torch.empty((world, length), dtype=torch.int32, device=packed.device)
     if distributed:
-        dist.all_gather(list(gathered.unbind(0)), padded, group=group)
+        work = dist.all_gather(list(gathered.unbind(0)), padded, group=group, async_op=True)
     else:
         gathered[0].copy_(padded)
+        work = None
+    ready_event = None
+    if packed.is_cuda:
+        ready_event = torch.cuda.Event()
+        ready_event.record(torch.cuda.current_stream(packed.device))
+    return PendingNativeFeatures(gathered, dimensions, rank, work, (batch, payload, padded, infos), ready_event)
+
+
+def _unpack_native_gathered(gathered, dimensions, rank):
+    width = dimensions[0][1]
+    world = len(dimensions)
+    packed = gathered
     if packed.is_cuda and torch.version.hip is None and unpack_native_distributed_rows is not None:
         result = unpack_native_distributed_rows(gathered, dimensions, width)
     else:
@@ -126,6 +162,10 @@ def _gather_native_packed_features(batch, group=None):
     for b, _, _, _ in dimensions:
         offsets.append(offsets[-1] + b)
     return GlobalFeatureBatch(*result, tuple(offsets), rank)
+
+
+def _gather_native_packed_features(batch, group=None):
+    return begin_native_packed_features(batch, group).finish()
 
 
 def gather_packed_features(

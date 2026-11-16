@@ -13,6 +13,7 @@ from data_loader import stream
 from data_loader.distributed_features import (
     _unpack_rows,
     _unpack_rows_reference,
+    begin_native_packed_features,
     gather_packed_features,
     unpack_counted_rows,
     unpack_distributed_rows,
@@ -52,6 +53,19 @@ def _check_packed_matches_dense(batch):
     for field in ("us", "them", "white_indices", "black_indices", "layer_stack_indices"):
         assert torch.equal(getattr(actual, field), getattr(expected, field))
     assert actual.offsets == expected.offsets
+    native = _pack_dense_batch(batch)
+    if batch[0].is_cuda:
+        producer = torch.cuda.Stream(device=batch[0].device)
+        producer.wait_stream(torch.cuda.current_stream(batch[0].device))
+        with torch.cuda.stream(producer):
+            pending = begin_native_packed_features(native)
+    else:
+        pending = begin_native_packed_features(native)
+    asynchronous = pending.finish()
+    assert pending.finish() is asynchronous
+    for field in ("us", "them", "white_indices", "black_indices", "layer_stack_indices"):
+        assert torch.equal(getattr(asynchronous, field), getattr(expected, field))
+    assert asynchronous.offsets == expected.offsets
 
 
 def test_packed_batch_respects_replaced_stack_tensor():

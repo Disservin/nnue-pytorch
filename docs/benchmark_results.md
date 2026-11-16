@@ -46,3 +46,37 @@ large and highly imbalanced between ranks. Timings vary across runs and
 systems, so individual comparisons should not be taken as universal results.
 The file `profile_measurements.json` contains sanitized benchmark measurement
 records. It omits raw traces and environment-specific paths.
+
+## Compilation and asynchronous feature exchange
+
+In a follow-up with the same batch and four H100s, 64 allocated CPUs and 16
+loader workers per rank, sharded training with compiled FT merge but an eager
+tail and loss reached 5.39–5.46 million positions/s in two live runs. Compiling
+the tail and loss increased that to 6.73–6.81 million positions/s; compiled
+DDP reached 7.09 million in two runs. These are successive runs and may be
+affected by data-loading variability. After fixing cross-stream batch
+lifetime handling, a later 800-step comparison measured 5.28 million
+positions/s with synchronous feature exchange and 5.34–5.39 million with
+one-batch-ahead exchange. Earlier asynchronous measurements before that
+lifetime fix should not be treated as validated training results. The sharded
+FT/L1 distributed forward itself was not compiled as
+one graph. An attempt to compile the entire sharded forward timed out a
+four-rank NCCL correctness test with uneven local batches, so this option is
+not enabled. The tests did not establish the cause of that timeout.
+
+The asynchronous prototype submits collectives in the same order on all ranks
+using one process group. It exchanges the next native-packed batch after the
+current forward and before backward, waits before using the result, and keeps
+the needed tensors alive across streams. It is available only in the
+experimental benchmark (`--async-features`), not the normal training loop. It
+increased peak per-GPU allocation by approximately 0.28 GiB. Four-rank Gloo
+and NCCL tests covered uneven and empty local batches, cross-stream feature
+consumption and several AdamW steps. These are smoke tests, not convergence
+tests or a proof of safety for arbitrary caller schedules.
+
+Nsight Systems captures showed recurring gaps between traced GPU activities,
+including gaps before kernels launched in feature distribution. A separate
+capture labels asynchronous preparation and completion. Such gaps can include
+profiler effects or untraced operations, and the phase of the next launch does
+not prove what caused a gap. The gap summaries are in
+`nsys_gap_summary.json`, with hardware-source and filesystem metadata omitted.
