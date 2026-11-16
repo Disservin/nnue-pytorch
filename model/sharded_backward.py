@@ -127,24 +127,46 @@ def clip_sharded_grad_norm_(
         raise ValueError("all parameters must be on one device")
     if max_norm < 0:
         raise ValueError("max_norm must be nonnegative")
-    # Accumulate the per-parameter norms in float64 without copying full
-    # feature-transformer gradients into float64 buffers.
-    total = torch.zeros((), dtype=torch.float64, device=params[0].device)
-    for p in sharded:
-        if p.grad is not None:
-            total += (
-                torch.linalg.vector_norm(p.grad.detach()).to(torch.float64).square()
-            )
+
+    def norm_squared(parameters):
+        buckets = OrderedDict()
+        for p in parameters:
+            if p.grad is not None:
+                grad = p.grad.detach()
+                buckets.setdefault(grad.dtype, []).append(grad)
+        total = torch.zeros((), dtype=torch.float64, device=params[0].device)
+        for grads in buckets.values():
+            if params[0].device.type in ("cpu", "cuda") and all(
+                grad.layout == torch.strided for grad in grads
+            ):
+                # Keep per-tensor norm precision, then accumulate scalar
+                # squares in FP64 without materializing FP64 gradient copies.
+                norms = torch._foreach_norm(grads, 2)
+                total += torch.stack(norms).to(torch.float64).square().sum()
+            else:
+                for grad in grads:
+                    total += torch.linalg.vector_norm(grad).to(torch.float64).square()
+        return total
+
+    # Sum only local shards across ranks. Replicas have already been
+    # synchronized and must be counted once, not once per rank.
+    total = norm_squared(sharded)
     if _world(group) > 1:
         dist.all_reduce(total, op=dist.ReduceOp.SUM, group=group)
-    for p in replicated:
-        if p.grad is not None:
-            total += (
-                torch.linalg.vector_norm(p.grad.detach()).to(torch.float64).square()
-            )
+    total += norm_squared(replicated)
     norm = total.sqrt()
     scale = (max_norm / (norm + 1e-6)).clamp(max=1.0)
+    buckets = OrderedDict()
     for p in params:
         if p.grad is not None:
-            p.grad.mul_(scale.to(dtype=p.grad.dtype))
+            buckets.setdefault(p.grad.dtype, []).append(p.grad)
+    for dtype, grads in buckets.items():
+        multiplier = scale.to(dtype=dtype)
+        if params[0].device.type in ("cpu", "cuda") and all(
+            grad.layout == torch.strided for grad in grads
+        ):
+            torch._foreach_mul_(grads, multiplier)
+        else:
+            for grad in grads:
+                grad.mul_(multiplier)
     return norm

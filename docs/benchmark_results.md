@@ -189,8 +189,27 @@ The experiment batches local gradient norm and scale operations, retaining
 the scalar cross-rank reduction and counting replicated parameters once.
 Four-rank tests compared norms and gradients for clipping, no clipping, zero
 and absent gradients on CPU and GPU, and compared multi-step AdamW loss and
-state on GPU. The experiment is opt-in via `NNUE_PROFILE_FOREACH_CLIP=1`, not
-the production default; broader validation is still required.
+state on GPU. The batched implementation is now the default in
+`clip_sharded_grad_norm_`; the results above measured its experimental
+predecessor, before the production version retained additional API checks and
+support for ranks with no gradients.
+
+A subsequent four-H200 run validated the production implementation with
+four-rank NCCL norm tests, a two-GPU AdamW comparison to the unsharded model,
+and a compiled four-rank multi-step test. An isolated clipping benchmark with
+the real 92-stack parameter shapes and synthetic, reused gradients measured
+the original loop at 0.96–1.01 ms and the production loop at 0.26–0.27 ms
+per call (two 300-call windows each). This is not an end-to-end speedup; the
+benchmark is reproducible with `scripts/benchmark_sharded_clip.py`.
+
+On the same system, two 1800-step live-loader runs with the original clip
+reached 8.05–8.11M positions/s, while two with the new clip reached
+7.81–7.88M. The slowest rank spent 0.36–0.52 seconds acquiring batches in the
+original runs versus 1.89–2.87 seconds in the new runs. Acquisition and GPU
+work can overlap, and these timings do not isolate cause; they do show that
+the end-to-end comparison is affected by loader imbalance. Shorter 600-step
+windows varied more widely and do not establish a stable throughput gain on
+this system. Both paths retained gradient and weight clipping.
 
 The default sharded trace also showed a 5.08–5.84 ms median host span in
 replicated-gradient synchronization and a 1.52–2.40 ms median feature-gather
@@ -210,6 +229,18 @@ across sharded ranks. These are device-kernel durations under instrumentation,
 may overlap other work, and are not additive estimates of exposed step time.
 They suggest reducing repeated full-batch feature preparation is worth
 investigating in addition to removing host synchronization.
+
+In the same instrumented default-sharding trace, launch attribution on rank
+0 counted 54 kernels per step in the model weight-clipping callback, 37 in
+sharded L1 forward, and 30 in the fused AdamW step. DDP also launched 54 in
+weight clipping. These counts include nested calls and do not establish that
+launch overhead is exposed; the weight-clipping ablation above also changes
+training behavior and its measured range overlaps the baseline. Weight
+clipping performs grouped/virtual-weight expansion before clamping; a fused
+implementation preserving those bounds is a candidate for a controlled test.
+The L1-forward count includes elementwise and gather operations for its
+factorized weights, as well as the grouped matmul and collective. Any change
+should be compared against the existing grouped L1 path with real stack maps.
 
 The trace's median host loader-acquisition span was 0.09–0.11 ms per rank in
 the sharded run; the 600-step baseline measured 0.11–0.17 seconds of host
