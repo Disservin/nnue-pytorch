@@ -19,6 +19,7 @@ import model.modules.feature_transformer.fused_ft_functions as ft_functions
 from model.modules.feature_transformer.composed_feature_transformer import ComposedFeatureTransformer
 from model.modules.layer_stacks import LayerStacks
 from model.modules.sharded_l1 import ShardedL1
+from model.optimizers.lr_scheduler import SafeOneCycleLR
 
 
 def wrap(obj, name, label):
@@ -48,6 +49,9 @@ if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
 if os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1":
     from experimental_bias_add import bucketed_bias_add
     sharded_l1._add_local_bias = bucketed_bias_add
+if os.environ.get("NNUE_PROFILE_FOREACH_CLIP") == "1":
+    from experimental_foreach_clip import foreach_sharded_clip
+    trainer.clip_sharded_grad_norm_ = foreach_sharded_clip
 if os.environ.get("NNUE_PROFILE_FT_BACKWARD") in ("direct", "aggregated"):
     mode = os.environ["NNUE_PROFILE_FT_BACKWARD"]
     def ft_selector(width, batch, active, device):
@@ -62,6 +66,8 @@ if os.environ.get("NNUE_PROFILE_FT_BACKWARD") in ("direct", "aggregated"):
             raise ValueError("NNUE_PROFILE_FT_TILE must be between 1 and 16")
         ft_functions._aggregated_tile_size = lambda *args: tile
 wrap(model, "gather_packed_features", "phase:feature_gather_total")
+wrap(features, "begin_native_packed_features", "phase:feature_prepare_exchange")
+wrap(features, "_unpack_native_gathered", "phase:feature_reconstruct")
 wrap(features, "_unpack_rows", "phase:feature_unpack")
 profile_compile_override = any(os.environ.get(key) == "1" for key in (
     "NNUE_PROFILE_COMPILE_FT_MERGE", "NNUE_PROFILE_COMPILE_TAIL", "NNUE_PROFILE_COMPILE_LOSS"
@@ -72,12 +78,17 @@ if profile_compile_override or "--eager-sharded" in sys.argv:
     wrap(ComposedFeatureTransformer, "merged_weight_and_bias", "phase:ft_merge_quantize")
 wrap(ComposedFeatureTransformer, "forward", "phase:ft_forward_total")
 wrap(ShardedL1, "forward", "phase:sharded_l1_forward")
+wrap(sharded_l1._SumReduceScatter, "forward", "phase:l1_reduce_scatter")
+wrap(sharded_l1._SumReduceScatter, "backward", "phase:l1_gradient_all_gather")
 if profile_compile_override or "--eager-sharded" in sys.argv:
     wrap(LayerStacks, "forward_from_l1", "phase:tail_forward")
 wrap(backward, "global_weighted_loss", "phase:loss_denominator")
 wrap(backward, "synchronize_replicated_gradients", "phase:replica_grad_sync")
 wrap(trainer, "backward_weighted_loss", "phase:backward_total")
 wrap(trainer, "clip_sharded_grad_norm_", "phase:clip_total")
+if os.environ.get("NNUE_PROFILE_NVTX") == "1":
+    wrap(torch.optim.AdamW, "step", "phase:adamw_step")
+    wrap(SafeOneCycleLR, "step", "phase:scheduler_step")
 
 gather_wall_times = []
 if os.environ.get("NNUE_PROFILE_GATHER_WALL") == "1":

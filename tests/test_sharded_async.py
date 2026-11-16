@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 
 import model.model as model_module
 import model.sharded_model as sharded_model_module
+import trainer.sharded_adamw as sharded_adamw_module
 from data_loader.distributed_features import begin_native_packed_features
 from model.nnue import NNUE
 from trainer.sharded_adamw import ShardedAdamWStep
@@ -40,6 +41,9 @@ def _worker(rank, port, backend):
                    for i, sizes in enumerate(([2, 0, 3, 1], [1, 2, 0, 4], [0, 1, 4, 1]))]
         expected_losses = [runner.step(batch).clone() for batch in batches]
         expected = copy.deepcopy(runner.state_dict())
+        if os.environ.get("NNUE_TEST_FOREACH_CLIP") == "1":
+            from scripts.experimental_foreach_clip import foreach_sharded_clip
+            sharded_adamw_module.clip_sharded_grad_norm_ = foreach_sharded_clip
         if os.environ.get("NNUE_TEST_COMPILED_DEFAULT") == "1":
             nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5,
                         sharding=(rank, 4)).to(device)
