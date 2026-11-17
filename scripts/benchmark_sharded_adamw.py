@@ -63,6 +63,16 @@ def pack_saved_batch(batch):
     return us, them, native, None, outcome, score, stacks
 
 
+def match_sharded_initial_parameters(nnue, config, *, max_epoch, num_batches_per_epoch, seed):
+    """Initialize shards from the same full-model seed as the DDP control."""
+    torch.manual_seed(seed)
+    full = NNUE(config, max_epoch=max_epoch, num_batches_per_epoch=num_batches_per_epoch)
+    nnue.model.input.load_unsharded(full.model.input)
+    nnue.model.layer_stacks.l1.load_unsharded(full.model.layer_stacks.l1)
+    nnue.model.layer_stacks.l2.load_state_dict(full.model.layer_stacks.l2.state_dict())
+    nnue.model.layer_stacks.output.load_state_dict(full.model.layer_stacks.output.state_dict())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True, choices=("ddp", "sharded"))
@@ -96,6 +106,12 @@ def main():
                         help="Diagnostic: reuse the first live batch throughout the timing window")
     parser.add_argument("--repeat-batch-cache",
                         help="Save or reload repeated rank batches; use a fresh directory per input and configuration")
+    parser.add_argument("--matched-batch-cache",
+                        help="Cache the same dense rank batches for DDP and packed sharding comparisons")
+    parser.add_argument("--matched-batch-index", type=int, default=0,
+                        help="Select a later loader batch when creating a matched cache")
+    parser.add_argument("--matched-initial-parameters", action="store_true",
+                        help="Initialize shards from the same full-model seed as DDP")
     parser.add_argument("--throughput-window", action="store_true",
                         help="Time a sustained live-loader window without per-step barriers")
     parser.add_argument("--measure-loader-wait", action="store_true",
@@ -172,6 +188,10 @@ def main():
         raise ValueError("repeating a live batch requires a non-async throughput window")
     if args.repeat_batch_cache and not args.repeat_live_batch:
         raise ValueError("--repeat-batch-cache requires --repeat-live-batch")
+    if args.matched_batch_cache and (not args.repeat_live_batch or args.repeat_batch_cache):
+        raise ValueError("--matched-batch-cache requires --repeat-live-batch and excludes --repeat-batch-cache")
+    if args.matched_batch_index < 0 or (args.matched_batch_index and not args.matched_batch_cache):
+        raise ValueError("matched-batch-index must be nonnegative and requires a matched cache")
     if args.throughput_window and (not args.live_loader or args.profile):
         raise ValueError("--throughput-window requires --live-loader and excludes --profile")
     if args.measure_loader_wait and not args.throughput_window:
@@ -227,13 +247,19 @@ def main():
         )
         loader_config = DataloaderSkipConfig()
         loader_io = DataloaderIOConfig(shuffle_buffer_entries=131072)
-    torch.manual_seed(1 if args.nettest_settings else 2026)
+    seed = 1 if args.nettest_settings else 2026
+    max_epoch = 560 if args.nettest_settings else 2
+    num_batches = 1073741824 // args.global_batch if args.nettest_settings else 100
+    torch.manual_seed(seed)
     nnue = NNUE(
         config,
-        max_epoch=560 if args.nettest_settings else 2,
-        num_batches_per_epoch=1073741824 // args.global_batch if args.nettest_settings else 100,
+        max_epoch=max_epoch,
+        num_batches_per_epoch=num_batches,
         sharding=(rank, world) if args.mode == "sharded" else None,
     ).cuda(rank)
+    if (args.matched_batch_cache or args.matched_initial_parameters) and args.mode == "sharded":
+        match_sharded_initial_parameters(nnue, config, max_epoch=max_epoch,
+                                         num_batches_per_epoch=num_batches, seed=seed)
     if os.environ.get("NNUE_BENCH_COMPILE_WEIGHT_CLIP") == "1":
         nnue.model._compile_layer_clipping = True
     live_loader = None
@@ -247,7 +273,7 @@ def main():
             ddp_config=DataloaderDDPConfig(rank=rank, world_size=world),
             io_config=loader_io,
             use_pinned_memory=True,
-            packed_sharded=native_requested,
+            packed_sharded=native_requested and not args.matched_batch_cache,
         )
         live_loader = DevicePrefetcher(dataset, num_batches=args.warmup + args.steps + 2,
                                              queue_size_limit=2, device=torch.device("cuda", rank))
@@ -257,13 +283,22 @@ def main():
             layout = "packed" if native_requested else "dense"
             cache_file = os.path.join(args.repeat_batch_cache,
                                       f"batch-{args.mode}-{layout}-{rank}-{args.global_batch}.pt")
+        elif args.matched_batch_cache:
+            os.makedirs(args.matched_batch_cache, exist_ok=True)
+            cache_file = os.path.join(args.matched_batch_cache,
+                                      f"batch-{args.matched_batch_index}-{rank}-{args.global_batch}.pt")
         if cache_file and os.path.isfile(cache_file):
             batch = torch.load(cache_file, map_location=torch.device("cuda", rank), weights_only=True)
         else:
             batch = live_loader.next_batch()
+            if args.matched_batch_cache:
+                for batch_index in range(args.matched_batch_index):
+                    batch = live_loader.next_batch()
             if cache_file:
                 torch.cuda.synchronize()
                 torch.save(batch, cache_file)
+        if args.matched_batch_cache and native_requested:
+            batch = pack_saved_batch(batch)
         repeated_batch = batch if args.repeat_live_batch else None
         active = (batch[2]["nw"] / batch[2]["size"] if native_requested
                   else (batch[2] >= 0).sum().item() / batch[2].shape[0])
@@ -506,6 +541,9 @@ def main():
                               "global_batch": args.global_batch, "steps": args.steps,
                               "live_loader": True, "throughput_window": True,
                               "repeat_live_batch": args.repeat_live_batch,
+                              "matched_batch": bool(args.matched_batch_cache),
+                              "matched_batch_index": args.matched_batch_index if args.matched_batch_cache else None,
+                              "matched_initial_parameters": bool(args.matched_batch_cache or args.matched_initial_parameters),
                               "nettest_settings": args.nettest_settings,
                               "nettest_batch_jitter_disabled": args.nettest_settings,
                               "nettest_quantization_phase": "post_warmup" if args.nettest_settings else None,
