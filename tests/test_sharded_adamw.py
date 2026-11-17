@@ -176,6 +176,9 @@ def test_compilation_selection_on_cpu(monkeypatch):
     invalid = NNUE(_config(), sharding=(0, 1))
     with pytest.raises(TypeError, match="compile_model"):
         ShardedAdamWStep(invalid, compile_model="yes")
+    invalid_bias = NNUE(_config(), sharding=(0, 1))
+    with pytest.raises(TypeError, match="bucketed_bias"):
+        ShardedAdamWStep(invalid_bias, bucketed_bias="yes")
 
 
 def test_real_features_allocate_only_shard_width():

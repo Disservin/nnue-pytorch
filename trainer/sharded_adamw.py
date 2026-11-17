@@ -15,7 +15,14 @@ from trainer.engine import is_one_cycle
 
 
 class ShardedAdamWStep:
-    def __init__(self, nnue, *, group=None, gradient_clip_val=2.0, compile_model: bool | None = None):
+    """Run AdamW on FT/L1 shards and a data-parallel tail.
+
+    ``bucketed_bias`` opts into a guarded CUDA bias-gradient reduction; it
+    falls back to eager for unsupported inputs and remains a caller choice
+    when restoring a checkpoint.
+    """
+    def __init__(self, nnue, *, group=None, gradient_clip_val=2.0,
+                 compile_model: bool | None = None, bucketed_bias: bool = False):
         if not isinstance(nnue.model, ShardedNNUEModel):
             raise TypeError(
                 "ShardedAdamWStep requires a directly constructed sharded NNUE"
@@ -52,7 +59,10 @@ class ShardedAdamWStep:
         device = next(nnue.parameters()).device
         if compile_model is not None and not isinstance(compile_model, bool):
             raise TypeError("compile_model must be a bool or None")
+        if not isinstance(bucketed_bias, bool):
+            raise TypeError("bucketed_bias must be a bool")
         self.compile_model = device.type == "cuda" if compile_model is None else compile_model
+        self.bucketed_bias = bucketed_bias
         # Replicas may have been created with different process seeds. Broadcast
         # them before creating optimizer state; never broadcast shard weights.
         if self.world > 1:
@@ -64,6 +74,7 @@ class ShardedAdamWStep:
                     dist.broadcast(buffer, src=src, group=group)
         nnue.model._compile_layer_clipping = self.compile_model
         nnue.model.layer_stacks.l1._compile_l1_merge = self.compile_model
+        nnue.model.layer_stacks.l1._bucketed_bias = self.bucketed_bias
         if self.compile_model:
             # Compile only the tested, local pieces. The distributed forward
             # itself includes collectives and remains eager.

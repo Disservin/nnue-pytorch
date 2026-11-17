@@ -122,6 +122,10 @@ def main():
                         help="Measure the GPU stream interval surrounding batch acquisition")
     parser.add_argument("--async-features", action="store_true",
                         help="Experimentally overlap next-batch feature exchange with backward")
+    parser.add_argument("--bucketed-l1-bias", action="store_true",
+                        help="Use the optional guarded bucketed L1 bias-gradient path")
+    parser.add_argument("--require-bucketed-l1-fastpath", action="store_true",
+                        help="Fail rather than measure an unsupported bias fast-path configuration")
     parser.add_argument("--nsys-capture", action="store_true",
                         help="Bracket the measured throughput window with CUDA profiler APIs")
     parser.add_argument(
@@ -167,6 +171,10 @@ def main():
         raise ValueError("--compile-ddp applies only to the DDP baseline")
     if args.eager_sharded and args.mode != "sharded":
         raise ValueError("--eager-sharded applies only to sharded mode")
+    if args.bucketed_l1_bias and args.mode != "sharded":
+        raise ValueError("--bucketed-l1-bias applies only to sharded mode")
+    if args.require_bucketed_l1_fastpath and not args.bucketed_l1_bias:
+        raise ValueError("--require-bucketed-l1-fastpath requires --bucketed-l1-bias")
     profile_compile = any(os.environ.get(key) == "1" for key in (
         "NNUE_PROFILE_COMPILE_FT_MERGE", "NNUE_PROFILE_COMPILE_TAIL", "NNUE_PROFILE_COMPILE_LOSS"
     ))
@@ -344,6 +352,7 @@ def main():
             return torch.cuda.nvtx.range(name)
         return torch.profiler.record_function(name) if args.profile else nullcontext()
 
+    bucketed_bias_eligible = None
     if args.mode == "ddp":
         if args.compile_ddp:
             torch._dynamo.config.cache_size_limit = 64
@@ -413,6 +422,7 @@ def main():
         runner = ShardedAdamWStep(
             nnue, gradient_clip_val=None if args.ablate_gradient_clipping else 2.0,
             compile_model=False if args.eager_sharded or profile_compile else None,
+            bucketed_bias=args.bucketed_l1_bias,
         )
         if os.environ.get("NNUE_BENCH_REFERENCE_LAUNCHES") == "1":
             nnue.model._compile_layer_clipping = False
@@ -420,6 +430,17 @@ def main():
         if args.ablate_shared_l1_factor:
             runner.sharded = [p for p in runner.sharded if p.requires_grad]
             runner.replicated = [p for p in runner.replicated if p.requires_grad]
+        if args.bucketed_l1_bias:
+            from model.modules.bucketed_bias import _eligible
+            l1 = nnue.model.layer_stacks.l1
+            local_indices = batch[-1]
+            probe = torch.empty((local_indices.numel(), l1.out_features),
+                                dtype=torch.float32, device=local_indices.device)
+            bucketed_bias_eligible = _eligible(probe, l1.linear.bias, local_indices,
+                                              l1.count, l1.out_features)
+            del probe
+            if args.require_bucketed_l1_fastpath and not bucketed_bias_eligible:
+                raise RuntimeError("bucketed L1 bias fast path is not eligible for this batch")
         if args.nsys_capture:
             def mark_method(obj, name, label):
                 original = getattr(obj, name)
@@ -565,6 +586,9 @@ def main():
                               "loader_workers_per_rank": args.loader_workers,
                               "stored_layer_stacks": nnue.model.layer_stacks.count,
                               "async_features": args.async_features,
+                              "bucketed_l1_bias": (args.bucketed_l1_bias
+                                                   or os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1"),
+                              "bucketed_l1_fastpath_eligible": bucketed_bias_eligible,
                               "compiled_layer_clipping": getattr(nnue.model, "_compile_layer_clipping", False),
                               "compiled_l1_merge": (getattr(nnue.model.layer_stacks.l1, "_compile_l1_merge", False)
                                                     if args.mode == "sharded" else None),

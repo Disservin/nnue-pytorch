@@ -247,4 +247,7 @@ class ShardedL1(FactorizedStackedLinear):
             partial = self.select_output(F.linear(x, weight), global_indices)
         local = sum_reduce_scatter_batch(partial, offsets, group)
         local_indices = global_indices[offsets[rank] : offsets[rank + 1]]
+        if getattr(self, "_bucketed_bias", False):
+            from .bucketed_bias import bucketed_bias_add
+            return bucketed_bias_add(local, bias, local_indices, self.count, self.out_features)
         return _add_local_bias(local, bias, local_indices, self.count, self.out_features)
