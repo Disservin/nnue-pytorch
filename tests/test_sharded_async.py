@@ -53,10 +53,10 @@ def _worker(rank, port, backend):
                 expected_gradients.append({name: None if p.grad is None else p.grad.clone()
                                            for name, p in nnue.named_parameters()})
         expected = copy.deepcopy(runner.state_dict())
-        if os.environ.get("NNUE_TEST_COMPILED_DEFAULT") == "1":
+        if os.environ.get("NNUE_TEST_COMPILED_DEFAULT") == "1" or test_bias:
             nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5,
                         sharding=(rank, 4)).to(device)
-            runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2)
+            runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2, bucketed_bias=test_bias)
             assert runner.compile_model == (device.type == "cuda")
         runner.load_state_dict(initial)
         if os.environ.get("NNUE_TEST_COMPILE_L1_MERGE") == "1":
@@ -64,10 +64,6 @@ def _worker(rank, port, backend):
             l1._compile_l1_merge = True
         if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
             sharded_l1._SumReduceScatter = original_collective
-        if test_bias:
-            import model.modules.sharded_l1 as sharded_l1
-            from scripts.experimental_bias_add import bucketed_bias_add
-            sharded_l1._add_local_bias = bucketed_bias_add
         if os.environ.get("NNUE_ASYNC_TEST_COMPILE") == "1":
             nnue.model.layer_stacks.forward_from_l1 = torch.compile(
                 nnue.model.layer_stacks.forward_from_l1
