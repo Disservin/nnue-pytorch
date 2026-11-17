@@ -246,3 +246,58 @@ The trace's median host loader-acquisition span was 0.09–0.11 ms per rank in
 the sharded run; the 600-step baseline measured 0.11–0.17 seconds of host
 acquisition per rank. This does not include all GPU-side input waits. Raw
 traces and logs contain machine-specific metadata and should remain private.
+
+### Dense clipping and L1 launch reduction
+
+The frequent dense-layer weight clipping is compiled for CUDA FP32 when
+training with Inductor. Feature-transformer clipping remains a separate eager
+operation. Sharded training also compiles the L1 factor merge and, for equal
+nonempty NCCL batches, directly reduce-scatters the partial output and uses
+an all-gather into a contiguous tensor for backward. Uneven, empty, Gloo and
+single-rank batches retain the padded implementation. Compiled code falls back
+to eager for CPU, autocast or non-FP32 parameters; the sharded runner's
+`compile_model=False` disables both compiled helpers. Compiled callables are
+unbound and cached outside the model so model copies and serialization do not
+capture the original model instance.
+
+On four H200 GPUs, compiled QAT, batch 131072, 92 stored stacks, and the real
+binpack and remap were used for the comparisons below. Each measurement has
+32 warmup and 600 measured steps; both paths include gradient and weight
+clipping. Lambda batch jitter remains disabled, and the binpack is one source
+from the training mixture. The original sharded control explicitly uses the
+old padding collective and eager dense clipping/L1 merge while retaining the
+previously compiled FT, tail, loss and batched gradient clipping. The DDP
+control differs only in dense clipping. Two runs were performed for each.
+
+| Case | Input | Before (M pos/s; ms/batch) | After (M pos/s; ms/batch) |
+| --- | --- | --- | --- |
+| Sharded | live, 16 loader workers/rank | 8.46–8.52; 15.39–15.49 | 9.26–9.35; 14.02–14.16 |
+| Sharded | repeated identical real batch | 10.70–10.79; 12.15–12.25 | 11.32–11.35; 11.55–11.58 |
+| DDP | live, 16 loader workers/rank | 8.10–8.83; 14.85–16.18 | 8.39–8.45; 15.51–15.62 |
+| DDP | repeated identical real batch | 9.68–9.91; 13.23–13.54 | 10.06–10.07; 13.02–13.03 |
+
+The repeated-batch diagnostic saves the first rank-local batches and reloads
+the same data within each mode; DDP and sharding use separately captured
+batches. It excludes ongoing data acquisition and is not a training-throughput
+result. In the live sharded windows, the slowest rank's
+host acquisition time was 0.11–0.35 seconds per run. The slowest DDP rank
+spent 2.96–3.90 seconds acquiring data in each roughly nine-second window;
+the measured spans can overlap GPU work. The live DDP ranges overlap and do
+not establish either a DDP improvement or a fair DDP-versus-sharding speed
+advantage. Individual run data are in `kernel_launch_results.json`.
+
+Nsight captures on the repeated batch attributed 54 kernels per step to dense
+weight clipping before versus 3 after, and 37 kernels in sharded L1 forward
+before versus 10 after, on rank 0. These are nested CPU-launch attributions;
+tracing perturbs execution and the counts do not measure exposed time. Separate
+repeated-batch experiments with all three changes together were 11.53–11.57 ms
+versus 12.02–12.27 ms in their baseline windows. Isolating changes showed
+smaller gains and interactions, so the differences should not be added.
+
+GPU correctness checks covered QAT on/off, rounding boundaries, cancellation,
+zero/one/multiple nonzero factor maps, remapped stacks, clipping boundary and
+non-finite values, copied/serialized models and CPU/autocast fallback. The
+real 92-stack, three-factor model matched eager clipping and L1 merge exactly.
+Distributed tests compared original and optimized collectives and optimizer
+steps, including equal, uneven, empty, noncontiguous and subgroup cases. CUDA
+graph capture/replay of these new paths has not been verified.
