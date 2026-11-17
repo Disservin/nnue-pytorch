@@ -409,3 +409,62 @@ separate four-rank NCCL test compared first-step losses,
 gradients, remaining parameter updates and AdamW states, including an empty
 local batch. No net-strength or convergence comparison was performed.
 Individual sanitized windows are in `l1_factor_ablation_results.json`.
+
+### Guarded bucketed L1 bias reduction
+
+The bucketed bias-gradient path is available explicitly through
+`ShardedAdamWStep(..., bucketed_bias=True)` or the benchmark's
+`--bucketed-l1-bias`; it is not the default. It keeps the eager PyTorch
+forward gather and bounds behavior, accepts valid negative indices, masks
+invalid router accesses before narrowing int64 IDs, and does not read index
+values back to the host. It only selects the fast CUDA path for supported
+same-device FP32 shapes, int64 indices, 1–256 stacks, width 1–128 and a
+conservative 64 MiB estimated backward-scratch cap. The estimate includes
+router rows/counts, reduction partials and result, plus possible contiguous
+copies of indices and incoming gradients; it excludes the common eager forward
+outputs and allocator overhead. For 92 stacks, 32768 local positions and width
+32, the conservative estimate is approximately 15.85 MiB per GPU.
+Unsupported devices, dependencies, shapes,
+dtypes, autocast, deterministic mode, empty inputs and CUDA graph capture use
+the existing eager path. Higher-order gradients use differentiable PyTorch
+reduction rather than the raw kernel. The caller chooses the option again
+when constructing a runner for checkpoint resume.
+
+On four H200 GPUs with 64 allocated CPU cores and 16 loader workers per rank,
+the final graph-safe version was compared with current sharding. Both used
+global batch 131072, 92 stored stacks, post-warmup QAT, AdamW, clipping,
+nettest filters, one real training binpack and identical initial model weights.
+Lambda batch jitter was disabled. Two different saved global batches were
+used for one 1000-step timing per path and batch, after 64 warmup steps; the
+same batch was reused during each window, excluding ongoing loading:
+
+| Path | Matched-batch positions/s | ms/global batch |
+| --- | ---: | ---: |
+| Current sharding | 11.44–11.51M | 11.393–11.460 |
+| Guarded bucketed bias | 12.35–12.39M | 10.576–10.613 |
+
+The saved-batch path improved throughput by roughly 8% and reduced step time
+by about 0.8 ms. A 100-step Nsight capture of the final version contained
+exactly 100 router and 100 bias-reduction kernels on each rank. This verifies
+execution rather than relying only on the benchmark's metadata eligibility
+probe. Tracing itself is intrusive and is not used for throughput numbers.
+
+In two final-version 3000-step live windows per path, with 64 warmup steps and
+independently loaded positions, current sharding reached 10.23–10.25M pos/s
+(12.787–12.815 ms/batch), while bucketed bias reached 10.10–10.18M pos/s
+(12.882–12.977 ms/batch). The slowest rank spent 0.62–1.00 s per baseline run
+and 1.73–2.09 s per bucketed run acquiring batches; that host time can overlap
+GPU work. Four additional 3000-step windows per path on an earlier guard
+iteration varied more widely: 8.81–10.25M baseline and 9.92–10.64M bucketed.
+The code versions and individual windows are identified in
+`bucketed_bias_hardened_results.json`. These live results do not establish a
+consistent throughput win, so the path remains opt-in.
+
+The final GPU suite passed 37 tests, including the original bias-gradient
+tests, concentrated buckets, noncontiguous indices/gradients, negative and
+invalid int64 IDs, extreme values, memory-cap boundaries, fallback cases,
+higher-order derivatives, CUDA graph forward capture/replay, nondefault
+streams, cross-device execution and four-rank compiled AdamW parity. A
+separate four-rank test compared two QAT/AdamW steps on the real 92-stack
+model and saved batch, including gradients, parameters and optimizer states.
+These are correctness tests, not convergence or net-strength measurements.
