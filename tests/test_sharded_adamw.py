@@ -163,7 +163,11 @@ def test_compilation_selection_on_cpu(monkeypatch):
     calls = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: calls.append(kwargs) or fn)
     eager = NNUE(_config(), sharding=(0, 1))
+    eager.model._compile_layer_clipping = True
+    eager.model.layer_stacks.l1._compile_l1_merge = True
     assert not ShardedAdamWStep(eager).compile_model
+    assert not eager.model._compile_layer_clipping
+    assert not eager.model.layer_stacks.l1._compile_l1_merge
     assert not calls
     requested = NNUE(_config(), sharding=(0, 1))
     monkeypatch.setattr(requested, "enable_compiled_loss", lambda: calls.append("loss"))

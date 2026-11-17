@@ -62,6 +62,8 @@ class ShardedAdamWStep:
                     dist.broadcast(p, src=src, group=group)
                 for buffer in nnue.model.layer_stacks.buffers():
                     dist.broadcast(buffer, src=src, group=group)
+        nnue.model._compile_layer_clipping = self.compile_model
+        nnue.model.layer_stacks.l1._compile_l1_merge = self.compile_model
         if self.compile_model:
             # Compile only the tested, local pieces. The distributed forward
             # itself includes collectives and remains eager.

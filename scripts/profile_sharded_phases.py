@@ -49,6 +49,9 @@ if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
 if os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1":
     from experimental_bias_add import bucketed_bias_add
     sharded_l1._add_local_bias = bucketed_bias_add
+if os.environ.get("NNUE_PROFILE_REFERENCE_L1_COLLECTIVE") == "1":
+    from reference_l1_collective import ReferenceReduceScatter
+    sharded_l1._SumReduceScatter = ReferenceReduceScatter
 if os.environ.get("NNUE_PROFILE_FT_BACKWARD") in ("direct", "aggregated"):
     mode = os.environ["NNUE_PROFILE_FT_BACKWARD"]
     def ft_selector(width, batch, active, device):

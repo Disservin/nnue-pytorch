@@ -1,6 +1,7 @@
 """Paired-input L1 shards and autograd-aware batch reduce-scatter."""
 
 import math
+from functools import lru_cache
 from itertools import pairwise
 
 import torch
@@ -10,6 +11,11 @@ import torch.nn.functional as F
 from . import stacked_linear
 from .feature_transformer.sharded_feature_transformer import FTShardLayout
 from .stacked_linear import FactorizedStackedLinear
+
+
+@lru_cache(maxsize=1)
+def _compiled_l1_merge():
+    return torch.compile(ShardedL1.merged_parameters, fullgraph=True)
 
 
 def _add_local_bias(values, bias, indices, count, out_features):
@@ -22,6 +28,15 @@ class _SumReduceScatter(torch.autograd.Function):
         world = len(offsets) - 1
         rank = dist.get_rank(group) if world > 1 else 0
         sizes = tuple(offsets[i + 1] - offsets[i] for i in range(world))
+        ctx.equal_batch_fast = (
+            world > 1 and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
+            and dist.get_backend(group) == "nccl"
+        )
+        if ctx.equal_batch_fast:
+            result = values.new_empty((sizes[0], values.shape[1]))
+            dist.reduce_scatter_tensor(result, values.contiguous(), group=group)
+            ctx.world, ctx.group = world, group
+            return result
         max_size = max(1, *sizes)
         # Equal-size blocks permit NCCL reduce_scatter_tensor with uneven local
         # batches. All ranks use the same rank-order offsets from feature gather.
@@ -43,6 +58,12 @@ class _SumReduceScatter(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.equal_batch_fast:
+            grad = grad_output.new_empty(
+                (ctx.world * grad_output.shape[0], grad_output.shape[1])
+            )
+            dist.all_gather_into_tensor(grad, grad_output.contiguous(), group=ctx.group)
+            return grad, None, None
         padded = grad_output.new_zeros((ctx.max_size, grad_output.shape[1]))
         padded[: ctx.sizes[ctx.rank]].copy_(grad_output)
         blocks = [torch.empty_like(padded) for _ in ctx.sizes]
@@ -169,6 +190,20 @@ class ShardedL1(FactorizedStackedLinear):
             src = source[name]
             dest.copy_(self.layout.select_columns(src) if src.ndim == 2 else src)
 
+    def merged_parameters(self, fake_quantize_weights=False):
+        """Merge the L1 factors before optional fake quantization."""
+        weight = self.linear.weight + self.factorized_linear.weight.repeat(
+            self.count, 1
+        )
+        bias = self.linear.bias + self.factorized_linear.bias.repeat(self.count)
+        ge = self.group_expansion()
+        if ge is not None:
+            weight, bias = weight + ge[0], bias + ge[1]
+        if fake_quantize_weights:
+            weight = self.quantization.fake_quantize_weights(weight, "ls_l1_weight")
+            bias = self.quantization.fake_quantize_weights(bias, "ls_l1_bias")
+        return weight, bias
+
     def forward(
         self, x, global_indices, offsets, fake_quantize_weights=False, group=None
     ):
@@ -194,16 +229,13 @@ class ShardedL1(FactorizedStackedLinear):
         rank = dist.get_rank(group) if world > 1 else 0
         if world != self.layout.world_size or rank != self.layout.rank:
             raise ValueError("L1 shard layout must match its process group")
-        weight = self.linear.weight + self.factorized_linear.weight.repeat(
-            self.count, 1
-        )
-        bias = self.linear.bias + self.factorized_linear.bias.repeat(self.count)
-        ge = self.group_expansion()
-        if ge is not None:
-            weight, bias = weight + ge[0], bias + ge[1]
-        if fake_quantize_weights:
-            weight = self.quantization.fake_quantize_weights(weight, "ls_l1_weight")
-            bias = self.quantization.fake_quantize_weights(bias, "ls_l1_bias")
+        if (getattr(self, "_compile_l1_merge", False) and x.device.type == "cuda"
+                and not torch.is_autocast_enabled()
+                and all(p.device.type == "cuda" and p.dtype == torch.float32
+                        for p in self.parameters())):
+            weight, bias = _compiled_l1_merge()(self, fake_quantize_weights)
+        else:
+            weight, bias = self.merged_parameters(fake_quantize_weights)
         if stacked_linear.can_use_grouped_l1(x, weight, bias, self.count):
             # Bias is added exactly once after reduce-scatter. This zero tensor
             # is not a parameter and its gradient is never computed.

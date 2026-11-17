@@ -92,6 +92,10 @@ def main():
                         help="Skip gradient-norm clipping; diagnostic only, not equivalent training")
     parser.add_argument("--live-loader", action="store_true",
                         help="Include asynchronous binpack loading in each timed step")
+    parser.add_argument("--repeat-live-batch", action="store_true",
+                        help="Diagnostic: reuse the first live batch throughout the timing window")
+    parser.add_argument("--repeat-batch-cache",
+                        help="Save or reload repeated rank batches; use a fresh directory per input and configuration")
     parser.add_argument("--throughput-window", action="store_true",
                         help="Time a sustained live-loader window without per-step barriers")
     parser.add_argument("--measure-loader-wait", action="store_true",
@@ -164,6 +168,10 @@ def main():
         raise ValueError("--save-batch-dir requires --binpack")
     if args.live_loader and (not args.binpack or args.save_batch_dir):
         raise ValueError("--live-loader requires --binpack and cannot save fixed batches")
+    if args.repeat_live_batch and (not args.throughput_window or args.async_features):
+        raise ValueError("repeating a live batch requires a non-async throughput window")
+    if args.repeat_batch_cache and not args.repeat_live_batch:
+        raise ValueError("--repeat-batch-cache requires --repeat-live-batch")
     if args.throughput_window and (not args.live_loader or args.profile):
         raise ValueError("--throughput-window requires --live-loader and excludes --profile")
     if args.measure_loader_wait and not args.throughput_window:
@@ -226,6 +234,8 @@ def main():
         num_batches_per_epoch=1073741824 // args.global_batch if args.nettest_settings else 100,
         sharding=(rank, world) if args.mode == "sharded" else None,
     ).cuda(rank)
+    if os.environ.get("NNUE_BENCH_COMPILE_WEIGHT_CLIP") == "1":
+        nnue.model._compile_layer_clipping = True
     live_loader = None
     native_requested = os.environ.get("NNUE_BENCH_NATIVE_PACKED") == "1"
     if native_requested and args.mode != "sharded":
@@ -240,8 +250,21 @@ def main():
             packed_sharded=native_requested,
         )
         live_loader = DevicePrefetcher(dataset, num_batches=args.warmup + args.steps + 2,
-                                       queue_size_limit=2, device=torch.device("cuda", rank))
-        batch = live_loader.next_batch()
+                                             queue_size_limit=2, device=torch.device("cuda", rank))
+        cache_file = None
+        if args.repeat_batch_cache:
+            os.makedirs(args.repeat_batch_cache, exist_ok=True)
+            layout = "packed" if native_requested else "dense"
+            cache_file = os.path.join(args.repeat_batch_cache,
+                                      f"batch-{args.mode}-{layout}-{rank}-{args.global_batch}.pt")
+        if cache_file and os.path.isfile(cache_file):
+            batch = torch.load(cache_file, map_location=torch.device("cuda", rank), weights_only=True)
+        else:
+            batch = live_loader.next_batch()
+            if cache_file:
+                torch.cuda.synchronize()
+                torch.save(batch, cache_file)
+        repeated_batch = batch if args.repeat_live_batch else None
         active = (batch[2]["nw"] / batch[2]["size"] if native_requested
                   else (batch[2] >= 0).sum().item() / batch[2].shape[0])
     elif args.load_batch_dir:
@@ -351,6 +374,9 @@ def main():
             nnue, gradient_clip_val=None if args.ablate_gradient_clipping else 2.0,
             compile_model=False if args.eager_sharded or profile_compile else None,
         )
+        if os.environ.get("NNUE_BENCH_REFERENCE_LAUNCHES") == "1":
+            nnue.model._compile_layer_clipping = False
+            nnue.model.layer_stacks.l1._compile_l1_merge = False
         if args.nsys_capture:
             def mark_method(obj, name, label):
                 original = getattr(obj, name)
@@ -394,7 +420,7 @@ def main():
             nonlocal batch, pipeline_batch, pipeline_pending
             if not args.async_features:
                 with phase("step:loader_acquire"):
-                    batch = live_loader.next_batch()
+                    batch = repeated_batch if args.repeat_live_batch else live_loader.next_batch()
                 return train_step()
             batch = pipeline_batch
             nvtx = (torch.cuda.nvtx.range("phase:async_feature_finish")
@@ -435,7 +461,8 @@ def main():
             if args.measure_loader_wait:
                 wait_started = time.perf_counter()
             with phase("step:loader_acquire"):
-                batch = live_loader.next_batch()
+                batch = (repeated_batch if args.repeat_live_batch
+                         else live_loader.next_batch())
             if args.measure_loader_wait:
                 host_loader_wait.append(time.perf_counter() - wait_started)
             if args.measure_input_device_wait:
@@ -478,6 +505,7 @@ def main():
             print(json.dumps({"mode": args.mode, "world_size": world,
                               "global_batch": args.global_batch, "steps": args.steps,
                               "live_loader": True, "throughput_window": True,
+                              "repeat_live_batch": args.repeat_live_batch,
                               "nettest_settings": args.nettest_settings,
                               "nettest_batch_jitter_disabled": args.nettest_settings,
                               "nettest_quantization_phase": "post_warmup" if args.nettest_settings else None,
@@ -490,6 +518,10 @@ def main():
                               "loader_workers_per_rank": args.loader_workers,
                               "stored_layer_stacks": nnue.model.layer_stacks.count,
                               "async_features": args.async_features,
+                              "compiled_layer_clipping": getattr(nnue.model, "_compile_layer_clipping", False),
+                              "compiled_l1_merge": (getattr(nnue.model.layer_stacks.l1, "_compile_l1_merge", False)
+                                                    if args.mode == "sharded" else None),
+                              "reference_l1_collective": os.environ.get("NNUE_PROFILE_REFERENCE_L1_COLLECTIVE") == "1",
                               "compiled": (args.compile_ddp if args.mode == "ddp" else
                                            runner.compile_model or profile_compile),
                               "gpu": torch.cuda.get_device_name(rank),

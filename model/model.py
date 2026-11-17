@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -5,6 +7,13 @@ from .config import ModelConfig
 from .modules import ComposedFeatureTransformer, LayerStacks, get_feature_cls
 from .modules.layer_stacks import stack_count, stack_keys
 from .quantize import QuantizationManager
+
+
+@lru_cache(maxsize=1)
+def _compiled_layer_clipping():
+    # Cache an unbound callable so copied/serialized models never retain a
+    # compiled closure pointing at the original instance.
+    return torch.compile(NNUEModel.clip_layer_weights, fullgraph=True)
 
 
 class NNUEModel(nn.Module):
@@ -47,7 +56,18 @@ class NNUEModel(nn.Module):
         """
         if include_input:
             self.input.clip_weights(self.quantization)
+        layers = (self.layer_stacks.l1, self.layer_stacks.l2, self.layer_stacks.output)
+        if (getattr(self, "_compile_layer_clipping", False)
+                and not torch.is_autocast_enabled()
+                and all(p.device.type == "cuda" and p.dtype == torch.float32
+                        for layer in layers for p in layer.parameters())):
+            _compiled_layer_clipping()(self)
+        else:
+            self.clip_layer_weights()
 
+    @torch.no_grad()
+    def clip_layer_weights(self):
+        """Clip the dense layers, independent of the feature transformer."""
         for group in self.weight_clipping:
             for p in group["params"]:
                 if "min_weight" in group or "max_weight" in group:
