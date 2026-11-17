@@ -100,6 +100,8 @@ def main():
                         help="Skip per-step weight clipping for a controlled comparison")
     parser.add_argument("--ablate-gradient-clipping", action="store_true",
                         help="Skip gradient-norm clipping; diagnostic only, not equivalent training")
+    parser.add_argument("--ablate-shared-l1-factor", action="store_true",
+                        help="Benchmark removing the shared L1 weight/bias factor (changes training)")
     parser.add_argument("--live-loader", action="store_true",
                         help="Include asynchronous binpack loading in each timed step")
     parser.add_argument("--repeat-live-batch", action="store_true",
@@ -260,6 +262,9 @@ def main():
     if (args.matched_batch_cache or args.matched_initial_parameters) and args.mode == "sharded":
         match_sharded_initial_parameters(nnue, config, max_epoch=max_epoch,
                                          num_batches_per_epoch=num_batches, seed=seed)
+    if args.ablate_shared_l1_factor:
+        from experimental_no_l1_factor import apply_no_shared_l1_factor
+        apply_no_shared_l1_factor(nnue)
     if os.environ.get("NNUE_BENCH_COMPILE_WEIGHT_CLIP") == "1":
         nnue.model._compile_layer_clipping = True
     live_loader = None
@@ -412,6 +417,9 @@ def main():
         if os.environ.get("NNUE_BENCH_REFERENCE_LAUNCHES") == "1":
             nnue.model._compile_layer_clipping = False
             nnue.model.layer_stacks.l1._compile_l1_merge = False
+        if args.ablate_shared_l1_factor:
+            runner.sharded = [p for p in runner.sharded if p.requires_grad]
+            runner.replicated = [p for p in runner.replicated if p.requires_grad]
         if args.nsys_capture:
             def mark_method(obj, name, label):
                 original = getattr(obj, name)
@@ -551,6 +559,7 @@ def main():
                               "nettest_filter_ablation": args.nettest_ablate_filters,
                               "nettest_weight_clipping_ablation": args.nettest_ablate_weight_clipping,
                               "gradient_clipping_ablation": args.ablate_gradient_clipping,
+                              "shared_l1_factor_ablation": args.ablate_shared_l1_factor,
                               "torch_threads_per_rank": torch.get_num_threads(),
                               "shuffle_buffer_entries": loader_io.shuffle_buffer_entries,
                               "loader_workers_per_rank": args.loader_workers,

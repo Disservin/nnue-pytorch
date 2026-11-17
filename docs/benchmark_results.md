@@ -355,3 +355,57 @@ benchmark override. Before promoting it, guard its supported device, dtype,
 index and stack-count contract and bound its `count * local_batch * 4` byte
 routing scratch allocation. Individual sanitized results are stored in
 `bias_comparison_results.json`; raw logs stay private.
+
+### Shared L1 factor ablation
+
+This diagnostic removes the shared `factorized_linear` weight and bias from
+L1, while retaining all L1 group factors and the FT factorization. It folds
+the shared factor into each base stack first, preserving the initial effective
+weights, then freezes and zeros the two retained placeholder parameters. It
+omits them from optimizer groups, sharded gradient synchronization and norm
+clipping, skips their forward merge, and removes their virtual weight from
+dense weight clipping. This is a changed training parameterization, not an
+equivalent long-term training run; the factor removal is benchmark-only via
+`--ablate-shared-l1-factor`.
+
+On four NVLink-connected H200 GPUs with 64 allocated CPU cores and 16 loader
+workers per GPU, the test used global batch 131072, 92 stored stacks, QAT,
+the same upstream settings and limitations as the preceding comparison, one
+real binpack, and disabled lambda batch jitter. Two distinct saved global
+batches and matching seed-initialized full-model weights were used; each
+configuration ran twice per batch with 48 warmup and 600 measured steps.
+The fixed-input timing excludes ongoing data loading:
+
+| Path | Shared factor | Positions/s | ms/global batch, mean (range) |
+| --- | --- | ---: | ---: |
+| Compiled DDP | On | 9.68–10.05M | 13.286 (13.045–13.535) |
+| Compiled DDP | Removed | 10.08–10.09M | 13.002 (12.997–13.009) |
+| Compiled sharding | On | 11.39–11.46M | 11.467 (11.436–11.507) |
+| Compiled sharding | Removed | 11.31–11.49M | 11.494 (11.411–11.588) |
+| Sharding + experimental bucketed bias | On | 12.30–12.45M | 10.604 (10.532–10.659) |
+| Sharding + experimental bucketed bias | Removed | 12.26–12.48M | 10.594 (10.500–10.694) |
+
+The sharded timings overlap; neither sharded variant shows a measurable saving
+at this resolution. DDP saved about 0.28 ms per batch on the means, or around
+2%, with noticeable baseline variation and only four runs per configuration.
+On the live loader, two 1000-step windows per configuration also overlapped:
+DDP 7.88–8.95M with the factor versus 8.28–9.09M without; sharding 8.19–8.95M
+versus 8.40–9.24M; and bucketed-bias sharding 8.28–8.87M versus 8.19–9.40M.
+Loader acquisition varied, so these live ranges do not establish a small gain.
+
+The shared factor is only 32,768 weights plus 32 biases in the full model,
+or 8,192 weight values plus 32 replicated biases per rank for four-way
+sharding. The retained placeholder weights mean the ablation's measured
+allocated memory does not represent fully deleting those tensors. In a
+100-step rank-0 Nsight capture, L1 forward and dense clipping had the same
+attributed launch counts in the bucketed-bias sharded path with and without
+the factor (10 and 3 per step), while AdamW fell from 30 to 26 launches.
+These are instrumented, nested CPU-launch attributions, not additive timings.
+
+Tests compared initial outputs, QAT, group-factor gradients and optimizer
+membership with nonzero folded factors on both full and sharded models; the
+full model's reconstructed per-stack L1 weights were also compared. A
+separate four-rank NCCL test compared first-step losses,
+gradients, remaining parameter updates and AdamW states, including an empty
+local batch. No net-strength or convergence comparison was performed.
+Individual sanitized windows are in `l1_factor_ablation_results.json`.
