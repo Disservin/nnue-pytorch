@@ -34,7 +34,9 @@ def _worker(rank, port, backend):
         sharded_model_module.get_feature_cls = lambda _: [_Feature]
         torch.manual_seed(42 + rank)
         nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5, sharding=(rank, 4)).to(device)
-        runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2, compile_model=False)
+        test_bias = os.environ.get("NNUE_TEST_BUCKETED_BIAS") == "1"
+        runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2,
+                                  compile_model=None if test_bias else False)
         if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
             import model.modules.sharded_l1 as sharded_l1
             from scripts.reference_l1_collective import ReferenceReduceScatter
@@ -44,7 +46,12 @@ def _worker(rank, port, backend):
         batches = [tuple(t.to(device) for t in _batch(rank, sizes[rank], i))
                    for i, sizes in enumerate(([2, 0, 3, 1], [1, 2, 0, 4],
                                               [0, 1, 4, 1], [1, 1, 1, 1]))]
-        expected_losses = [runner.step(batch).clone() for batch in batches]
+        expected_losses, expected_gradients = [], []
+        for batch in batches:
+            expected_losses.append(runner.step(batch).clone())
+            if test_bias:
+                expected_gradients.append({name: None if p.grad is None else p.grad.clone()
+                                           for name, p in nnue.named_parameters()})
         expected = copy.deepcopy(runner.state_dict())
         if os.environ.get("NNUE_TEST_COMPILED_DEFAULT") == "1":
             nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5,
@@ -57,6 +64,10 @@ def _worker(rank, port, backend):
             l1._compile_l1_merge = True
         if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
             sharded_l1._SumReduceScatter = original_collective
+        if test_bias:
+            import model.modules.sharded_l1 as sharded_l1
+            from scripts.experimental_bias_add import bucketed_bias_add
+            sharded_l1._add_local_bias = bucketed_bias_add
         if os.environ.get("NNUE_ASYNC_TEST_COMPILE") == "1":
             nnue.model.layer_stacks.forward_from_l1 = torch.compile(
                 nnue.model.layer_stacks.forward_from_l1
@@ -82,6 +93,13 @@ def _worker(rank, port, backend):
                     future.append(begin(i + 1))
             actual = runner.step(batch, global_batch=features, after_forward=prepare_next)
             torch.testing.assert_close(actual, expected_losses[i], rtol=1e-5, atol=2e-6)
+            if test_bias:
+                for name, p in nnue.named_parameters():
+                    expected_grad = expected_gradients[i][name]
+                    if expected_grad is None:
+                        assert p.grad is None
+                    else:
+                        torch.testing.assert_close(p.grad, expected_grad, rtol=3e-4, atol=5e-6)
             pending = future[0] if future else None
         actual = runner.state_dict()
         for name, value in expected["nnue"].items():
