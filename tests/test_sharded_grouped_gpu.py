@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 
 from model.modules import stacked_linear
 from model.modules.sharded_l1 import ShardedL1
+import model.modules.sharded_l1 as sharded_l1_module
 from model.modules.stacked_linear import FactorizedStackedLinear
 from model.quantize import QuantizationConfig, QuantizationManager
 from model.sharded_backward import synchronize_replicated_gradients
@@ -44,7 +45,13 @@ def _check(rank, sizes, quantized, concentrated):
     upstream = torch.randn(n, 16, device=rank)
     results = []
     original = stacked_linear.grouped_l1
+    original_collective = sharded_l1_module._SumReduceScatter
     for mode, layer in (("0", shard), ("1", other)):
+        if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
+            from scripts.reference_l1_collective import ReferenceReduceScatter
+            sharded_l1_module._SumReduceScatter = (
+                ReferenceReduceScatter if mode == "0" else original_collective
+            )
         os.environ["NNUE_GROUPED_L1"] = mode
         inputs = x.detach().clone().requires_grad_(True)
         with patch.object(stacked_linear, "grouped_l1", wraps=original) as kernel:
@@ -64,6 +71,7 @@ def _check(rank, sizes, quantized, concentrated):
                 [p.grad.detach().clone() for p in layer.parameters()],
             )
         )
+    sharded_l1_module._SumReduceScatter = original_collective
     torch.testing.assert_close(results[0][0], results[1][0], atol=2e-5, rtol=2e-4)
     torch.testing.assert_close(results[0][1], results[1][1], atol=2e-5, rtol=2e-4)
     for left, right in zip(results[0][2], results[1][2]):
@@ -86,7 +94,7 @@ def _worker(rank, port):
     try:
         if stacked_linear.grouped_l1 is None:
             raise RuntimeError("grouped CUDA dependencies are required for this test")
-        for sizes in ([0, 9], [4, 5]):
+        for sizes in ([0, 9], [4, 5], [4, 4]):
             for quantized in (False, True):
                 for concentrated in (False, True):
                     _check(rank, sizes, quantized, concentrated)
@@ -134,3 +142,40 @@ def test_grouped_sharded_l1():
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port,), nprocs=2, join=True)
+
+
+def _collective_subgroup_worker(rank, port):
+    from scripts.reference_l1_collective import ReferenceReduceScatter
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=4, timeout=timedelta(seconds=120))
+    try:
+        groups = [dist.new_group(ranks=[0, 2]), dist.new_group(ranks=[1, 3])]
+        group = groups[rank % 2]
+        for size in (2, 0):
+            torch.manual_seed(50 + rank)
+            values = torch.randn(3, size * 2, device=rank).t()
+            upstream = torch.randn(3, size, device=rank).t()
+            expected_x = values.detach().clone().requires_grad_()
+            actual_x = values.detach().clone().requires_grad_()
+            offsets = (0, size, 2 * size)
+            expected = ReferenceReduceScatter.apply(expected_x, offsets, group)
+            actual = sharded_l1_module._SumReduceScatter.apply(actual_x, offsets, group)
+            expected.backward(upstream)
+            actual.backward(upstream)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_nccl_available() or torch.cuda.device_count() < 4,
+    reason="Four CUDA GPUs and NCCL required",
+)
+def test_equal_collective_subgroup_noncontiguous_and_empty():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_collective_subgroup_worker, args=(port,), nprocs=4, join=True)

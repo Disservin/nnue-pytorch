@@ -351,6 +351,8 @@ def main():
         # Compile only the inner NNUEModel; the outer NNUE shell handles loss,
         # lambda scheduling and checkpointing in plain Python.
         torch._dynamo.config.cache_size_limit = 64
+        if accelerator == "cuda" and args.compile_backend == "inductor":
+            nnue.model._compile_layer_clipping = True
         nnue.model = torch.compile(nnue.model, backend=args.compile_backend)
         # The loss itself is a long eager pointwise chain outside the model;
         # compiling it fuses those kernels.

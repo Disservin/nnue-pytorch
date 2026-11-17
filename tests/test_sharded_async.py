@@ -35,9 +35,15 @@ def _worker(rank, port, backend):
         torch.manual_seed(42 + rank)
         nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5, sharding=(rank, 4)).to(device)
         runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2, compile_model=False)
+        if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
+            import model.modules.sharded_l1 as sharded_l1
+            from scripts.reference_l1_collective import ReferenceReduceScatter
+            original_collective = sharded_l1._SumReduceScatter
+            sharded_l1._SumReduceScatter = ReferenceReduceScatter
         initial = copy.deepcopy(runner.state_dict())
         batches = [tuple(t.to(device) for t in _batch(rank, sizes[rank], i))
-                   for i, sizes in enumerate(([2, 0, 3, 1], [1, 2, 0, 4], [0, 1, 4, 1]))]
+                   for i, sizes in enumerate(([2, 0, 3, 1], [1, 2, 0, 4],
+                                              [0, 1, 4, 1], [1, 1, 1, 1]))]
         expected_losses = [runner.step(batch).clone() for batch in batches]
         expected = copy.deepcopy(runner.state_dict())
         if os.environ.get("NNUE_TEST_COMPILED_DEFAULT") == "1":
@@ -46,6 +52,11 @@ def _worker(rank, port, backend):
             runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2)
             assert runner.compile_model == (device.type == "cuda")
         runner.load_state_dict(initial)
+        if os.environ.get("NNUE_TEST_COMPILE_L1_MERGE") == "1":
+            l1 = nnue.model.layer_stacks.l1
+            l1._compile_l1_merge = True
+        if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
+            sharded_l1._SumReduceScatter = original_collective
         if os.environ.get("NNUE_ASYNC_TEST_COMPILE") == "1":
             nnue.model.layer_stacks.forward_from_l1 = torch.compile(
                 nnue.model.layer_stacks.forward_from_l1
