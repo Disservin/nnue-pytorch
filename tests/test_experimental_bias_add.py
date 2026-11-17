@@ -29,3 +29,23 @@ def test_bucketed_bias_add(batch, count):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None
+                    or bucketed_bias_add is None,
+                    reason="CUDA, CuPy and Triton are required")
+@pytest.mark.parametrize("count", [92, 256])
+def test_bucketed_bias_concentrated_noncontiguous_gradient(count):
+    batch, width = 1025, 32
+    values = torch.randn(batch, width, device="cuda", requires_grad=True)
+    bias = torch.randn(count * width, device="cuda", requires_grad=True)
+    indices = torch.full((batch,), count - 1, dtype=torch.int64, device="cuda")
+    gradient = torch.randn(width, batch, device="cuda").t()
+    assert not gradient.is_contiguous()
+    expected = values + bias.view(count, width)[indices]
+    actual = bucketed_bias_add(values, bias, indices, count, width)
+    expected_grads = torch.autograd.grad(expected, (values, bias), gradient, retain_graph=True)
+    actual_grads = torch.autograd.grad(actual, (values, bias), gradient)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-3)

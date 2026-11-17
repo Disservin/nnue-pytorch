@@ -301,3 +301,57 @@ real 92-stack, three-factor model matched eager clipping and L1 merge exactly.
 Distributed tests compared original and optimized collectives and optimizer
 steps, including equal, uneven, empty, noncontiguous and subgroup cases. CUDA
 graph capture/replay of these new paths has not been verified.
+
+### Matched-batch L1 bias reduction versus DDP
+
+On four NVLink-connected H200 GPUs, 64 allocated CPU cores (128 visible
+hardware threads), and 16 loader workers per rank, three paths were compared:
+compiled DDP, the current compiled sharded runner, and the same sharded runner
+with the experimental bucketed L1 bias-gradient reduction. Each used global
+batch 131072, 92 stored stacks, post-warmup fake quantization, AdamW, gradient
+and weight clipping, one PyTorch CPU thread per rank, the nettest filters,
+and a real training binpack. Lambda batch jitter was disabled in all paths;
+the binpack is one part of the real training mixture.
+
+The fixed-input diagnostic saved two distinct real global batches. For each,
+DDP and sharding loaded the same dense rank-local positions and targets;
+sharding converted those to native packed form before timing. Shards were
+initialized by slicing the same seed-initialized full model as DDP. Thus
+inputs and starting parameters match, though optimizer trajectories can differ
+after updates. Each run included 48 warmup and 600 measured steps, repeatedly
+using one saved batch; ongoing data loading was excluded. There were three
+runs per path on the first batch and two per path on the second.
+
+| Path | Matched-batch positions/s | ms/global batch |
+| --- | ---: | ---: |
+| Compiled DDP | 9.26–9.41M | 13.92–14.15 |
+| Current compiled sharding | 10.52–10.60M | 12.37–12.45 |
+| Sharding with bucketed bias gradient | 11.41–11.57M | 11.33–11.48 |
+
+These results establish a repeated-input compute comparison for the tested
+positions and settings, not full live-training throughput. Peak allocated GPU
+memory in these runs was 3.87–4.07 GiB for DDP and 1.895 GiB for both sharded
+paths; this measures peak allocated, not reserved memory.
+
+For live loading, each path ran three 1000-step windows with 48 warmup steps,
+the same initial model seed, and independently loaded positions:
+
+| Path | Live positions/s | ms/global batch | Slowest-rank host acquisition per run |
+| --- | ---: | ---: | ---: |
+| Compiled DDP | 8.02–8.65M | 15.15–16.35 | 3.96–7.73 s |
+| Current compiled sharding | 8.14–8.72M | 15.03–16.10 | 0.87–0.95 s |
+| Sharding with bucketed bias gradient | 7.54–8.94M | 14.67–17.39 | 1.30–2.44 s |
+
+Host acquisition may overlap GPU work, so its duration cannot simply be
+subtracted from the window. The DDP runs show substantial loader imbalance,
+and the live ranges overlap. The live runs do not establish a consistent
+end-to-end winner or an improvement from the bucketed reduction.
+
+The bucketed experiment passed CUDA forward and gradient comparisons for
+92 and 192 stacks and batches up to 32768, concentrated-bucket and
+noncontiguous-gradient cases, and a four-rank compiled multi-step comparison
+of gradients, losses, optimizer state and parameters. It remains an opt-in
+benchmark override. Before promoting it, guard its supported device, dtype,
+index and stack-count contract and bound its `count * local_batch * 4` byte
+routing scratch allocation. Individual sanitized results are stored in
+`bias_comparison_results.json`; raw logs stay private.
