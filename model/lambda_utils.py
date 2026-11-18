@@ -26,6 +26,8 @@ class LambdaController(nn.Module):
         max_steps: int,
         is_training: bool,
         scorenet: Tensor,
+        *,
+        batch_jitter_generator: torch.Generator | None = None,
     ) -> Tensor | float:
         cfg = loss_params.lambda_config
         start_lambda = cfg.start_lambda if cfg.start_lambda is not None else cfg.lambda_
@@ -75,16 +77,19 @@ class LambdaController(nn.Module):
                 jitter_lambda_batch = cfg.jitter_lambda_batch * math.sqrt(
                     1 - cfg.jitter_decay_lambda_batch**2
                 )
-                batch_jitter_delta = jitter_lambda_batch * torch.randn_like(
-                    self.jitter_buffer
+                noise = torch.randn(
+                    self.jitter_buffer.shape,
+                    dtype=self.jitter_buffer.dtype,
+                    device=self.jitter_buffer.device,
+                    generator=batch_jitter_generator,
                 )
                 self.jitter_buffer.mul_(cfg.jitter_decay_lambda_batch).add_(
-                    batch_jitter_delta
+                    jitter_lambda_batch * noise
                 )
-                batch_jitter = self.jitter_buffer.expand_as(scorenet)
+                batch_jitter = self.jitter_buffer
                 if cfg.lambda_schedule_steps >= 0 and cfg.lambda_cycle_jitter:
                     batch_jitter = batch_jitter * cos_val
-                actual_lambda = actual_lambda + batch_jitter
+                actual_lambda = (actual_lambda + batch_jitter).expand_as(scorenet)
 
             if cfg.jitter_lambda_sample != 0.0:
                 sample_jitter = torch.randn_like(scorenet) * cfg.jitter_lambda_sample

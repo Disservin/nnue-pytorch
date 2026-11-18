@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--nettest-remap-data", help="Nettest's stack-remapping binpack")
     parser.add_argument("--nettest-remap-cache", help="Read or create a cached stack-remapping table")
     parser.add_argument("--nettest-disable-batch-jitter", action="store_true",
-                        help="Acknowledge the sharded runner cannot yet match nettest batch jitter")
+                        help="Disable batch lambda jitter for comparison with older benchmarks")
     parser.add_argument("--nettest-ablate-filters", action="store_true",
                         help="Use the earlier benchmark's filtering for a controlled comparison")
     parser.add_argument("--nettest-torch-threads", type=int,
@@ -151,15 +151,14 @@ def main():
     parser.add_argument("--ddp-freeze-weights", action="store_true",
                         help="Set DDP optimizer learning rates to zero for fixed-weight diagnostics")
     args = parser.parse_args()
-    if args.nettest_settings and not args.nettest_disable_batch_jitter:
-        raise ValueError("nettest's batch jitter is unsupported; explicitly pass --nettest-disable-batch-jitter")
     if args.nettest_settings and not args.nettest_remap_data and not (
         args.nettest_remap_cache and os.path.isfile(args.nettest_remap_cache)
     ):
         raise ValueError("nettest settings require --nettest-remap-data or an existing remap cache")
     if args.nettest_settings and (not args.live_loader or args.global_batch not in (131072, 65536)):
         raise ValueError("nettest settings require a live batch of 131072 or 65536")
-    if not args.nettest_settings and (args.nettest_ablate_filters or args.nettest_torch_threads is not None
+    if not args.nettest_settings and (args.nettest_disable_batch_jitter or args.nettest_ablate_filters
+                                      or args.nettest_torch_threads is not None
                                       or args.nettest_shuffle_entries is not None or args.nettest_ablate_weight_clipping):
         raise ValueError("nettest ablations require --nettest-settings")
     if args.nettest_torch_threads is not None and args.nettest_torch_threads < 1:
@@ -245,6 +244,8 @@ def main():
                 with open(args.nettest_remap_cache, "x", encoding="utf-8") as cache:
                     cache.write(remap + "\n")
         config, loader_config, loader_io = make_nettest_settings(remap)
+        if args.nettest_disable_batch_jitter:
+            config.loss_params.lambda_config.jitter_lambda_batch = 0.0
         if args.nettest_ablate_filters:
             loader_config = DataloaderSkipConfig()
         if args.nettest_shuffle_entries is not None:
@@ -574,7 +575,8 @@ def main():
                               "matched_batch_index": args.matched_batch_index if args.matched_batch_cache else None,
                               "matched_initial_parameters": bool(args.matched_batch_cache or args.matched_initial_parameters),
                               "nettest_settings": args.nettest_settings,
-                              "nettest_batch_jitter_disabled": args.nettest_settings,
+                              "nettest_batch_jitter_disabled": args.nettest_disable_batch_jitter,
+                              "batch_lambda_jitter_std": config.loss_params.lambda_config.jitter_lambda_batch,
                               "nettest_quantization_phase": "post_warmup" if args.nettest_settings else None,
                               "features": config.features,
                               "nettest_filter_ablation": args.nettest_ablate_filters,
@@ -642,6 +644,7 @@ def main():
                     "mode": args.mode,
                     "world_size": world,
                     "global_batch": args.global_batch,
+                    "batch_lambda_jitter_std": config.loss_params.lambda_config.jitter_lambda_batch,
                     "mean_white_active_rank0": active,
                     "input": "binpack"
                     if args.binpack or args.load_batch_dir
