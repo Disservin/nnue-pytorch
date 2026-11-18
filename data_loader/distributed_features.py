@@ -10,8 +10,11 @@ import torch
 import torch.distributed as dist
 
 try:
-    from ._cuda_transport import (unpack_counted_rows, unpack_distributed_rows,
-                                  unpack_native_distributed_rows)
+    from ._cuda_transport import (
+        unpack_counted_rows,
+        unpack_distributed_rows,
+        unpack_native_distributed_rows,
+    )
 except ImportError:
     unpack_counted_rows = None
     unpack_distributed_rows = None
@@ -29,6 +32,10 @@ class GlobalFeatureBatch:
     # original loader batch, corresponding to [offsets[rank]:offsets[rank+1]].
     offsets: tuple[int, ...]
     rank: int
+    # When present, the index tensors contain [start, end) ranges into the
+    # flattened payload instead of padded feature IDs.
+    packed_payload: torch.Tensor | None = None
+    packed_feature_width: int | None = None
 
     @property
     def local_slice(self) -> slice:
@@ -72,7 +79,8 @@ class PendingNativeFeatures:
         self.ready_event = ready_event
         self._result = None
 
-    def finish(self):
+    def finish(self, *, direct_packed_ft=False):
+        """Wait once and retain the layout selected by the first call."""
         if self._result is None:
             if self.ready_event is not None:
                 torch.cuda.current_stream(self.gathered.device).wait_event(self.ready_event)
@@ -80,7 +88,10 @@ class PendingNativeFeatures:
                 self.work.wait()
             if self.gathered.is_cuda:
                 self.gathered.record_stream(torch.cuda.current_stream(self.gathered.device))
-            self._result = _unpack_native_gathered(self.gathered, self.dimensions, self.rank)
+            self._result = _unpack_native_gathered(
+                self.gathered, self.dimensions, self.rank,
+                direct_packed_ft=direct_packed_ft,
+            )
         return self._result
 
 
@@ -140,12 +151,17 @@ def begin_native_packed_features(batch, group=None):
     return PendingNativeFeatures(gathered, dimensions, rank, work, (batch, payload, padded, infos), ready_event)
 
 
-def _unpack_native_gathered(gathered, dimensions, rank):
+def _unpack_native_gathered(gathered, dimensions, rank, *, direct_packed_ft=False):
     width = dimensions[0][1]
-    world = len(dimensions)
-    packed = gathered
-    if packed.is_cuda and torch.version.hip is None and unpack_native_distributed_rows is not None:
-        result = unpack_native_distributed_rows(gathered, dimensions, width)
+    feature_ranges = False
+    if gathered.is_cuda and torch.version.hip is None and unpack_native_distributed_rows is not None:
+        feature_ranges = (
+            direct_packed_ft and 0 < width and any(b for b, _, _, _ in dimensions)
+            and gathered.numel() <= torch.iinfo(torch.int32).max
+        )
+        result = unpack_native_distributed_rows(
+            gathered, dimensions, width, feature_ranges=feature_ranges
+        )
     else:
         fields = [[], [], [], [], []]
         for src, (b, _, w, k) in zip(gathered, dimensions):
@@ -161,15 +177,18 @@ def _unpack_native_gathered(gathered, dimensions, rank):
     offsets = [0]
     for b, _, _, _ in dimensions:
         offsets.append(offsets[-1] + b)
-    return GlobalFeatureBatch(*result, tuple(offsets), rank)
+    return GlobalFeatureBatch(
+        *result, tuple(offsets), rank,
+        gathered if feature_ranges else None, width if feature_ranges else None,
+    )
 
 
-def _gather_native_packed_features(batch, group=None):
-    return begin_native_packed_features(batch, group).finish()
+def _gather_native_packed_features(batch, group=None, *, direct_packed_ft=False):
+    return begin_native_packed_features(batch, group).finish(direct_packed_ft=direct_packed_ft)
 
 
 def gather_packed_features(
-    batch: tuple[torch.Tensor, ...], group=None
+    batch: tuple[torch.Tensor, ...], group=None, *, direct_packed_ft=False
 ) -> GlobalFeatureBatch:
     """Gather one loader batch from each rank, in process-group rank order.
 
@@ -186,7 +205,7 @@ def gather_packed_features(
     """
     us, them, white, black, _outcome, _score, stacks = batch
     if isinstance(white, dict):
-        return _gather_native_packed_features(batch, group)
+        return _gather_native_packed_features(batch, group, direct_packed_ft=direct_packed_ft)
     n, width = white.shape
     if (
         white.dtype != torch.int32

@@ -19,8 +19,26 @@ def _num_threads(l1_half: int, target: int) -> int:
 _fused_double_ft_forward_kernel_cache = {}
 
 
+def _feature_row_source(max_active_indices):
+    return f"""
+#if PACKED
+    const int w_start = white_indices[2 * block_idx];
+    const int b_start = black_indices[2 * block_idx];
+    const int* const w_idx_row = packed_ids + w_start;
+    const int* const b_idx_row = packed_ids + b_start;
+    const int w_count = white_indices[2 * block_idx + 1] - w_start;
+    const int b_count = black_indices[2 * block_idx + 1] - b_start;
+#else
+    const int* const w_idx_row = white_indices + block_idx * {max_active_indices};
+    const int* const b_idx_row = black_indices + block_idx * {max_active_indices};
+    const int w_count = {max_active_indices};
+    const int b_count = {max_active_indices};
+#endif
+"""
+
+
 @torch.compiler.disable(recursive=False)
-def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
+def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int, *, packed=False):
     l1_half = l1_size // 2
     target = _FORWARD_THREADS
     if torch.version.hip is None:
@@ -34,10 +52,10 @@ def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
     num_threads = _num_threads(l1_half, target)
     output_thread_slice_size = l1_half // num_threads
 
-    key = (max_active_indices, l1_size, num_threads)
+    key = (max_active_indices, l1_size, num_threads, packed)
     if key not in _fused_double_ft_forward_kernel_cache:
         kernel = cp.RawKernel(
-            r"""
+            f"#define PACKED {int(packed)}\n" + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
 typedef long long int64_t;
@@ -54,6 +72,9 @@ void fused_double_ft_forward(
           float* __restrict__ l0_out,
           float* __restrict__ clamped_out,
     const int32_t        output_size
+#if PACKED
+    , const int32_t* __restrict__ packed_ids
+#endif
 ) {
     const uint32_t block_idx = blockIdx.x;
     const uint32_t tid = threadIdx.x;
@@ -61,12 +82,9 @@ void fused_double_ft_forward(
     const float us_val = __ldg(&us[block_idx]);
     const float them_val = __ldg(&them[block_idx]);
 
-    const int32_t* const w_idx_row = white_indices + block_idx * """
-            + str(max_active_indices)
-            + r""";
-    const int32_t* const b_idx_row = black_indices + block_idx * """
-            + str(max_active_indices)
-            + r""";
+    """
+            + _feature_row_source(max_active_indices)
+            + r"""
 
     const int32_t l1_size = """
             + str(l1_size)
@@ -104,10 +122,10 @@ void fused_double_ft_forward(
 
     // Interleave independent perspectives without changing either sum's order.
     // Widen row offsets before multiplying by the compile-time weight stride.
-    for (int k = 0; k < """
-            + str(max_active_indices)
-            + r"""; ++k) {
-        int wi = w_idx_row[k], bi = b_idx_row[k];
+    const int count = w_count > b_count ? w_count : b_count;
+    for (int k = 0; k < count; ++k) {
+        int wi = k < w_count ? w_idx_row[k] : -1;
+        int bi = k < b_count ? b_idx_row[k] : -1;
         if (wi == -1 && bi == -1) break;
         #pragma unroll
         for (uint32_t s = 0; s < """
@@ -169,7 +187,8 @@ _fused_double_ft_backward_kernel_cache = {}
 
 @torch.compiler.disable(recursive=False)
 def make_fused_double_ft_backward_kernel(
-    max_active_indices: int, l1_size: int, tile_size: int = BACKWARD_TILE_SIZE
+    max_active_indices: int, l1_size: int, tile_size: int = BACKWARD_TILE_SIZE,
+    *, packed=False,
 ):
     l1_half = l1_size // 2
     # On H100, four 128-thread blocks per position tile outperform a single
@@ -186,10 +205,10 @@ def make_fused_double_ft_backward_kernel(
     column_stride = num_threads * column_tiles
     output_size = l1_size
 
-    key = (max_active_indices, l1_size, num_threads, tile_size, column_tiles)
+    key = (max_active_indices, l1_size, num_threads, tile_size, column_tiles, packed)
     if key not in _fused_double_ft_backward_kernel_cache:
         kernel = cp.RawKernel(
-            r"""
+            f"#define PACKED {int(packed)}\n" + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
 typedef long long int64_t;
@@ -209,6 +228,9 @@ void fused_double_ft_backward(
           float* __restrict__ grad_bias,
     const int32_t        batch_size,
     const int32_t        output_size
+#if PACKED
+    , const int32_t* __restrict__ packed_ids
+#endif
 ) {
     const uint32_t tile_idx = blockIdx.x;
     const uint32_t tid = threadIdx.x + blockIdx.y * blockDim.x;
@@ -241,12 +263,9 @@ void fused_double_ft_backward(
         const float us_val = __ldg(&us[block_idx]);
         const float them_val = __ldg(&them[block_idx]);
 
-        const int32_t* const w_idx_row = white_indices + block_idx * """
-            + str(max_active_indices)
-            + r""";
-        const int32_t* const b_idx_row = black_indices + block_idx * """
-            + str(max_active_indices)
-            + r""";
+        """
+            + _feature_row_source(max_active_indices)
+            + r"""
 
         const uint32_t clamp_base = block_idx * 4 * l1_half;
 
@@ -269,18 +288,14 @@ void fused_double_ft_backward(
             float g_b0 = them_val * dw0 + us_val * db0;
             float g_b1 = them_val * dw1 + us_val * db1;
 
-            for(int k=0; k<"""
-            + str(max_active_indices)
-            + r"""; ++k) {
+            for(int k=0; k < w_count; ++k) {
                 int w_idx = w_idx_row[k];
                 if (w_idx == -1) break;
                 atomicAdd(&grad_weight[w_idx * output_size + col], g_w0);
                 atomicAdd(&grad_weight[w_idx * output_size + col + l1_half], g_w1);
             }
 
-            for(int k=0; k<"""
-            + str(max_active_indices)
-            + r"""; ++k) {
+            for(int k=0; k < b_count; ++k) {
                 int b_idx = b_idx_row[k];
                 if (b_idx == -1) break;
                 atomicAdd(&grad_weight[b_idx * output_size + col], g_b0);

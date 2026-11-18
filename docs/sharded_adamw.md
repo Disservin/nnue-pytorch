@@ -58,3 +58,18 @@ Callers must coordinate collective ordering, batch order, stream lifetimes,
 errors and shutdown across all ranks. Do not advance model weights while
 preparing the current forward. See `benchmark_results.md` for measured cost
 and limitations.
+
+The following experiments are opt-in. Select the same runner options on all
+ranks. The benchmark reports which ones were active on the last step.
+
+| Runner option | Benchmark flag | Behavior |
+| --- | --- | --- |
+| `uniform_loss=True` | `--uniform-loss` | With uniform weights and finite training targets, normalize the local loss sum by the exact global position count from feature gathering. Recipes with nonuniform weights use the usual denominator reduction. |
+| `overlap_replica_gradients=True` | `--overlap-replica-gradients` | On equal, nonempty batches with trainable FP32 replicas, split backward at FT output. Enqueue one replica reduction after L1 backward's all-gather, run the local FT backward, and wait before gradient clipping or AdamW. Uneven or empty batches use the generic path. |
+| `direct_packed_ft=True` | `--direct-packed-ft` | With native packed batches on supported NVIDIA CUDA, FT reads the gathered feature IDs through per-row ranges. Both scatter and aggregated FT backward use those ranges. In the benchmark set `NNUE_BENCH_NATIVE_PACKED=1`. |
+
+Use `--repeat-live-batch --matched-batch-cache DIR --matched-batch-count 8`
+to replay eight successive saved real batches in order. Choose the same
+cache, starting index, batch size and world size for each variant. Cache
+creation and loading are outside the timing window. Each rank holds its
+replay batches on its GPU, so larger counts use more memory.
