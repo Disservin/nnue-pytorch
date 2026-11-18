@@ -41,17 +41,51 @@ def global_weighted_loss(
 
 
 def backward_weighted_loss(
-    local_numerator, local_weight, replicated_parameters, group=None
+    local_numerator, local_weight, replicated_parameters, group=None, *,
+    global_count=None, ft_backward=None,
 ):
     """Backpropagate the local weighted contribution, then sum replica gradients.
 
     Start with cleared gradients and call exactly once per optimizer step on
     every rank. Returns the detached local contribution, not the global loss.
     """
-    loss = global_weighted_loss(local_numerator, local_weight, group)
+    if global_count is None:
+        loss = global_weighted_loss(local_numerator, local_weight, group)
+    else:
+        if global_count <= 0:
+            raise ValueError("global loss weight must be finite and positive")
+        loss = local_numerator / global_count
     loss.backward()
-    synchronize_replicated_gradients(replicated_parameters, group)
+    if ft_backward is None:
+        synchronize_replicated_gradients(replicated_parameters, group)
+    else:
+        output, boundary = ft_backward
+        flat, work = _begin_dense_replica_reduce(replicated_parameters, group)
+        # L1's backward all-gather was already enqueued by loss.backward().
+        # This local backward can run while the replica reduction is in flight.
+        output.backward(boundary.grad)
+        work.wait()
+        torch._assert_async(flat[-1] == 0, "expected all replica gradients to be dense")
+        offset = 0
+        for p in replicated_parameters:
+            p.grad = flat[offset : offset + p.numel()].view_as(p)
+            offset += p.numel()
     return loss.detach()
+
+
+@torch.no_grad()
+def _begin_dense_replica_reduce(parameters, group):
+    valid = [p.grad is not None and p.grad.layout == torch.strided for p in parameters]
+    # Report an unexpected absent or sparse gradient to all ranks in the same
+    # collective. No rank can skip or change the shape of the all-reduce.
+    flag = parameters[0].new_full((1,), int(not all(valid)))
+    pieces = [
+        p.grad.reshape(-1) if ok else p.new_zeros(p.numel())
+        for p, ok in zip(parameters, valid)
+    ]
+    flat = torch.cat([*pieces, flag])
+    work = dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group, async_op=True)
+    return flat, work
 
 
 @torch.no_grad()

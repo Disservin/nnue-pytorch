@@ -16,7 +16,7 @@ from scripts.nettest_benchmark_settings import make_nettest_settings
 from trainer.sharded_adamw import ShardedAdamWStep
 
 
-def _worker(rank, port, remap_path, batch_dir):
+def _worker(rank, port, remap_path, batch_dir, next_experiments):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
@@ -29,7 +29,10 @@ def _worker(rank, port, remap_path, batch_dir):
         reference = ShardedAdamWStep(baseline, bucketed_bias=False)
         candidate = NNUE(copy.deepcopy(config), max_epoch=560, num_batches_per_epoch=8192,
                          sharding=(rank, 4)).cuda(rank)
-        optimized = ShardedAdamWStep(candidate, bucketed_bias=True)
+        optimized = ShardedAdamWStep(
+            candidate, bucketed_bias=True, uniform_loss=next_experiments,
+            overlap_replica_gradients=next_experiments, direct_packed_ft=next_experiments,
+        )
         cfg = config.loss_params.lambda_config
         reference.global_step = int(cfg.lambda_schedule_steps * cfg.lambda_cycle_warmup_pct)
         optimized.load_state_dict(reference.state_dict())
@@ -45,6 +48,8 @@ def _worker(rank, port, remap_path, batch_dir):
             expected_loss = reference.step(batch)
             torch.manual_seed(400 + step + rank)
             actual_loss = optimized.step(batch)
+            if next_experiments:
+                assert all(optimized.last_experiments.values())
             torch.testing.assert_close(actual_loss, expected_loss, rtol=3e-4, atol=2e-6)
             jitter = candidate.lambda_scheduler.jitter_buffer
             by_rank = torch.empty(4, device=rank)
@@ -58,9 +63,9 @@ def _worker(rank, port, remap_path, batch_dir):
                     assert q.grad is None
                 else:
                     torch.testing.assert_close(q.grad, p.grad, rtol=3e-4, atol=5e-6,
-                                               msg=lambda msg: f"{name} grad: {msg}")
+                                               msg=lambda msg, name=name: f"{name} grad: {msg}")
                 torch.testing.assert_close(q, p, rtol=3e-4, atol=5e-6,
-                                           msg=lambda msg: f"{name} parameter: {msg}")
+                                           msg=lambda msg, name=name: f"{name} parameter: {msg}")
                 for key, value in reference.optimizer.state.get(p, {}).items():
                     actual = optimized.optimizer.state[q][key]
                     if torch.is_tensor(value):
@@ -75,9 +80,11 @@ def _worker(rank, port, remap_path, batch_dir):
                     or not os.environ.get("NNUE_TEST_REAL_REMAP_CACHE")
                     or not os.environ.get("NNUE_TEST_REAL_BATCH_CACHE"),
                     reason="four GPUs and real remap/batch caches required")
-def test_bucketed_bias_real_model_four_rank():
+@pytest.mark.parametrize("next_experiments", [False, True], ids=["bias-only", "combined"])
+def test_bucketed_bias_real_model_four_rank(next_experiments):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, os.environ["NNUE_TEST_REAL_REMAP_CACHE"],
-                            os.environ["NNUE_TEST_REAL_BATCH_CACHE"]), nprocs=4, join=True)
+                            os.environ["NNUE_TEST_REAL_BATCH_CACHE"], next_experiments),
+             nprocs=4, join=True)

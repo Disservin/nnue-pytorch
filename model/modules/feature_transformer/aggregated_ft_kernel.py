@@ -17,7 +17,7 @@ from .fused_ft_kernel import _num_threads
 
 
 @cache
-def _kernels(active: int, width: int, tile: int = 8):
+def _kernels(active: int, width: int, tile: int = 8, *, packed=False):
     A = active
     half = width // 2
     threads = _num_threads(half, 128)
@@ -26,9 +26,14 @@ def _kernels(active: int, width: int, tile: int = 8):
     code = (
         f"#define T {tile}\n#define A {A}\n#define H {h}\n#define M {maxids}\n"
         f"#define K {width}\n#define HALF {half}\n#define B {threads}\n"
+        f"#define PACKED {int(packed)}\n"
         + r"""
 extern "C" __global__ void ft_pack_features(const int *w, const int *b, int *ids, unsigned *masks,
-                                            int *counts, int batch_size) {
+                                            int *counts, int batch_size
+#if PACKED
+                                            , const int *packed_ids
+#endif
+                                            ) {
     extern __shared__ unsigned mem[];
     int *keys = (int *)mem;
     unsigned *bits = mem + H;
@@ -46,7 +51,15 @@ extern "C" __global__ void ft_pack_features(const int *w, const int *b, int *ids
         int pos = blockIdx.x * T + row / 2;
         if (pos >= batch_size)
             continue;
+#if PACKED
+        const int *range = ((row & 1) ? b : w) + 2 * pos;
+        int start = range[0];
+        if (k >= range[1] - start)
+            continue;
+        int id = packed_ids[start + k];
+#else
         int id = (row & 1) ? b[pos * A + k] : w[pos * A + k];
+#endif
         if (id < 0)
             continue;
         unsigned slot = ((unsigned)id * 2654435761u) & (H - 1);
@@ -152,6 +165,8 @@ def aggregated_ft_backward(
     maxact,
     *,
     tile_size=8,
+    packed_payload=None,
+    packed_feature_width=None,
 ):
     """Accumulate on the current stream.
 
@@ -159,10 +174,12 @@ def aggregated_ft_backward(
     unique within each white/black row.
     """
     batch_size, active = white.shape
+    if packed_payload is not None:
+        active = packed_feature_width
     tiles = (batch_size + tile_size - 1) // tile_size
     with cp.cuda.Device(us.device.index):
         pack, aggregate, capacity, shared_bytes, threads = _kernels(
-            active, grad.shape[1], tile_size
+            active, grad.shape[1], tile_size, packed=packed_payload is not None,
         )
         ids = torch.empty((tiles, capacity), device=us.device, dtype=torch.int32)
         masks = torch.empty_like(ids)
@@ -175,6 +192,8 @@ def aggregated_ft_backward(
             counts.data_ptr(),
             np.int32(batch_size),
         )
+        if packed_payload is not None:
+            pack_args += (packed_payload.data_ptr(),)
         backward_args = (
             us.data_ptr(),
             them.data_ptr(),

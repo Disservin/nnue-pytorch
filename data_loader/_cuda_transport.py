@@ -8,7 +8,7 @@ import triton.language as tl
 @triton.jit(do_not_specialize=["STRIDE"])
 def _unpack_native_distributed_kernel(payload, metadata, white, black, us, them, stacks,
                                       STRIDE, WIDTH: tl.constexpr,
-                                      BLOCK: tl.constexpr):
+                                      BLOCK: tl.constexpr, FEATURE_RANGES: tl.constexpr):
     row, rank, perspective = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     n = tl.load(metadata + 4 * rank)
     nw = tl.load(metadata + 4 * rank + 1)
@@ -20,12 +20,25 @@ def _unpack_native_distributed_kernel(payload, metadata, white, black, us, them,
     start = tl.load(offs, mask=valid, other=0)
     end = tl.load(offs + 1, mask=valid, other=0)
     global_row = offset + row
-    col = tl.arange(0, BLOCK)
-    value = tl.load(src + 2 * (n + 1) + perspective * nw + start + col,
-                    mask=valid & (col < WIDTH) & (col < end - start), other=-1)
+    if FEATURE_RANGES:
+        base = rank.to(tl.int64) * STRIDE + 2 * (n + 1) + perspective * nw
+        if perspective == 0:
+            tl.store(white + 2 * global_row, base + start, mask=valid)
+            tl.store(white + 2 * global_row + 1, base + end, mask=valid)
+        else:
+            tl.store(black + 2 * global_row, base + start, mask=valid)
+            tl.store(black + 2 * global_row + 1, base + end, mask=valid)
+    else:
+        col = tl.arange(0, BLOCK)
+        value = tl.load(src + 2 * (n + 1) + perspective * nw + start + col,
+                        mask=valid & (col < WIDTH) & (col < end - start), other=-1)
+        if perspective == 0:
+            tl.store(white + global_row.to(tl.int64) * WIDTH + col, value,
+                     mask=valid & (col < WIDTH))
+        else:
+            tl.store(black + global_row.to(tl.int64) * WIDTH + col, value,
+                     mask=valid & (col < WIDTH))
     if perspective == 0:
-        tl.store(white + global_row.to(tl.int64) * WIDTH + col, value,
-                 mask=valid & (col < WIDTH))
         stack_base = 2 * (n + 1) + nw + nb
         u = tl.load(src + stack_base + n + row, mask=valid, other=0).to(tl.float32, bitcast=True)
         v = tl.load(src + stack_base + 2 * n + row, mask=valid, other=0).to(tl.float32, bitcast=True)
@@ -33,16 +46,13 @@ def _unpack_native_distributed_kernel(payload, metadata, white, black, us, them,
         tl.store(us + global_row, u, mask=valid)
         tl.store(them + global_row, v, mask=valid)
         tl.store(stacks + global_row, s, mask=valid)
-    else:
-        tl.store(black + global_row.to(tl.int64) * WIDTH + col, value,
-                 mask=valid & (col < WIDTH))
 
 
 @torch.compiler.disable
-def unpack_native_distributed_rows(payload, dimensions, width):
+def unpack_native_distributed_rows(payload, dimensions, width, *, feature_ranges=False):
     total = sum(n for n, _, _, _ in dimensions)
     device = payload.device
-    white = torch.empty((total, width), dtype=torch.int32, device=device)
+    white = torch.empty((total, 2 if feature_ranges else width), dtype=torch.int32, device=device)
     black = torch.empty_like(white)
     us = torch.empty((total, 1), dtype=torch.float32, device=device)
     them = torch.empty_like(us)
@@ -57,6 +67,7 @@ def unpack_native_distributed_rows(payload, dimensions, width):
             _unpack_native_distributed_kernel[(max(d[0] for d in dimensions), len(dimensions), 2)](
                 payload, metadata, white, black, us, them, stacks,
                 payload.shape[1], width, BLOCK=triton.next_power_of_2(max(1, width)),
+                FEATURE_RANGES=feature_ranges,
             )
     return us, them, white, black, stacks
 

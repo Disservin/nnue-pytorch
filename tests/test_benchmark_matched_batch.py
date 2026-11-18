@@ -1,14 +1,17 @@
 """The comparison benchmark's dense-to-packed conversion preserves inputs."""
 import torch
-
-from data_loader.distributed_features import _unpack_rows_reference
-from scripts.benchmark_sharded_adamw import pack_saved_batch
-from scripts.benchmark_sharded_adamw import match_sharded_initial_parameters
-from model.nnue import NNUE
-import model.model as model_module
-import model.sharded_model as sharded_model_module
 from test_sharded_adamw import _config
 from test_sharded_ft import _Feature
+
+import model.model as model_module
+import model.sharded_model as sharded_model_module
+from data_loader.distributed_features import _unpack_rows_reference
+from model.nnue import NNUE
+from scripts.benchmark_sharded_adamw import (
+    load_matched_batches,
+    match_sharded_initial_parameters,
+    pack_saved_batch,
+)
 
 
 def test_matched_benchmark_batch_conversion():
@@ -48,3 +51,15 @@ def test_matched_sharded_initial_parameters(monkeypatch):
         if name.startswith("input.") or (name.startswith("layer_stacks.l1.") and p.ndim == 2):
             expected = shard.model.input.layout.select_columns(expected)
         torch.testing.assert_close(p, expected, rtol=0, atol=0)
+
+
+def test_matched_cache_preserves_selected_order(tmp_path):
+    class Loader:
+        def __getitem__(self, index):
+            return (torch.tensor([index]),)
+
+    loader = Loader()
+    expected = [3, 4, 5]
+    for source in (loader, None):
+        batches = load_matched_batches(source, tmp_path, 3, 3, 0, 131072, "cpu")
+        assert [batch[0].item() for batch in batches] == expected

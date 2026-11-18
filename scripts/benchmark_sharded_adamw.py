@@ -6,19 +6,23 @@ gradient synchronization, clipping, and the optimizer update.
 """
 
 import argparse
-from contextlib import nullcontext
 import functools
 import json
 import os
 import statistics
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_loader import (DataloaderSkipConfig, SparseBatchProvider, SparseBatchDataset,
-                         FixedNumBatchesDataset)
+from data_loader import (
+    DataloaderSkipConfig,
+    FixedNumBatchesDataset,
+    SparseBatchDataset,
+    SparseBatchProvider,
+)
 from data_loader.config import DataloaderDDPConfig, DataloaderIOConfig
 from model.config import ModelConfig, NNUEConfig
 from model.nnue import NNUE
@@ -64,6 +68,24 @@ def pack_saved_batch(batch):
     return us, them, native, None, outcome, score, stacks
 
 
+def load_matched_batches(loader, cache, first, count, rank, global_batch, device):
+    os.makedirs(cache, exist_ok=True)
+    paths = {
+        i: os.path.join(cache, f"batch-{i}-{rank}-{global_batch}.pt")
+        for i in range(first, first + count)
+    }
+    missing = {i for i, path in paths.items() if not os.path.isfile(path)}
+    if missing:
+        for i in range(max(missing) + 1):
+            batch = loader[i]
+            if i in missing:
+                # Save CPU tensors so the cache can be replayed on any device.
+                torch.save(tuple(t.cpu() for t in batch), paths[i])
+    return tuple(
+        torch.load(path, map_location=device, weights_only=True) for path in paths.values()
+    )
+
+
 def match_sharded_initial_parameters(nnue, config, *, max_epoch, num_batches_per_epoch, seed):
     """Initialize shards from the same full-model seed as the DDP control."""
     torch.manual_seed(seed)
@@ -106,13 +128,15 @@ def main():
     parser.add_argument("--live-loader", action="store_true",
                         help="Include asynchronous binpack loading in each timed step")
     parser.add_argument("--repeat-live-batch", action="store_true",
-                        help="Diagnostic: reuse the first live batch throughout the timing window")
+                        help="Diagnostic: replay cached inputs throughout the timing window")
     parser.add_argument("--repeat-batch-cache",
                         help="Save or reload repeated rank batches; use a fresh directory per input and configuration")
     parser.add_argument("--matched-batch-cache",
                         help="Cache the same dense rank batches for DDP and packed sharding comparisons")
     parser.add_argument("--matched-batch-index", type=int, default=0,
                         help="Select a later loader batch when creating a matched cache")
+    parser.add_argument("--matched-batch-count", type=int, default=1,
+                        help="Cycle through successive matched batches in one timed window")
     parser.add_argument("--matched-initial-parameters", action="store_true",
                         help="Initialize shards from the same full-model seed as DDP")
     parser.add_argument("--throughput-window", action="store_true",
@@ -127,6 +151,12 @@ def main():
                         help="Use the optional guarded bucketed L1 bias-gradient path")
     parser.add_argument("--require-bucketed-l1-fastpath", action="store_true",
                         help="Fail rather than measure an unsupported bias fast-path configuration")
+    parser.add_argument("--uniform-loss", action="store_true",
+                        help="Experimentally skip the denominator reduction for uniform weights")
+    parser.add_argument("--overlap-replica-gradients", action="store_true",
+                        help="Experimentally overlap replica gradient reduction with FT backward")
+    parser.add_argument("--direct-packed-ft", action="store_true",
+                        help="Experimentally consume native packed feature ranges in FT")
     parser.add_argument("--nsys-capture", action="store_true",
                         help="Bracket the measured throughput window with CUDA profiler APIs")
     parser.add_argument(
@@ -202,6 +232,12 @@ def main():
         raise ValueError("--matched-batch-cache requires --repeat-live-batch and excludes --repeat-batch-cache")
     if args.matched_batch_index < 0 or (args.matched_batch_index and not args.matched_batch_cache):
         raise ValueError("matched-batch-index must be nonnegative and requires a matched cache")
+    if args.matched_batch_count < 1 or (args.matched_batch_count > 1 and not args.matched_batch_cache):
+        raise ValueError("matched-batch-count must be positive and multiple batches require a matched cache")
+    if args.matched_batch_count > 1 and os.environ.get("NNUE_PROFILE_CACHE_FEATURES") == "1":
+        raise ValueError("the single-batch feature cache is incompatible with rotating matched batches")
+    if args.mode != "sharded" and (args.uniform_loss or args.overlap_replica_gradients or args.direct_packed_ft):
+        raise ValueError("uniform loss, replica overlap and direct packed FT require sharded mode")
     if args.throughput_window and (not args.live_loader or args.profile):
         raise ValueError("--throughput-window requires --live-loader and excludes --profile")
     if args.measure_loader_wait and not args.throughput_window:
@@ -224,6 +260,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     if args.nettest_settings:
         from nettest_benchmark_settings import make_nettest_settings
+
         from model.modules.layer_stacks import STACK_KEY_STATES, stack_count, stack_keys
         from model.modules.stack_table import count_stacks, fallback_table, table_to_str
         keys = stack_keys(ModelConfig().ls_keys)
@@ -279,6 +316,8 @@ def main():
         nnue.model._compile_layer_clipping = True
     live_loader = None
     native_requested = os.environ.get("NNUE_BENCH_NATIVE_PACKED") == "1"
+    if args.direct_packed_ft and not native_requested:
+        raise ValueError("--direct-packed-ft requires NNUE_BENCH_NATIVE_PACKED=1")
     if native_requested and args.mode != "sharded":
         raise ValueError("native packed benchmark input requires sharded mode")
     if args.live_loader:
@@ -292,28 +331,33 @@ def main():
         live_loader = FixedNumBatchesDataset(dataset, num_batches=args.warmup + args.steps + 2,
                                              queue_size_limit=2, device=torch.device("cuda", rank))
         cache_file = None
+        replay_batches = ()
         if args.repeat_batch_cache:
             os.makedirs(args.repeat_batch_cache, exist_ok=True)
             layout = "packed" if native_requested else "dense"
             cache_file = os.path.join(args.repeat_batch_cache,
                                       f"batch-{args.mode}-{layout}-{rank}-{args.global_batch}.pt")
-        elif args.matched_batch_cache:
-            os.makedirs(args.matched_batch_cache, exist_ok=True)
-            cache_file = os.path.join(args.matched_batch_cache,
-                                      f"batch-{args.matched_batch_index}-{rank}-{args.global_batch}.pt")
-        if cache_file and os.path.isfile(cache_file):
+        if args.matched_batch_cache:
+            replay_batches = load_matched_batches(
+                live_loader, args.matched_batch_cache, args.matched_batch_index,
+                args.matched_batch_count, rank, args.global_batch, torch.device("cuda", rank),
+            )
+            if any(batch[0].shape[0] != args.global_batch // world for batch in replay_batches):
+                raise ValueError("matched batch cache does not match the local batch size")
+            if native_requested:
+                replay_batches = tuple(pack_saved_batch(batch) for batch in replay_batches)
+            batch = replay_batches[0]
+        elif cache_file and os.path.isfile(cache_file):
             batch = torch.load(cache_file, map_location=torch.device("cuda", rank), weights_only=True)
         else:
             batch = live_loader[0]
-            if args.matched_batch_cache:
-                for batch_index in range(args.matched_batch_index):
-                    batch = live_loader[batch_index + 1]
             if cache_file:
                 torch.cuda.synchronize()
                 torch.save(batch, cache_file)
-        if args.matched_batch_cache and native_requested:
-            batch = pack_saved_batch(batch)
-        repeated_batch = batch if args.repeat_live_batch else None
+        if args.repeat_live_batch:
+            replay_batches = replay_batches or (batch,)
+            # End any cache-generation prefetch before warmup and timing.
+            live_loader = dataset = None
         active = (batch[2]["nw"] / batch[2]["size"] if native_requested
                   else (batch[2] >= 0).sum().item() / batch[2].shape[0])
     elif args.load_batch_dir:
@@ -424,6 +468,9 @@ def main():
             nnue, gradient_clip_val=None if args.ablate_gradient_clipping else 2.0,
             compile_model=False if args.eager_sharded or profile_compile else None,
             bucketed_bias=args.bucketed_l1_bias,
+            uniform_loss=args.uniform_loss,
+            overlap_replica_gradients=args.overlap_replica_gradients,
+            direct_packed_ft=args.direct_packed_ft,
         )
         if os.environ.get("NNUE_BENCH_REFERENCE_LAUNCHES") == "1":
             nnue.model._compile_layer_clipping = False
@@ -467,8 +514,8 @@ def main():
         pipeline_batch = pipeline_pending = feature_stream = None
         total_pipeline_steps = args.warmup + args.steps
         if args.async_features:
-            from data_loader.distributed_features import begin_native_packed_features
             from data_loader.dataset import _recursive_record_stream
+            from data_loader.distributed_features import begin_native_packed_features
             feature_stream = torch.cuda.Stream(device=rank)
 
             def prepare(index):
@@ -485,13 +532,16 @@ def main():
             nonlocal batch, pipeline_batch, pipeline_pending
             if not args.async_features:
                 with phase("step:loader_acquire"):
-                    batch = repeated_batch if args.repeat_live_batch else live_loader[index + 1]
+                    batch = (replay_batches[index % len(replay_batches)] if replay_batches
+                             else live_loader[index + 1])
                 return train_step()
             batch = pipeline_batch
             nvtx = (torch.cuda.nvtx.range("phase:async_feature_finish")
                     if os.environ.get("NNUE_PROFILE_NVTX") == "1" else nullcontext())
             with nvtx:
-                features = pipeline_pending.finish()
+                features = pipeline_pending.finish(
+                    direct_packed_ft=nnue.model.can_use_direct_packed_ft()
+                )
             _recursive_record_stream(batch, torch.cuda.current_stream(rank))
             next_batch = next_pending = None
 
@@ -526,7 +576,7 @@ def main():
             if args.measure_loader_wait:
                 wait_started = time.perf_counter()
             with phase("step:loader_acquire"):
-                batch = (repeated_batch if args.repeat_live_batch
+                batch = (replay_batches[(args.warmup + i) % len(replay_batches)] if replay_batches
                          else live_loader[args.warmup + i + 1])
             if args.measure_loader_wait:
                 host_loader_wait.append(time.perf_counter() - wait_started)
@@ -573,6 +623,7 @@ def main():
                               "repeat_live_batch": args.repeat_live_batch,
                               "matched_batch": bool(args.matched_batch_cache),
                               "matched_batch_index": args.matched_batch_index if args.matched_batch_cache else None,
+                              "matched_batch_count": args.matched_batch_count if args.matched_batch_cache else None,
                               "matched_initial_parameters": bool(args.matched_batch_cache or args.matched_initial_parameters),
                               "nettest_settings": args.nettest_settings,
                               "nettest_batch_jitter_disabled": args.nettest_disable_batch_jitter,
@@ -588,6 +639,7 @@ def main():
                               "loader_workers_per_rank": args.loader_workers,
                               "stored_layer_stacks": nnue.model.layer_stacks.count,
                               "async_features": args.async_features,
+                              "sharded_experiments": runner.last_experiments if args.mode == "sharded" else None,
                               "bucketed_l1_bias": (args.bucketed_l1_bias
                                                    or os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1"),
                               "bucketed_l1_fastpath_eligible": bucketed_bias_eligible,
@@ -645,6 +697,7 @@ def main():
                     "world_size": world,
                     "global_batch": args.global_batch,
                     "batch_lambda_jitter_std": config.loss_params.lambda_config.jitter_lambda_batch,
+                    "sharded_experiments": runner.last_experiments if args.mode == "sharded" else None,
                     "mean_white_active_rank0": active,
                     "input": "binpack"
                     if args.binpack or args.load_batch_dir
