@@ -29,8 +29,16 @@ before further updates. Save a separate state for every process-group rank.
 groups, device type and clipping setting, and restores that rank's AdamW moments, scheduler,
 lambda state and random generators. This format does not produce a normal
 unsharded checkpoint or NNUE file; conversion and coordinated checkpoint-file
-management are not implemented. Batch-level lambda jitter is rejected until
-its random state is synchronized across ranks.
+management are not implemented.
+
+Set `jitter_lambda_batch` before constructing the runner. On multiple ranks,
+the runner broadcasts an initial seed and jitter buffer. Each rank then draws
+one value per step from an identical dedicated generator on its training
+device, so the whole batch shares the same jitter without a per-step
+collective. Per-sample jitter uses the usual local generator. The checkpoint
+saves both the running jitter value and the dedicated generator state.
+`--nettest-settings` enables nettest's batch jitter in the benchmark;
+`--nettest-disable-batch-jitter` reproduces the older benchmark setting.
 
 The CPU/Gloo path is for correctness testing. Eligible CUDA L1 shards use the
 grouped selected-bucket kernel; unsupported shapes fall back to dense

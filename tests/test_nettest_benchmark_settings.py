@@ -14,7 +14,8 @@ def test_nettest_benchmark_settings_are_explicit_about_batch_jitter():
     assert config.optimizer_config.threat_lr_mult == 0.5
     assert config.optimizer_config.ft_weight_decay == 0.02
     assert config.loss_params.lambda_config.jitter_lambda_sample == 0.0035
-    assert config.loss_params.lambda_config.jitter_lambda_batch == 0
+    assert config.loss_params.lambda_config.jitter_lambda_batch == 0.007
+    assert config.loss_params.lambda_config.jitter_decay_lambda_batch == 0.999
     assert (skip.random_fen_skipping, skip.early_fen_skipping, skip.soft_early_fen_skipping) == (3, 18, 32)
     assert skip.tree_sample_accept == 0.12
     assert io.shuffle_buffer_entries == 1048576

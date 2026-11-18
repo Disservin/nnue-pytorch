@@ -29,10 +29,6 @@ class ShardedAdamWStep:
             )
         if nnue.config.optimizer_config.optimizer_name.lower() != "adamw":
             raise ValueError("sharded training supports only AdamW")
-        if nnue.config.loss_params.lambda_config.jitter_lambda_batch:
-            raise ValueError(
-                "batch lambda jitter is not yet synchronized for sharded training"
-            )
         if nnue.optimizer_wrapper is not None:
             raise ValueError("ShardedAdamWStep must create the NNUE optimizer")
         self.nnue, self.group = nnue, group
@@ -63,6 +59,7 @@ class ShardedAdamWStep:
             raise TypeError("bucketed_bias must be a bool")
         self.compile_model = device.type == "cuda" if compile_model is None else compile_model
         self.bucketed_bias = bucketed_bias
+        self._batch_jitter_generator = None
         # Replicas may have been created with different process seeds. Broadcast
         # them before creating optimizer state; never broadcast shard weights.
         if self.world > 1:
@@ -72,6 +69,8 @@ class ShardedAdamWStep:
                     dist.broadcast(p, src=src, group=group)
                 for buffer in nnue.model.layer_stacks.buffers():
                     dist.broadcast(buffer, src=src, group=group)
+                if nnue.config.loss_params.lambda_config.jitter_lambda_batch:
+                    self._init_batch_jitter(src, device)
         nnue.model._compile_layer_clipping = self.compile_model
         nnue.model.layer_stacks.l1._compile_l1_merge = self.compile_model
         nnue.model.layer_stacks.l1._bucketed_bias = self.bucketed_bias
@@ -94,6 +93,17 @@ class ShardedAdamWStep:
         ]
         self.global_step = 0
 
+    def _init_batch_jitter(self, src, device):
+        # Each rank draws one scalar per global step from its own copy of this
+        # stream. Local sample jitter and unrelated RNG calls cannot advance it.
+        if self.rank == 0:
+            seed = torch.empty((), dtype=torch.int64, device="cpu").random_().to(device)
+        else:
+            seed = torch.empty((), dtype=torch.int64, device=device)
+        dist.broadcast(seed, src=src, group=self.group)
+        dist.broadcast(self.nnue.lambda_scheduler.jitter_buffer, src=src, group=self.group)
+        self._batch_jitter_generator = torch.Generator(device=device).manual_seed(seed.item())
+
     def step(self, batch, *, global_batch=None, after_forward=None):
         """Run one local-batch forward/backward and return the global loss.
 
@@ -105,9 +115,13 @@ class ShardedAdamWStep:
         """
         if not self.nnue.training:
             raise RuntimeError("sharded AdamW steps require training mode")
-        if self.nnue.config.loss_params.lambda_config.jitter_lambda_batch:
+        if (
+            self.world > 1
+            and self._batch_jitter_generator is None
+            and self.nnue.config.loss_params.lambda_config.jitter_lambda_batch
+        ):
             raise ValueError(
-                "batch lambda jitter is not yet synchronized for sharded training"
+                "enable batch lambda jitter before constructing the sharded runner"
             )
         self.optimizer.zero_grad(set_to_none=True)
         enabled = self.global_step >= self.nnue.config.fake_quant_warmup_steps
@@ -122,7 +136,8 @@ class ShardedAdamWStep:
         if after_forward is not None:
             after_forward()
         numerator, weight = self.nnue.compute_loss_components_with_scorenet(
-            prediction, batch, self.global_step
+            prediction, batch, self.global_step,
+            batch_jitter_generator=self._batch_jitter_generator,
         )
         contribution = backward_weighted_loss(
             numerator, weight, self.replicated, self.group
@@ -155,7 +170,7 @@ class ShardedAdamWStep:
         save its own checkpoint.
         """
         device = next(self.nnue.parameters()).device
-        return {
+        state = {
             "format": "sharded-adamw-v1",
             "rank": self.rank,
             "world_size": self.world,
@@ -172,9 +187,13 @@ class ShardedAdamWStep:
             if device.type == "cuda"
             else None,
         }
+        if self._batch_jitter_generator is not None:
+            state["batch_jitter_rng"] = self._batch_jitter_generator.get_state()
+        return state
 
     def load_state_dict(self, state):
         """Restore a checkpoint produced by the same rank and world size."""
+        batch_jitter_rng = state.get("batch_jitter_rng")
         if (
             state.get("format") != "sharded-adamw-v1"
             or state.get("rank") != self.rank
@@ -184,6 +203,7 @@ class ShardedAdamWStep:
             or state.get("gradient_clip_val") != self.gradient_clip_val
             or state.get("device_type") != next(self.nnue.parameters()).device.type
             or len(state.get("schedulers", ())) != len(self.schedulers)
+            or (batch_jitter_rng is None) != (self._batch_jitter_generator is None)
         ):
             raise ValueError("incompatible sharded AdamW checkpoint layout")
         self.nnue.load_state_dict(state["nnue"])
@@ -191,6 +211,8 @@ class ShardedAdamWStep:
             scheduler.load_state_dict(value)
         self.global_step = state["global_step"]
         self.nnue.max_steps = state["max_steps"]
+        if self._batch_jitter_generator is not None:
+            self._batch_jitter_generator.set_state(batch_jitter_rng.cpu())
         torch.set_rng_state(state["cpu_rng"].cpu())
         if state["cuda_rng"] is not None:
             torch.cuda.set_rng_state(

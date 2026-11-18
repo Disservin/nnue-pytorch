@@ -94,9 +94,9 @@ benchmark used the recipe's model dimensions, feature set, position filters,
 one-cycle AdamW parameters, sample jitter, per-step dense weight clipping,
 shuffle-buffer size and one PyTorch CPU thread per rank. It ran after the
 fake-quantization warmup, with a global batch of 131072. **Batch-level lambda
-jitter was disabled in both modes**, because the sharded runner does not yet
-support it; this is therefore not an exact training run. It used one training
-file rather than the full multi-file mixture.
+jitter was disabled in both modes** because the sharded runner did not
+support it at the time. This comparison used one training file from the
+full multi-file mixture.
 
 The host allocation had 64 CPUs. Upstream's 32 loader workers per rank would
 produce 128 loader workers, so the comparison instead used 8, 12 or 16 per
@@ -117,8 +117,8 @@ buffer, four PyTorch threads per rank, and did not include the same per-step
 weight clipping and scheduler. Thus the earlier higher throughput is not
 directly comparable. Controlled ablations are needed to determine the cause
 of the difference. The upstream remapping table used here is saved in
-`nettest_stack_remap.txt`; the corresponding benchmark requires explicit
-acknowledgment that batch jitter is disabled.
+`nettest_stack_remap.txt`. Pass `--nettest-disable-batch-jitter` to reproduce
+this comparison's jitter setting with the current benchmark.
 
 On a separate four-H200 NVL system with 64 allocated CPUs and 128 visible
 hardware threads, a same-node follow-up used 16 loader workers per rank. DDP
