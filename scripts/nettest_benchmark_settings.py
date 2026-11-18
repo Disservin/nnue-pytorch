@@ -1,8 +1,4 @@
-"""Benchmark settings based on the upstream training recipe.
-
-Batch-level lambda jitter is intentionally disabled: the sharded runner does
-not yet implement it. These settings do not constitute an exact training run.
-"""
+"""Benchmark settings based on the upstream training recipe."""
 
 from data_loader.config import DataloaderIOConfig, DataloaderSkipConfig
 from model.config import LambdaConfig, LossParams, ModelConfig, NNUEConfig
@@ -27,7 +23,7 @@ def make_nettest_settings(remap_table):
             in_offset=285.2706341467852, out_offset=289.1258344152218,
             lambda_config=LambdaConfig(
                 start_lambda=1.0, end_lambda=1.0, jitter_lambda_sample=0.0035,
-                jitter_lambda_batch=0.0, jitter_decay_lambda_batch=0.999,
+                jitter_lambda_batch=0.007, jitter_decay_lambda_batch=0.999,
                 lambda_cycle_jitter=True, lambda_schedule_steps=5052000,
                 lambda_cycle_warmup_pct=0.25, lambda_cycle_delta=-0.3,
             ),

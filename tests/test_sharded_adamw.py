@@ -47,7 +47,7 @@ def _batch(rank, n, step):
     return tuple(values)
 
 
-def _worker(rank, port):
+def _worker(rank, port, batch_jitter):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -57,6 +57,11 @@ def _worker(rank, port):
         model_module.get_feature_cls = lambda _: [_Feature]
         sharded_model_module.get_feature_cls = lambda _: [_Feature]
         config = _config()
+        if batch_jitter:
+            cfg = config.loss_params.lambda_config
+            cfg.start_lambda = cfg.end_lambda = 0.5
+            cfg.jitter_lambda_batch = 0.15
+            cfg.jitter_decay_lambda_batch = 0.8
         torch.manual_seed(42)
         full = NNUE(config, max_epoch=3, num_batches_per_epoch=5)
         with torch.no_grad():
@@ -81,7 +86,10 @@ def _worker(rank, port):
             with torch.no_grad():
                 sharded.model.layer_stacks.l1.linear.bias.add_(rank)
                 sharded.model.layer_stacks.l2.linear.weight.add_(rank)
+                if batch_jitter:
+                    sharded.lambda_scheduler.jitter_buffer.fill_(rank)
         runner = ShardedAdamWStep(sharded, gradient_clip_val=0.2)
+        reference_rng = runner.state_dict().get("batch_jitter_rng")
         snapshot = None
         for step in range(3):
             sizes = ([2, 0, 3, 1], [1, 2, 0, 4], [0, 1, 4, 1])[step]
@@ -90,12 +98,26 @@ def _worker(rank, port):
                 torch.cat([part[i] for part in batches]) for i in range(7)
             )
             reference_optimizer.zero_grad(set_to_none=True)
-            loss = full.compute_loss(global_batch, step)
+            if batch_jitter:
+                with torch.random.fork_rng(devices=[]):
+                    torch.set_rng_state(reference_rng)
+                    loss = full.compute_loss(global_batch, step)
+                    reference_rng = torch.get_rng_state()
+                torch.rand(rank + step + 1)
+            else:
+                loss = full.compute_loss(global_batch, step)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(full.model.parameters(), 0.2)
             reference_optimizer.step()
             got = runner.step(batches[rank])
             torch.testing.assert_close(got, loss.detach(), atol=3e-6, rtol=2e-5)
+            if batch_jitter:
+                jitter = sharded.lambda_scheduler.jitter_buffer
+                all_jitter = [torch.empty_like(jitter) for _ in range(4)]
+                dist.all_gather(all_jitter, jitter)
+                for value in all_jitter:
+                    torch.testing.assert_close(value, full.lambda_scheduler.jitter_buffer,
+                                               atol=0, rtol=0)
             expected = dict(full.model.named_parameters())
             for name, param in sharded.model.named_parameters():
                 reference = expected[name]
@@ -119,6 +141,8 @@ def _worker(rank, port):
                 resumed_loss = restarted.step(batches[rank])
                 torch.testing.assert_close(resumed_loss, got, atol=2e-6, rtol=2e-5)
                 resumed_state = restarted.state_dict()
+                if batch_jitter:
+                    assert torch.equal(resumed_state["batch_jitter_rng"], reference_rng)
                 for name, value in after_second["nnue"].items():
                     if torch.is_tensor(value):
                         torch.testing.assert_close(resumed_state["nnue"][name], value)
@@ -144,11 +168,12 @@ def _worker(rank, port):
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(), reason="Gloo unavailable"
 )
-def test_four_rank_adamw_and_resume():
+@pytest.mark.parametrize("batch_jitter", [False, True], ids=["no-jitter", "batch-jitter"])
+def test_four_rank_adamw_and_resume(batch_jitter):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=4, join=True)
+    mp.spawn(_worker, args=(port, batch_jitter), nprocs=4, join=True)
 
 
 def test_reject_non_adamw():

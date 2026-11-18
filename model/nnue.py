@@ -448,18 +448,28 @@ class NNUE(nn.Module):
         )
 
     def compute_loss_components_with_scorenet(
-        self, scorenet: Tensor, batch: tuple[Tensor, ...], current_step: int
+        self,
+        scorenet: Tensor,
+        batch: tuple[Tensor, ...],
+        current_step: int,
+        *,
+        batch_jitter_generator: torch.Generator | None = None,
     ):
         """Return local weighted numerator and denominator for sharded training."""
         scorenet, score, outcome, actual_lambda = self._loss_inputs(
-            scorenet, batch, current_step
+            scorenet, batch, current_step, batch_jitter_generator=batch_jitter_generator
         )
         return self._sf_loss_components_fn(
             scorenet, score, outcome, self.config.loss_params, actual_lambda
         )
 
     def _loss_inputs(
-        self, scorenet: Tensor, batch: tuple[Tensor, ...], current_step: int
+        self,
+        scorenet: Tensor,
+        batch: tuple[Tensor, ...],
+        current_step: int,
+        *,
+        batch_jitter_generator: torch.Generator | None = None,
     ):
         (
             _us,
@@ -479,6 +489,7 @@ class NNUE(nn.Module):
             max_steps=self.max_steps,
             is_training=self.training,
             scorenet=scorenet,
+            batch_jitter_generator=batch_jitter_generator,
         )
         if not torch.is_tensor(actual_lambda):
             # A stable tensor input keeps the compiled loss from respecializing

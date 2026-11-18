@@ -29,8 +29,10 @@ def _worker(rank, port, remap_path, batch_dir):
         reference = ShardedAdamWStep(baseline, bucketed_bias=False)
         candidate = NNUE(copy.deepcopy(config), max_epoch=560, num_batches_per_epoch=8192,
                          sharding=(rank, 4)).cuda(rank)
-        candidate.model.load_state_dict(baseline.model.state_dict())
         optimized = ShardedAdamWStep(candidate, bucketed_bias=True)
+        cfg = config.loss_params.lambda_config
+        reference.global_step = int(cfg.lambda_schedule_steps * cfg.lambda_cycle_warmup_pct)
+        optimized.load_state_dict(reference.state_dict())
         filename = os.path.join(batch_dir, f"batch-0-{rank}-131072.pt")
         batch = pack_saved_batch(torch.load(filename, map_location=torch.device("cuda", rank), weights_only=True))
         l1 = candidate.model.layer_stacks.l1
@@ -44,6 +46,11 @@ def _worker(rank, port, remap_path, batch_dir):
             torch.manual_seed(400 + step + rank)
             actual_loss = optimized.step(batch)
             torch.testing.assert_close(actual_loss, expected_loss, rtol=3e-4, atol=2e-6)
+            jitter = candidate.lambda_scheduler.jitter_buffer
+            by_rank = torch.empty(4, device=rank)
+            dist.all_gather_into_tensor(by_rank, jitter)
+            torch.testing.assert_close(by_rank, baseline.lambda_scheduler.jitter_buffer.expand(4),
+                                       atol=0, rtol=0)
             for (name, p), (candidate_name, q) in zip(baseline.model.named_parameters(),
                                                        candidate.model.named_parameters()):
                 assert name == candidate_name
