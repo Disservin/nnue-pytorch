@@ -1,22 +1,25 @@
 """Run benchmark_sharded_adamw with labeled PyTorch profiler regions."""
 import functools
-from contextlib import nullcontext
+import json
 import os
 import runpy
-import json
 import statistics
 import sys
 import time
+from contextlib import nullcontext
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+
 import data_loader.distributed_features as features
+import model.modules.feature_transformer.fused_ft_functions as ft_functions
 import model.sharded_backward as backward
 import model.sharded_model as model
 import trainer.sharded_adamw as trainer
-import model.modules.sharded_l1 as sharded_l1
-import model.modules.feature_transformer.fused_ft_functions as ft_functions
-from model.modules.feature_transformer.composed_feature_transformer import ComposedFeatureTransformer
+from model.modules import sharded_l1
+from model.modules.feature_transformer.composed_feature_transformer import (
+    ComposedFeatureTransformer,
+)
 from model.modules.layer_stacks import LayerStacks
 from model.modules.sharded_l1 import ShardedL1
 from model.optimizers.lr_scheduler import SafeOneCycleLR
@@ -84,6 +87,7 @@ if profile_compile_override or "--eager-sharded" in sys.argv:
     wrap(LayerStacks, "forward_from_l1", "phase:tail_forward")
 wrap(backward, "global_weighted_loss", "phase:loss_denominator")
 wrap(backward, "synchronize_replicated_gradients", "phase:replica_grad_sync")
+wrap(backward, "_begin_dense_replica_reduce", "phase:enqueue_replica_grad_reduce")
 wrap(trainer, "backward_weighted_loss", "phase:backward_total")
 wrap(trainer, "clip_sharded_grad_norm_", "phase:clip_total")
 if os.environ.get("NNUE_PROFILE_NVTX") == "1":
@@ -109,9 +113,9 @@ if os.environ.get("NNUE_PROFILE_CACHE_FEATURES") == "1":
     original_gather = model.gather_packed_features
     cache = []
 
-    def cached_gather(batch, group=None):
+    def cached_gather(batch, group=None, **kwargs):
         if not cache:
-            cache.append(original_gather(batch, group))
+            cache.append(original_gather(batch, group, **kwargs))
         return cache[0]
 
     model.gather_packed_features = cached_gather

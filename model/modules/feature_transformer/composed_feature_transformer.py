@@ -154,6 +154,9 @@ class ComposedFeatureTransformer(nn.Module):
         fake_quantize_acts: bool,
         fake_quantize_weights: bool,
         backend: str = "auto",
+        *,
+        packed_payload: torch.Tensor | None = None,
+        packed_feature_width: int | None = None,
     ) -> torch.Tensor:
         merged, bias = self.merged_weight_and_bias(fake_quantize_weights)
         ft_max_act = self.quantization.max_ft_activation
@@ -169,6 +172,8 @@ class ComposedFeatureTransformer(nn.Module):
             self.l1_size,
             backend,
             sharded_backward=self._sharded_backward,
+            packed_payload=packed_payload,
+            packed_feature_width=packed_feature_width,
         )
 
         # We multiply by a correction factor,

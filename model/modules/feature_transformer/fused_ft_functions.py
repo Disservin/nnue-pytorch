@@ -90,10 +90,12 @@ class FusedDoubleFtFunction(autograd.Function):
         max_ft_activation,
         l1_size,
         sharded_backward=False,
+        packed_payload=None,
+        packed_feature_width=None,
     ):
         ctx.max_ft_activation = float(max_ft_activation)
         ctx.l1_size = int(l1_size)
-        ctx.sharded_backward = sharded_backward
+        ctx.sharded_backward = sharded_backward or packed_payload is not None
 
         assert l1_size % 2 == 0
 
@@ -125,6 +127,15 @@ class FusedDoubleFtFunction(autograd.Function):
 
         batch_size = white_indices.shape[0]
         max_active_features = white_indices.shape[1]
+        if packed_payload is not None:
+            if (
+                packed_payload.device != us.device or packed_payload.dtype != torch.int32
+                or not packed_payload.is_contiguous() or max_active_features != 2
+                or not isinstance(packed_feature_width, int) or packed_feature_width <= 0
+            ):
+                raise ValueError("invalid packed feature ranges")
+            max_active_features = packed_feature_width
+        ctx.max_active_features = max_active_features
         l1_half = l1_size // 2
 
         l0_ = torch.empty(batch_size, l1_size, dtype=torch.float32, device=us.device)
@@ -133,7 +144,9 @@ class FusedDoubleFtFunction(autograd.Function):
         )
 
         output_size = bias.shape[0]
-        kernel = make_fused_double_ft_forward_kernel(max_active_features, l1_size)
+        kernel = make_fused_double_ft_forward_kernel(
+            max_active_features, l1_size, packed=packed_payload is not None
+        )
         kernel(
             grid=(batch_size,),
             args=(
@@ -147,20 +160,21 @@ class FusedDoubleFtFunction(autograd.Function):
                 l0_.data_ptr(),
                 clamped_out.data_ptr(),
                 np.int32(output_size),
-            ),
+            ) + ((packed_payload.data_ptr(),) if packed_payload is not None else ()),
         )
 
         # The loader's prefetch thread may have prepared the tiled backward's tile structure for
         # this batch (registered by its index tensor); claim it now, while the tensor is the batch's.
-        ctx.tiled_prep = None if sharded_backward else claim_prep(white_indices)
+        ctx.tiled_prep = None if ctx.sharded_backward else claim_prep(white_indices)
         ctx.save_for_backward(
-            us, them, white_indices, black_indices, weight, bias, clamped_out
+            us, them, white_indices, black_indices, weight, bias, clamped_out,
+            packed_payload,
         )
         return l0_
 
     @staticmethod
     def backward(ctx, grad_l0):
-        us, them, white_indices, black_indices, weight, bias, clamped_out = (
+        us, them, white_indices, black_indices, weight, bias, clamped_out, packed_payload = (
             ctx.saved_tensors
         )
         max_ft_activation = ctx.max_ft_activation
@@ -180,11 +194,11 @@ class FusedDoubleFtFunction(autograd.Function):
                 max_ft_activation,
                 prep,
             )
-            gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None)
+            gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None, None, None)
             return gradients[:len(ctx.needs_input_grad)]
 
         batch_size = white_indices.shape[0]
-        max_active_features = white_indices.shape[1]
+        max_active_features = ctx.max_active_features
         output_size = bias.shape[0]
 
         grad_weight = torch.zeros(
@@ -200,14 +214,25 @@ class FusedDoubleFtFunction(autograd.Function):
                 torch.cuda.get_device_capability(us.device),
             )
             aggregated_ft_backward(
-                us, them, white_indices, black_indices, grad_l0, clamped_out,
-                grad_weight, grad_bias, max_ft_activation, tile_size=tile_size,
+                us,
+                them,
+                white_indices,
+                black_indices,
+                grad_l0,
+                clamped_out,
+                grad_weight,
+                grad_bias,
+                max_ft_activation,
+                tile_size=tile_size,
+                packed_payload=packed_payload,
+                packed_feature_width=max_active_features,
             )
-            gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None)
+            gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None, None, None)
             return gradients[:len(ctx.needs_input_grad)]
 
-        # The direct scatter, for the layers and devices the tiled backward does not handle.
-        kernel = make_fused_double_ft_backward_kernel(max_active_features, l1_size)
+        kernel = make_fused_double_ft_backward_kernel(
+            max_active_features, l1_size, packed=packed_payload is not None
+        )
         grid_size = (batch_size + BACKWARD_TILE_SIZE - 1) // BACKWARD_TILE_SIZE
         kernel(
             grid=(grid_size,),
@@ -225,8 +250,8 @@ class FusedDoubleFtFunction(autograd.Function):
                 grad_bias.data_ptr(),
                 np.int32(batch_size),
                 np.int32(output_size),
-            ),
+            ) + ((packed_payload.data_ptr(),) if packed_payload is not None else ()),
         )
 
-        gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None)
+        gradients = (None, None, None, None, grad_weight, grad_bias, None, None, None, None, None)
         return gradients[:len(ctx.needs_input_grad)]
