@@ -131,9 +131,7 @@ class StackedLinear(nn.Module):
                 bias, f"{self.layer_key}_bias"
             )
 
-        if grouped_l1_preferred(self.count) and grouped_l1_applicable(
-            x, weight, bias, self.count
-        ):
+        if can_use_grouped_l1(x, weight, bias, self.count):
             return grouped_l1(x, weight, bias, ls_indices, self.count)
 
         stacked_output = F.linear(x, weight, bias)
