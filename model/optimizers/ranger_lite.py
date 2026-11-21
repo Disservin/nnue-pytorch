@@ -43,6 +43,13 @@ class _RangerLiteFusedKernels:
         source = r"""
 typedef long long int64_t;
 
+static __device__ __forceinline__ float blend_lookahead(
+    float fast, float slow, float alpha, float slow_alpha
+) {
+    // Match the separate torch mul_ followed by add_(slow, alpha=slow_alpha).
+    return fmaf(slow, slow_alpha, __fmul_rn(fast, alpha));
+}
+
 extern "C" __global__ void ranger_lite_update_pnm(
     float* __restrict__ p,
     const float* __restrict__ grad,
@@ -61,7 +68,10 @@ extern "C" __global__ void ranger_lite_update_pnm(
     float lr_div_bc1,
     float eps,
     int64_t step,
-    float wd_factor
+    float wd_factor,
+    float* __restrict__ slow,
+    float lookahead_alpha,
+    float slow_alpha
 ) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float g = grad[i];
@@ -81,6 +91,10 @@ extern "C" __global__ void ranger_lite_update_pnm(
             new_p = new_p * (1.0f - wd_factor);
         }
         new_p = new_p - lr_div_bc1 * (pnm_val / denom);
+        if (slow != nullptr) {
+            new_p = blend_lookahead(new_p, slow[i], lookahead_alpha, slow_alpha);
+            slow[i] = new_p;
+        }
         p[i] = new_p;
 
         if (step & 1LL) {
@@ -104,7 +118,10 @@ extern "C" __global__ void ranger_lite_update_adam(
     float one_minus_beta1,
     float lr_div_bc1,
     float eps,
-    float wd_factor
+    float wd_factor,
+    float* __restrict__ slow,
+    float lookahead_alpha,
+    float slow_alpha
 ) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float g = grad[i];
@@ -120,6 +137,10 @@ extern "C" __global__ void ranger_lite_update_adam(
             new_p = new_p * (1.0f - wd_factor);
         }
         new_p = new_p - lr_div_bc1 * (gm / denom);
+        if (slow != nullptr) {
+            new_p = blend_lookahead(new_p, slow[i], lookahead_alpha, slow_alpha);
+            slow[i] = new_p;
+        }
         p[i] = new_p;
     }
 }
@@ -340,7 +361,34 @@ class RangerLite(torch.optim.Optimizer):
                 return False
         return True
 
-    def _fused_update_group(self, group):
+    def _can_fuse_lookahead(self):
+        # Moving the blend into each update is safe when the states and parameters do not alias.
+        storages = set()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                storage = (p.device, p.untyped_storage().data_ptr())
+                if storage in storages:
+                    return False
+                storages.add(storage)
+                slow = self.state[p].get("lookahead_params")
+                if slow is None:
+                    continue
+                if (
+                    slow.device != p.device
+                    or slow.dtype != p.dtype
+                    or slow.shape != p.shape
+                    or not slow.is_contiguous()
+                ):
+                    return False
+                slow_storage = (slow.device, slow.untyped_storage().data_ptr())
+                if slow_storage in storages:
+                    return False
+                storages.add(slow_storage)
+        return True
+
+    def _fused_update_group(self, group, merge_lookahead):
         """Apply the fused full update kernel (variance + moment + param)."""
         _RangerLiteFusedKernels._compile()
         beta1, beta2 = group["betas"]
@@ -372,6 +420,17 @@ class RangerLite(torch.optim.Optimizer):
             gm_arr = cp.from_dlpack(torch.to_dlpack(state["grad_ma"]))
             vm_arr = cp.from_dlpack(torch.to_dlpack(state["variance_ma"]))
 
+            slow = (
+                cp.from_dlpack(torch.to_dlpack(state["lookahead_params"]))
+                if merge_lookahead
+                else 0
+            )
+            lookahead_args = (
+                slow,
+                np.float32(self.lookahead_alpha),
+                np.float32(1.0 - self.lookahead_alpha),
+            )
+
             block = 512
             grid = (p.numel() + block - 1) // block
 
@@ -399,6 +458,7 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(eps),
                     np.int64(step),
                     np.float32(wd_factor),
+                    *lookahead_args,
                 )
                 _RangerLiteFusedKernels._pnm_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -420,6 +480,7 @@ class RangerLite(torch.optim.Optimizer):
                     np.float32(lr_div_bc1),
                     np.float32(eps),
                     np.float32(wd_factor),
+                    *lookahead_args,
                 )
                 _RangerLiteFusedKernels._adam_kernel(
                     grid=(grid,), block=(block,), args=args
@@ -570,9 +631,16 @@ class RangerLite(torch.optim.Optimizer):
         if not needs_variance_sum:
             all_fusable = all(self._can_fuse_group_full(g) for g in self.param_groups)
             if all_fusable:
+                merge_lookahead = (
+                    self.lookahead_active
+                    and (self.lookahead_step + 1 >= self.lookahead_mergetime)
+                    and self._can_fuse_lookahead()
+                )
                 for group in self.param_groups:
-                    self._fused_update_group(group)
-                if self.lookahead_active:
+                    self._fused_update_group(group, merge_lookahead)
+                if merge_lookahead:
+                    self.lookahead_step = 0
+                elif self.lookahead_active:
                     self.lookahead_process_step()
                 return loss
 

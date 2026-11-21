@@ -11,6 +11,7 @@ from model.optimizers import (
     SafeOneCycleLR,
     ScheduleFreeWrapper,
 )
+from model.optimizers.ranger_lite import _HAS_CUPY, RangerLite
 
 ALL_OPTIMIZERS = ["rangerlite", "ranger21", "schedulefree", "adamw"]
 
@@ -347,3 +348,35 @@ def test_weight_clipper_and_swa_export():
     swa.swap_weights = lambda model, to_eval: None
     swa.on_train_end(t_swa)
     assert t_swa.model.model.calls == [True]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY, reason="CUDA and CuPy required"
+)
+@pytest.mark.parametrize("pnm", [False, True])
+def test_fused_lookahead_matches_separate_update(pnm, monkeypatch):
+    rng = torch.Generator(device="cuda").manual_seed(0)
+    initial = torch.randn(3073, device="cuda", generator=rng)
+    fast = torch.nn.Parameter(initial.clone())
+    reference = torch.nn.Parameter(initial.clone())
+    fused, separate = [
+        RangerLite(
+            [p],
+            lr=0.000875,
+            normloss_active=False,
+            pnm_activate=pnm,
+            lookahead_blending_alpha=0.2,
+        )
+        for p in (fast, reference)
+    ]
+    monkeypatch.setattr(separate, "_can_fuse_lookahead", lambda: False)
+
+    for _ in range(12):
+        grad = torch.randn(initial.shape, device=initial.device, generator=rng)
+        fast.grad = reference.grad = grad
+        fused.step()
+        separate.step()
+        assert torch.equal(fast, reference)
+        assert fused.lookahead_step == separate.lookahead_step
+        for key in ("grad_ma", "variance_ma", "lookahead_params"):
+            assert torch.equal(fused.state[fast][key], separate.state[reference][key])
