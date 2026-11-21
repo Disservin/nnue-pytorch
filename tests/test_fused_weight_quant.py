@@ -98,10 +98,17 @@ def test_merge_quant_matches_the_torch_chain(cols):
     v[:2] = 0.0
     segs = [(w0, None, 1), (w1, v, nb)]
     assert FWQ.usable(segs)
-    out = FWQ.merge_and_fake_quantize(segs, s)
+    out, low = FWQ.merge_and_fake_quantize(segs, s)
+    assert low is None
     x = torch.cat([w0, w1 + v.repeat(nb, 1)])
     ref = torch.round(x * s) * (np.float32(1.0) / np.float32(s)).item()
     assert torch.equal(out, ref)
+    # the bf16 copy written in the same pass matches torch's rounding bit for bit
+    # (s = 254 makes most values inexact in bf16, so this exercises the rounding)
+    out, low = FWQ.merge_and_fake_quantize(segs, s, with_bf16=True)
+    assert torch.equal(out, ref)
+    assert low.dtype == torch.bfloat16
+    assert torch.equal(low.view(torch.int16), ref.to(torch.bfloat16).view(torch.int16))
 
 
 @needs_cuda

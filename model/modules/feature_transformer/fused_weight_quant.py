@@ -22,19 +22,30 @@ import torch
 from ...cupy_utils import HAS_CUPY, compile_kernel, cupy_stream
 
 _SRC = r"""
+// bf16 bits of x, rounded to nearest even like torch's float -> bfloat16 conversion.
+__device__ __forceinline__ unsigned int bf16_bits(float x) {
+    const unsigned int u = __float_as_uint(x);
+    if (x != x) return 0x7FC0u;
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+
 // out = rint((w + v) * s) * inv, 16 B per access. Thread j owns float4 j of the virtual weight (or of
 // the whole segment when there is none) and walks the nb buckets, so each virtual element is read
-// once.
+// once. When low is set, the same values are also written to it as bf16 (8 B per access), so the
+// gather's bf16 copy needs no separate pass over the merged weight.
 extern "C" __global__ void merge_quant(float4* __restrict__ out, const float4* __restrict__ w,
                                        const float4* __restrict__ v, int vn4, int nb,
-                                       float s, float inv) {
+                                       float s, float inv, uint2* __restrict__ low) {
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < vn4; j += blockDim.x * gridDim.x) {
         const float4 a = v != nullptr ? v[j] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int b = 0; b < nb; ++b) {
             const long long i = (long long)b * vn4 + j;
             float4 x = w[i];
             if (v != nullptr) { x.x = x.x + a.x; x.y = x.y + a.y; x.z = x.z + a.z; x.w = x.w + a.w; }
-            out[i] = make_float4(rintf(x.x * s) * inv, rintf(x.y * s) * inv, rintf(x.z * s) * inv, rintf(x.w * s) * inv);
+            const float4 q = make_float4(rintf(x.x * s) * inv, rintf(x.y * s) * inv, rintf(x.z * s) * inv, rintf(x.w * s) * inv);
+            out[i] = q;
+            if (low != nullptr)
+                low[i] = make_uint2(bf16_bits(q.x) | (bf16_bits(q.y) << 16), bf16_bits(q.z) | (bf16_bits(q.w) << 16));
         }
     }
 }
@@ -93,7 +104,7 @@ def usable(segs) -> bool:
 class _MergeFakeQuant(torch.autograd.Function):
     @staticmethod
     @torch.compiler.disable
-    def forward(ctx, scale, layout, *params):
+    def forward(ctx, scale, layout, low, *params):
         s = np.float32(scale)
         inv = np.float32(1.0) / s
         rows = sum(params[i].shape[0] for i, (has_v, _) in _iter_layout(layout))
@@ -119,6 +130,7 @@ class _MergeFakeQuant(torch.autograd.Function):
                             np.int32(1 if v is None else nb),
                             s,
                             inv,
+                            0 if low is None else low[r0:].data_ptr(),
                         ),
                     )
                 r0 += w.shape[0]
@@ -139,7 +151,7 @@ class _MergeFakeQuant(torch.autograd.Function):
                 # the virtual weight is repeated over the buckets: sum its gradient over them
                 grads[i + 1] = g.view(nb, *ctx.shapes[i + 1]).sum(0)
             r0 += nr
-        return (None, None, *grads)
+        return (None, None, None, *grads)
 
 
 def _iter_layout(layout):
@@ -150,7 +162,15 @@ def _iter_layout(layout):
         i += 2 if has_v else 1
 
 
-def merge_and_fake_quantize(segs, scale):
+def merge_and_fake_quantize(segs, scale, with_bf16=False):
+    """The merged, fake-quantized weight; with ``with_bf16`` also a detached bf16 copy of it
+    (bit-identical to ``merged.detach().to(torch.bfloat16)``) written by the same kernel, else None."""
     layout = tuple((v is not None, nb) for _, v, nb in segs)
     params = [p for w, v, _ in segs for p in ((w, v) if v is not None else (w,))]
-    return _MergeFakeQuant.apply(scale, layout, *params)
+    low = None
+    if with_bf16:
+        rows = sum(w.shape[0] for w, _, _ in segs)
+        w0 = segs[0][0]
+        low = torch.empty(rows, w0.shape[1], device=w0.device, dtype=torch.bfloat16)
+    merged = _MergeFakeQuant.apply(scale, layout, low, *params)
+    return merged, low

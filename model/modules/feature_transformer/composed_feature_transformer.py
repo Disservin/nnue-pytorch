@@ -72,23 +72,28 @@ class ComposedFeatureTransformer(nn.Module):
     def merged_weight_and_bias(
         self,
         fake_quantize_weights: bool = False,
+        with_bf16: bool = False,
     ):
+        """(merged, bias); with ``with_bf16`` (merged, bias, low), where low is a bf16 copy of merged
+        that the fused merge kernel wrote in the same pass, or None when it did not run."""
         b = self.bias
         if fake_quantize_weights:
             segs = _fwq.segments_of(self.features)
             if _fwq.usable(segs):
                 # one pass instead of cat + virtual add + STE chain; bit-identical (fused_weight_quant.py)
-                merged = _fwq.merge_and_fake_quantize(
-                    segs, self.quantization.weight_scales_dict["ft_weight"]
+                merged, low = _fwq.merge_and_fake_quantize(
+                    segs,
+                    self.quantization.weight_scales_dict["ft_weight"],
+                    with_bf16=with_bf16,
                 )
                 b = self.quantization.fake_quantize_weights(b, "ft_bias")
-                return merged, b
+                return (merged, b, low) if with_bf16 else (merged, b)
         merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
         if fake_quantize_weights:
             merged = self.quantization.fake_quantize_weights(merged, "ft_weight")
             b = self.quantization.fake_quantize_weights(b, "ft_bias")
 
-        return merged, b
+        return (merged, b, None) if with_bf16 else (merged, b)
 
     def list_buckets(self) -> tuple[int, int] | None:
         """(first_row, rows_per_bucket) of the last feature when its rows are bucket-major (K32H3),
@@ -157,20 +162,21 @@ class ComposedFeatureTransformer(nn.Module):
         fake_quantize_weights: bool,
         backend: str = "auto",
     ) -> torch.Tensor:
-        merged, bias = self.merged_weight_and_bias(fake_quantize_weights)
+        want_low = bool(
+            _GATHER_BF16 and fake_quantize_weights and fused_backend_available()
+        )
+        merged, bias, weight_low = self.merged_weight_and_bias(
+            fake_quantize_weights, with_bf16=want_low
+        )
         ft_max_act = self.quantization.max_ft_activation
 
         # Fake quantization rounds every weight to a multiple of 1/256
         # (ft_quantized_one), which bfloat16 represents exactly, so the gather can
         # read a half-size copy of the same values. The autograd path stays on the
         # fp32 weight, which receives the gradient.
-        weight_low = None
-        if (
-            _GATHER_BF16
-            and fake_quantize_weights
-            and merged.is_cuda
-            and fused_backend_available()
-        ):
+        # The fused merge kernel writes that copy in the same pass; cast only when
+        # the reference chain built the weight.
+        if want_low and weight_low is None and merged.is_cuda:
             weight_low = merged.detach().to(torch.bfloat16)
         l0_ = double_feature_transform(
             us,
