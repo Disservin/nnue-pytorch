@@ -5,34 +5,23 @@ from torch import nn
 from ..quantize import QuantizationManager
 
 try:
-    from .grouped_linear import grouped_l1, grouped_l1_preferred
+    from .grouped_linear import grouped_l1, grouped_l1_applicable, grouped_l1_preferred
 except (ImportError, OSError, RuntimeError):
     grouped_l1 = None
 
+    def grouped_l1_applicable(x, weight, bias, count) -> bool:
+        return False
+
+    def grouped_l1_preferred(count) -> bool:
+        return False
+
 
 def can_use_grouped_l1(x, weight, bias, count):
-    """Share the grouped-kernel eligibility rules across full and sharded L1."""
-    if (
-        grouped_l1 is None
-        or not x.is_cuda
-        or torch.version.hip is not None
-        or x.ndim != 2
-        or x.shape[0] == 0
-        or x.dtype != torch.float32
-        or weight.dtype != torch.float32
-        or bias.dtype != torch.float32
-        or torch.is_autocast_enabled()
-    ):
-        return False
-    width = x.shape[1]
-    outputs = bias.numel() // count if count else 0
+    """Share the grouped-kernel dispatch across full and sharded layers."""
     return (
-        128 <= width <= 4096
-        and width % 128 == 0
-        and 1 <= outputs <= 128
-        and 1 <= count <= 256
+        grouped_l1 is not None
         and grouped_l1_preferred(count)
-        and torch.cuda.get_device_capability(x.device)[0] >= 8
+        and grouped_l1_applicable(x, weight, bias, count)
     )
 
 
@@ -142,6 +131,9 @@ class StackedLinear(nn.Module):
                 bias, f"{self.layer_key}_bias"
             )
 
+        if can_use_grouped_l1(x, weight, bias, self.count):
+            return grouped_l1(x, weight, bias, ls_indices, self.count)
+
         stacked_output = F.linear(x, weight, bias)
 
         return self.select_output(stacked_output, ls_indices)
@@ -221,16 +213,7 @@ class FactorizedStackedLinear(StackedLinear):
                 merged_bias, f"{self.layer_key}_bias"
             )
 
-        # The custom kernels specialize FP32 K->N, N <= 128. The router uses
-        # one of its 256 threads per bucket for initialization/reservation.
-        # They only outperform the dense path with enough stacks (measured
-        # crossover: 32). Keep the standard
-        # path for missing dependencies and other workloads.
-        if (
-            x.ndim == 2
-            and x.shape[1] == self.in_features
-            and can_use_grouped_l1(x, merged_weight, merged_bias, self.count)
-        ):
+        if can_use_grouped_l1(x, merged_weight, merged_bias, self.count):
             return grouped_l1(x, merged_weight, merged_bias, ls_indices, self.count)
 
         stacked_output = F.linear(x, merged_weight, merged_bias)
