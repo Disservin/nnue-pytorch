@@ -1,9 +1,11 @@
 import pytest
 import torch
 
+from model.modules import ComposedFeatureTransformer, get_feature_cls
 from model.modules.feature_transformer.sparse_linear_functions import (
     SparseLinearFunction,
 )
+from model.quantize import QuantizationConfig, QuantizationManager
 
 
 def SparseLinearFunctionEmulate(
@@ -95,6 +97,15 @@ def _run_padding_test(device: torch.device):
 
     assert torch.max(torch.abs(out_unpadded - out_padded)) < MAX_ERROR
     print(f"Padding test passed on {device}.")
+
+
+def test_composed_forward_without_bf16_copy():
+    ft = ComposedFeatureTransformer(
+        get_feature_cls("PP_3Wide"), 8, QuantizationManager(QuantizationConfig())
+    )
+    indices = torch.tensor([[0, -1]], dtype=torch.int32)
+    result = ft(torch.ones(1, 1), torch.zeros(1, 1), indices, indices, False, False)
+    assert result.shape == (1, 8)
 
 
 def test_cpu():

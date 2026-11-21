@@ -165,9 +165,10 @@ class ComposedFeatureTransformer(nn.Module):
         want_low = bool(
             _GATHER_BF16 and fake_quantize_weights and fused_backend_available()
         )
-        merged, bias, weight_low = self.merged_weight_and_bias(
+        merged, bias, *low = self.merged_weight_and_bias(
             fake_quantize_weights, with_bf16=want_low
         )
+        weight_low = low[0] if want_low else None
         ft_max_act = self.quantization.max_ft_activation
 
         # Fake quantization rounds every weight to a multiple of 1/256
