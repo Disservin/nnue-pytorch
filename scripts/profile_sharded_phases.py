@@ -44,8 +44,8 @@ if os.environ.get("NNUE_PROFILE_REFERENCE_UNPACK") == "1":
 if os.environ.get("NNUE_PROFILE_SEPARATE_UNPACK") == "1":
     features._use_fused_unpack = lambda device: False
 if os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1":
-    ComposedFeatureTransformer.merged_weight_and_bias = torch.compile(
-        ComposedFeatureTransformer.merged_weight_and_bias, fullgraph=True
+    ComposedFeatureTransformer._merge_weight_and_bias_torch = torch.compile(
+        ComposedFeatureTransformer._merge_weight_and_bias_torch, fullgraph=True
     )
 if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
     LayerStacks.forward_from_l1 = torch.compile(LayerStacks.forward_from_l1)

@@ -122,7 +122,8 @@ int main(int argc, char** argv) {
         for (const char* name : {"Full_Threats", "PP_3Wide", "K32H3",
                                  "Full_Threats+PP_3Wide+K32H3", "K32H3+Full_Threats+PP_3Wide"}) {
             auto* reference = get_sparse_batch_from_fens(name, test_keys, int(count), fen_ptrs.data(),
-                                                        scores.data(), plies.data(), results.data());
+                                                        scores.data(), plies.data(), results.data(),
+                                                        /*prepack=*/false);
             char error[256] = {};
             auto* decoded = get_sparse_batch_from_compact_backend(name, test_keys, records, count * 32, 8, true,
                                                           error, sizeof(error));
@@ -261,7 +262,7 @@ int main(int argc, char** argv) {
         std::vector<const char*> fen_ptrs;
         for (const auto& fen : fens) fen_ptrs.push_back(fen.c_str());
         auto* reference = get_sparse_batch_from_fens(random_features, random_keys, int(count),
-          fen_ptrs.data(), scores.data(), plies.data(), results.data());
+          fen_ptrs.data(), scores.data(), plies.data(), results.data(), /*prepack=*/false);
         char error[256] = {};
         auto* decoded = get_sparse_batch_from_compact_backend(random_features, random_keys, records,
                                                        count * 32, 8, true, error, sizeof(error));

@@ -24,7 +24,7 @@ def test_compiled_ft_merge_matches_eager(quantized):
             if hasattr(feature, "virtual_weight"):
                 feature.virtual_weight.uniform_(-0.02, 0.02)
         candidate.load_state_dict(reference.state_dict())
-    compiled = torch.compile(candidate.merged_weight_and_bias, fullgraph=True)
+    compiled = torch.compile(candidate._merge_weight_and_bias_torch, fullgraph=True)
     expected_w, expected_b = reference.merged_weight_and_bias(quantized)
     actual_w, actual_b = compiled(quantized)
     torch.testing.assert_close(actual_w, expected_w, atol=1e-7, rtol=1e-6)
