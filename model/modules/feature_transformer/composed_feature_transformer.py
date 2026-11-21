@@ -69,7 +69,6 @@ class ComposedFeatureTransformer(nn.Module):
         self,
         fake_quantize_weights: bool = False,
     ):
-        b = self.bias
         if fake_quantize_weights:
             segs = _fwq.segments_of(self.features)
             if _fwq.usable(segs):
@@ -77,8 +76,12 @@ class ComposedFeatureTransformer(nn.Module):
                 merged = _fwq.merge_and_fake_quantize(
                     segs, self.quantization.weight_scales_dict["ft_weight"]
                 )
-                b = self.quantization.fake_quantize_weights(b, "ft_bias")
-                return merged, b
+                return merged, self.quantization.fake_quantize_weights(self.bias, "ft_bias")
+        return self._merge_weight_and_bias_torch(fake_quantize_weights)
+
+    def _merge_weight_and_bias_torch(self, fake_quantize_weights: bool = False):
+        """Pure PyTorch fallback that can be compiled as a full graph."""
+        b = self.bias
         merged = torch.cat([f.merged_weight() for f in self.features], dim=0)
         if fake_quantize_weights:
             merged = self.quantization.fake_quantize_weights(merged, "ft_weight")

@@ -14,9 +14,11 @@ Every rank must call `step(local_loader_batch)` in the same order. The returned
 tensor is the global weighted loss. The caller is responsible for epoch-based
 scheduler steps and the existing weight-clipping callbacks.
 
-When the model is on CUDA, `ShardedAdamWStep` compiles FT weight merging, the
-post-L1 tail and the loss by default. The distributed forward and collectives
-remain eager. Pass `compile_model=False` to keep those local components eager;
+When the model is on CUDA, `ShardedAdamWStep` compiles the PyTorch FT weight
+merge fallback, the post-L1 tail and the loss by default. Supported weights
+use upstream's fused CUDA merge for fake quantization. The distributed
+forward and collectives remain eager. Pass `compile_model=False` to keep
+those local components eager;
 CPU runs default to eager, while `compile_model=True` explicitly enables
 compilation. Construct the runner after moving the model to its final device.
 Compilation is lazy, and different batch shapes or quantization settings may
@@ -46,6 +48,16 @@ all-bucket multiplication. Feature gathering supports the existing padded
 loader tensors and an optional native-packed representation. Full
 training-pipeline and checkpoint conversion behavior have not yet been
 validated.
+
+Native-packed sharded batches use the upstream loader workers to build the
+packed layout. The benchmark's loader wait diagnostics include each rank's
+native fetch and prefetch queue counters. Rebuild the native loader with this
+checkout because the stream ABI includes the prepack flag.
+
+Ordinary training uses upstream's tiled FT backward where supported. The
+sharded path retains its existing scatter and tile-local aggregation kernels,
+including for direct packed FT. The DDP benchmark uses tiled preparation in
+the live prefetch thread, or prepares each replay batch inline during timing.
 
 The benchmark's `--async-features` option experiments with one-batch
 lookahead for native-packed loader batches. All ranks enqueue the next feature
