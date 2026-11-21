@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch import autograd
 
+from ...quantize import FAKE_QUANTIZE_EPS
 from . import tiled_ft_backward
 from .tiled_ft_prep import claim_prep
 
@@ -31,9 +32,21 @@ class FusedDoubleFtFunction(autograd.Function):
         max_ft_activation,
         l1_size,
         weight_low=None,
+        activation_quant=None,
     ):
         ctx.max_ft_activation = float(max_ft_activation)
         ctx.l1_size = int(l1_size)
+        ctx.act_corr = 1.0
+        activation_args = ()
+        if activation_quant is not None:
+            scale, ctx.act_corr = activation_quant
+            act_scale = np.float32(scale)
+            activation_args = (
+                act_scale,
+                np.float32(FAKE_QUANTIZE_EPS),
+                np.float32(1.0) / act_scale,
+                np.float32(ctx.act_corr),
+            )
 
         assert l1_size % 2 == 0
 
@@ -84,7 +97,10 @@ class FusedDoubleFtFunction(autograd.Function):
         # bandwidth. The gradient still accumulates into the fp32 weight.
         gather_weight = weight if weight_low is None else weight_low
         kernel = make_fused_double_ft_forward_kernel(
-            max_active_features, l1_size, gather_weight.dtype
+            max_active_features,
+            l1_size,
+            gather_weight.dtype,
+            activation_quant is not None,
         )
         kernel(
             grid=(batch_size,),
@@ -99,6 +115,7 @@ class FusedDoubleFtFunction(autograd.Function):
                 l0_.data_ptr(),
                 clamped_out.data_ptr(),
                 np.int32(output_size),
+                *activation_args,
             ),
         )
 
@@ -118,6 +135,8 @@ class FusedDoubleFtFunction(autograd.Function):
         max_ft_activation = ctx.max_ft_activation
         l1_size = ctx.l1_size
 
+        if ctx.act_corr != 1.0:
+            grad_l0 = grad_l0 * ctx.act_corr
         grad_l0 = grad_l0.contiguous()
         prep, ctx.tiled_prep = ctx.tiled_prep, None
         if tiled_ft_backward.enabled(l1_size, weight.shape[0], us.device):
@@ -132,7 +151,18 @@ class FusedDoubleFtFunction(autograd.Function):
                 max_ft_activation,
                 prep,
             )
-            return None, None, None, None, grad_weight, grad_bias, None, None, None
+            return (
+                None,
+                None,
+                None,
+                None,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+            )
 
         batch_size = white_indices.shape[0]
         max_active_features = white_indices.shape[1]
@@ -165,4 +195,4 @@ class FusedDoubleFtFunction(autograd.Function):
             ),
         )
 
-        return None, None, None, None, grad_weight, grad_bias, None, None, None
+        return None, None, None, None, grad_weight, grad_bias, None, None, None, None

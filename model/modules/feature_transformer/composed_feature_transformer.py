@@ -190,6 +190,7 @@ class ComposedFeatureTransformer(nn.Module):
             self.l1_size,
             backend,
             weight_low,
+            self.quantization if fake_quantize_acts else None,
         )
 
         # We multiply by a correction factor,
@@ -197,5 +198,5 @@ class ComposedFeatureTransformer(nn.Module):
         # When using fake quantization any correction factor
         # not equal 1.0 will lead to diverging discrete grids
         if fake_quantize_acts:
-            return self.quantization.fake_quantize_ft_act_and_correct(l0_)
+            return l0_
         return l0_ * self.quantization.l0_correction_factor

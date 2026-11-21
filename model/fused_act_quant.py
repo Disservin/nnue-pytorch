@@ -16,16 +16,25 @@ import torch
 
 from .cupy_utils import HAS_CUPY, compile_kernel, cupy_stream
 
-_SRC = r"""
+ACT_QUANT_DEVICE = r"""
+static __device__ __forceinline__ float quantize_activation(float x, float s, float eps, float inv, float c) {
+    float h = __fmul_rn(floorf(__fadd_rn(__fmul_rn(x, s), eps)), inv);
+    return __fmul_rn(h, c);
+}
+"""
+
+_SRC = (
+    ACT_QUANT_DEVICE
+    + r"""
 extern "C" __global__ void act_quant(float* __restrict__ out, const float* __restrict__ x, long long n,
                                      float s, float eps, float inv, float c) {
     long long stride = (long long)blockDim.x * gridDim.x;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        float h = __fmul_rn(floorf(__fadd_rn(__fmul_rn(x[i], s), eps)), inv);
-        out[i] = __fmul_rn(h, c);
+        out[i] = quantize_activation(x[i], s, eps, inv, c);
     }
 }
 """
+)
 
 
 class _ActFakeQuant(torch.autograd.Function):

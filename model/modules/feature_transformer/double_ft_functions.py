@@ -1,5 +1,6 @@
 import torch
 
+from ...quantize import QuantizationManager
 from .fused_ft_functions import _HAS_CUPY_KERNELS, FusedDoubleFtFunction
 from .sparse_linear_functions import SparseLinearFunction
 
@@ -20,6 +21,7 @@ def double_feature_transform(
     l1_size: int,
     backend: str = "auto",
     weight_low: torch.Tensor | None = None,
+    activation_quantization: QuantizationManager | None = None,
 ) -> torch.Tensor:
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
@@ -47,6 +49,12 @@ def double_feature_transform(
             raise RuntimeError(
                 "Fused double FT backend requested, but not all tensors/parameters are on CUDA."
             )
+        activation_quant = None
+        if activation_quantization is not None:
+            activation_quant = (
+                activation_quantization.config.hidden_quantized_one,
+                activation_quantization.l0_correction_factor,
+            )
         return FusedDoubleFtFunction.apply(
             us,
             them,
@@ -57,6 +65,7 @@ def double_feature_transform(
             max_ft_activation,
             l1_size,
             weight_low,
+            activation_quant,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":
@@ -82,6 +91,8 @@ def double_feature_transform(
         l0_s1 = [l0_s[0] * l0_s[1], l0_s[2] * l0_s[3]]
         l0_ = torch.cat(l0_s1, dim=1)
 
+        if activation_quantization is not None:
+            return activation_quantization.fake_quantize_ft_act_and_correct(l0_)
         return l0_
     else:
         raise ValueError(f"Invalid double FT implementation mode: {backend}")

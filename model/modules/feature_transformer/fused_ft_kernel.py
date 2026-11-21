@@ -1,6 +1,7 @@
 import cupy as cp
 import torch
 
+from ...fused_act_quant import ACT_QUANT_DEVICE
 from .sparse_linear_kernel import _kernel_with_threads
 
 # General forward target; the measured H100 master-net launch uses 256.
@@ -24,6 +25,7 @@ def make_fused_double_ft_forward_kernel(
     max_active_indices: int,
     l1_size: int,
     weight_dtype: torch.dtype = torch.float32,
+    fake_quantize_acts: bool = False,
 ):
     l1_half = l1_size // 2
     target = _FORWARD_THREADS
@@ -56,10 +58,12 @@ static __device__ __forceinline__ float load_weight(const weight_t* w, size_t i)
 }
 """
 
-    key = (max_active_indices, l1_size, num_threads, weight_dtype)
+    key = (max_active_indices, l1_size, num_threads, weight_dtype, fake_quantize_acts)
     if key not in _fused_double_ft_forward_kernel_cache:
         kernel = cp.RawKernel(
-            weight_prologue
+            f"#define FAKE_QUANT_ACTS {int(fake_quantize_acts)}\n"
+            + ACT_QUANT_DEVICE
+            + weight_prologue
             + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
@@ -77,6 +81,9 @@ void fused_double_ft_forward(
           float* __restrict__ l0_out,
           float* __restrict__ clamped_out,
     const int32_t        output_size
+#if FAKE_QUANT_ACTS
+    , float act_scale, float act_eps, float act_inv, float act_corr
+#endif
 ) {
     const uint32_t block_idx = blockIdx.x;
     const uint32_t tid = threadIdx.x;
@@ -164,8 +171,14 @@ void fused_double_ft_forward(
         if (l0_b0 < 0.0f) l0_b0 = 0.0f; else if (l0_b0 > max_ft_act) l0_b0 = max_ft_act;
         if (l0_b1 < 0.0f) l0_b1 = 0.0f; else if (l0_b1 > max_ft_act) l0_b1 = max_ft_act;
 
-        l0_out[block_idx * l1_size + i] = l0_w0 * l0_w1;
-        l0_out[block_idx * l1_size + l1_half + i] = l0_b0 * l0_b1;
+        float l0_w = __fmul_rn(l0_w0, l0_w1);
+        float l0_b = __fmul_rn(l0_b0, l0_b1);
+#if FAKE_QUANT_ACTS
+        l0_w = quantize_activation(l0_w, act_scale, act_eps, act_inv, act_corr);
+        l0_b = quantize_activation(l0_b, act_scale, act_eps, act_inv, act_corr);
+#endif
+        l0_out[block_idx * l1_size + i] = l0_w;
+        l0_out[block_idx * l1_size + l1_half + i] = l0_b;
 
         const uint32_t clamp_base = block_idx * 4 * l1_half;
         clamped_out[clamp_base + 0 * l1_half + i] = l0_w0;

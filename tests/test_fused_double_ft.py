@@ -94,3 +94,36 @@ def test_fused_double_ft(l1, batch_size, max_active):
 
     torch.testing.assert_close(grad_weight_fused, weight.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(grad_bias_fused, bias.grad, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_CUPY_KERNELS,
+    reason="CUDA and CuPy required for custom kernel",
+)
+def test_fused_activation_quantization_matches_separate_pass():
+    from model.quantize import QuantizationConfig, QuantizationManager
+
+    rng = torch.Generator(device="cuda").manual_seed(1)
+    quantization = QuantizationManager(QuantizationConfig(hidden_quantized_one=127.0))
+    l1 = 64
+    weight = torch.rand(100, l1, generator=rng, device="cuda") * 0.04 - 0.02
+    weight.requires_grad_()
+    bias = torch.zeros(l1, device="cuda", requires_grad=True)
+    white, black = torch.randint(
+        100, (2, 8, 44), generator=rng, device="cuda", dtype=torch.int32
+    )
+    us = (torch.arange(8, device="cuda") % 2).float().view(-1, 1)
+    args = us, 1 - us, white, black, weight, bias, quantization.max_ft_activation, l1
+    reference = quantization.fake_quantize_ft_act_and_correct(
+        double_feature_transform(*args, backend="fused")
+    )
+    fused = double_feature_transform(
+        *args, backend="fused", activation_quantization=quantization
+    )
+    assert torch.equal(fused, reference)
+    upstream = torch.rand(fused.shape, generator=rng, device="cuda")
+    for actual, expected in zip(
+        torch.autograd.grad(fused, (weight, bias), upstream),
+        torch.autograd.grad(reference, (weight, bias), upstream),
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
