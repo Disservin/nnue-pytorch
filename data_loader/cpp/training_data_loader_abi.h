@@ -19,13 +19,19 @@ NNUE_API SparseBatch* NNUE_CDECL get_sparse_batch_from_fens(const char*        f
                                                             const char* const* fens,
                                                             int*               scores,
                                                             int*               plies,
-                                                            int*               results);
+                                                            int*               results,
+                                                            bool               prepack);
 
 NNUE_API void NNUE_CDECL destroy_sparse_batch(SparseBatch* e);
 // capacity is in int32 elements. Returns false without writing if too small.
 NNUE_API bool NNUE_CDECL pack_sparse_batch(const SparseBatch* batch,
                                          int*               output,
                                          std::size_t        capacity);
+// The packed layout of pack_sparse_batch, already built by the loader worker when the stream
+// was created with prepack_indices; nullptr (and *size = 0) otherwise. Valid until the batch
+// is destroyed.
+NNUE_API const int* NNUE_CDECL sparse_batch_prepacked_indices(const SparseBatch* batch,
+                                                              std::size_t*       size);
 NNUE_API void NNUE_CDECL destroy_fen_batch(FenBatch* e);
 
 // Raw layer-stack counts (--ls-keys index) over the binpacks, all positions, no filtering. Decodes
@@ -64,7 +70,8 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
                                                                   DataloaderSkipConfig config,
                                                                   DataloaderDDPConfig  ddp_config,
                                                                   DataloaderHllConfig  hll_config,
-                                                                  DataloaderIOConfig   io_config);
+                                                                  DataloaderIOConfig   io_config,
+                                                                  bool prepack_indices);
 
 NNUE_API void NNUE_CDECL         destroy_sparse_batch_stream(SparseBatchStream* stream);
 NNUE_API SparseBatch* NNUE_CDECL fetch_next_sparse_batch(SparseBatchStream* stream);

@@ -15,6 +15,13 @@ from .config import (
 )
 
 
+def _prepacked_indices(batch) -> tuple[int | None, int]:
+    """(address, elements) of the packed indices the loader worker built, or (None, 0)."""
+    size = ctypes.c_size_t(0)
+    address = c_lib.sparse_batch_prepacked_indices(batch, ctypes.byref(size))
+    return address, size.value
+
+
 class SparseBatch(ctypes.Structure):
     _fields_ = [
         ("num_inputs", ctypes.c_int),
@@ -62,6 +69,7 @@ class SparseBatch(ctypes.Structure):
             native_owned=isinstance(self._b_base_, NativeSparseBatchPointer),
             pack=c_lib.pack_sparse_batch,
             policy=transport_policy or CompactTransportPolicy(),
+            prepacked=_prepacked_indices,
         )
 
         us = float_block_gpu[0:size].view(size, 1)
@@ -167,6 +175,13 @@ class CDataLoaderAPI:
             ctypes.c_void_p,
             ctypes.c_size_t,
         ]
+        # EXPORT const int* CDECL sparse_batch_prepacked_indices(const SparseBatch*, size_t* size)
+        self.sparse_batch_prepacked_indices = self.dll.sparse_batch_prepacked_indices
+        self.sparse_batch_prepacked_indices.restype = ctypes.c_void_p
+        self.sparse_batch_prepacked_indices.argtypes = [
+            ctypes.POINTER(SparseBatch),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
         # EXPORT FenBatchStream* CDECL create_fen_batch_stream(
         #     int concurrency,
         #     int num_files,
@@ -209,7 +224,8 @@ class CDataLoaderAPI:
         #     DataloaderSkipConfig config,
         #     DataloaderDDPConfig ddp_config,
         #     DataloaderHllConfig hll_config,
-        #     DataloaderIOConfig io_config
+        #     DataloaderIOConfig io_config,
+        #     bool prepack_indices
         # )
         self.dll.create_sparse_batch_stream.restype = ctypes.c_void_p
         self.dll.create_sparse_batch_stream.argtypes = [
@@ -224,6 +240,7 @@ class CDataLoaderAPI:
             CDataloaderDDPConfig,
             CDataloaderHllConfig,
             CDataloaderIOConfig,
+            ctypes.c_bool,  # prepack_indices
         ]
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
@@ -240,7 +257,8 @@ class CDataLoaderAPI:
         #    const char* const* fens,
         #    int* scores,
         #    int* plies,
-        #    int* results
+        #    int* results,
+        #    bool prepack
         # )
         self.dll.get_sparse_batch_from_fens.restype = NativeSparseBatchPointer
         self.dll.get_sparse_batch_from_fens.argtypes = [
@@ -251,6 +269,7 @@ class CDataLoaderAPI:
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
+            ctypes.c_bool,
         ]
 
         # EXPORT bool CDECL count_layer_stacks(
