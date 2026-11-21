@@ -4,6 +4,11 @@ from .fused_ft_functions import _HAS_CUPY_KERNELS, FusedDoubleFtFunction
 from .sparse_linear_functions import SparseLinearFunction
 
 
+def fused_backend_available() -> bool:
+    """Whether CUDA calls use the fused CuPy kernels (double_feature_transform's "fused")."""
+    return _HAS_CUPY_KERNELS
+
+
 def double_feature_transform(
     us: torch.Tensor,
     them: torch.Tensor,
@@ -14,6 +19,7 @@ def double_feature_transform(
     max_ft_activation: float,
     l1_size: int,
     backend: str = "auto",
+    weight_low: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
@@ -50,6 +56,7 @@ def double_feature_transform(
             bias,
             max_ft_activation,
             l1_size,
+            weight_low,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":
