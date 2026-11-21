@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 
 import torch
@@ -7,9 +8,12 @@ from ...quantize import QuantizationManager
 from ..features.input_feature import InputFeature
 from . import fused_weight_quant as _fwq
 from . import tiled_ft_backward
-from .double_ft_functions import double_feature_transform
+from .double_ft_functions import double_feature_transform, fused_backend_available
 from .tiled_ft_prep import register_prep
 
+# Gather the fake-quantized feature weights from a bf16 copy (exact, half the
+# bandwidth). NNUE_FT_BF16=0 gathers the fp32 weights instead.
+_GATHER_BF16 = os.environ.get("NNUE_FT_BF16", "1") != "0"
 
 class ComposedFeatureTransformer(nn.Module):
     """Thin coordinator that wraps one or more InputFeature modules.
@@ -156,6 +160,18 @@ class ComposedFeatureTransformer(nn.Module):
         merged, bias = self.merged_weight_and_bias(fake_quantize_weights)
         ft_max_act = self.quantization.max_ft_activation
 
+        # Fake quantization rounds every weight to a multiple of 1/256
+        # (ft_quantized_one), which bfloat16 represents exactly, so the gather can
+        # read a half-size copy of the same values. The autograd path stays on the
+        # fp32 weight, which receives the gradient.
+        weight_low = None
+        if (
+            _GATHER_BF16
+            and fake_quantize_weights
+            and merged.is_cuda
+            and fused_backend_available()
+        ):
+            weight_low = merged.detach().to(torch.bfloat16)
         l0_ = double_feature_transform(
             us,
             them,
@@ -166,6 +182,7 @@ class ComposedFeatureTransformer(nn.Module):
             ft_max_act,
             self.l1_size,
             backend,
+            weight_low,
         )
 
         # We multiply by a correction factor,

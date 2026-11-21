@@ -20,7 +20,11 @@ _fused_double_ft_forward_kernel_cache = {}
 
 
 @torch.compiler.disable(recursive=False)
-def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
+def make_fused_double_ft_forward_kernel(
+    max_active_indices: int,
+    l1_size: int,
+    weight_dtype: torch.dtype = torch.float32,
+):
     l1_half = l1_size // 2
     target = _FORWARD_THREADS
     if torch.version.hip is None:
@@ -34,10 +38,29 @@ def make_fused_double_ft_forward_kernel(max_active_indices: int, l1_size: int):
     num_threads = _num_threads(l1_half, target)
     output_thread_slice_size = l1_half // num_threads
 
-    key = (max_active_indices, l1_size, num_threads)
+    # The fake-quantized feature weights are multiples of 1/256 (ft_quantized_one),
+    # which bfloat16 stores exactly, so a bf16 copy gathers the same values at half
+    # the bandwidth. Unquantized weights need the fp32 variant.
+    if weight_dtype == torch.bfloat16:
+        weight_prologue = r"""
+typedef unsigned short weight_t;
+static __device__ __forceinline__ float load_weight(const weight_t* w, size_t i) {
+    return __uint_as_float((unsigned int)__ldg(w + i) << 16);
+}
+"""
+    else:
+        weight_prologue = r"""
+typedef float weight_t;
+static __device__ __forceinline__ float load_weight(const weight_t* w, size_t i) {
+    return __ldg(w + i);
+}
+"""
+
+    key = (max_active_indices, l1_size, num_threads, weight_dtype)
     if key not in _fused_double_ft_forward_kernel_cache:
         kernel = cp.RawKernel(
-            r"""
+            weight_prologue
+            + r"""
 typedef unsigned int uint32_t;
 typedef int int32_t;
 typedef long long int64_t;
@@ -48,7 +71,7 @@ void fused_double_ft_forward(
     const float* __restrict__ them,
     const int32_t* __restrict__ white_indices,
     const int32_t* __restrict__ black_indices,
-    const float* __restrict__ weight,
+    const weight_t* __restrict__ weight,
     const float* __restrict__ bias,
     const float          max_ft_act,
           float* __restrict__ l0_out,
@@ -115,12 +138,12 @@ void fused_double_ft_forward(
             + r"""; ++s) {
             uint32_t i = s * n_threads + tid;
             if (wi >= 0) {
-                w0[s] += __ldg(&weight[(size_t)(unsigned)wi * l1_size + i]);
-                w1[s] += __ldg(&weight[(size_t)(unsigned)wi * l1_size + i + l1_half]);
+                w0[s] += load_weight(weight, (size_t)(unsigned)wi * l1_size + i);
+                w1[s] += load_weight(weight, (size_t)(unsigned)wi * l1_size + i + l1_half);
             }
             if (bi >= 0) {
-                b0[s] += __ldg(&weight[(size_t)(unsigned)bi * l1_size + i]);
-                b1[s] += __ldg(&weight[(size_t)(unsigned)bi * l1_size + i + l1_half]);
+                b0[s] += load_weight(weight, (size_t)(unsigned)bi * l1_size + i);
+                b1[s] += load_weight(weight, (size_t)(unsigned)bi * l1_size + i + l1_half);
             }
         }
     }
