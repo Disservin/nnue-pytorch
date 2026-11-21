@@ -90,8 +90,8 @@ class ShardedAdamWStep:
         if self.compile_model:
             # Compile only the tested, local pieces. The distributed forward
             # itself includes collectives and remains eager.
-            nnue.model.input.merged_weight_and_bias = torch.compile(
-                nnue.model.input.merged_weight_and_bias, fullgraph=True
+            nnue.model.input._merge_weight_and_bias_torch = torch.compile(
+                nnue.model.input._merge_weight_and_bias_torch, fullgraph=True
             )
             nnue.model.layer_stacks.forward_from_l1 = torch.compile(
                 nnue.model.layer_stacks.forward_from_l1

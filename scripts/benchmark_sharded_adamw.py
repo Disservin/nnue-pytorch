@@ -315,6 +315,7 @@ def main():
     if os.environ.get("NNUE_BENCH_COMPILE_WEIGHT_CLIP") == "1":
         nnue.model._compile_layer_clipping = True
     live_loader = None
+    ddp_prefetch = nnue.prefetch_hook() if args.mode == "ddp" else None
     native_requested = os.environ.get("NNUE_BENCH_NATIVE_PACKED") == "1"
     if args.direct_packed_ft and not native_requested:
         raise ValueError("--direct-packed-ft requires NNUE_BENCH_NATIVE_PACKED=1")
@@ -329,8 +330,11 @@ def main():
             use_pinned_memory=True,
             packed_sharded=native_requested and not args.matched_batch_cache,
         )
-        live_loader = DevicePrefetcher(dataset, num_batches=args.warmup + args.steps + 2,
-                                             queue_size_limit=2, device=torch.device("cuda", rank))
+        live_loader = DevicePrefetcher(
+            dataset, num_batches=args.warmup + args.steps + 2, queue_size_limit=2,
+            device=torch.device("cuda", rank),
+            prefetch_hook=ddp_prefetch if not args.repeat_live_batch else None,
+        )
         cache_file = None
         replay_batches = ()
         if args.repeat_batch_cache:
@@ -430,6 +434,10 @@ def main():
             nonlocal ddp_step
             bucket_info.clear()
             optimizer.zero_grad(set_to_none=True)
+            if ddp_prefetch is not None and live_loader is None:
+                # Replay excludes loader work, but still pays tiled FT preparation.
+                with phase("step:ddp_tiled_prep"):
+                    ddp_prefetch(batch)
             us, them, white, black, _, _, stacks = batch
             with phase("step:ddp_forward"):
                 output = ddp(us, them, white, black, stacks, True, True)
@@ -456,8 +464,8 @@ def main():
     else:
         if profile_compile and os.environ.get("NNUE_PROFILE_WRAPPER") != "1":
             if os.environ.get("NNUE_PROFILE_COMPILE_FT_MERGE") == "1":
-                nnue.model.input.merged_weight_and_bias = torch.compile(
-                    nnue.model.input.merged_weight_and_bias, fullgraph=True
+                nnue.model.input._merge_weight_and_bias_torch = torch.compile(
+                    nnue.model.input._merge_weight_and_bias_torch, fullgraph=True
                 )
             if os.environ.get("NNUE_PROFILE_COMPILE_TAIL") == "1":
                 nnue.model.layer_stacks.forward_from_l1 = torch.compile(
@@ -563,6 +571,10 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         if args.nsys_capture:
             torch.cuda.cudart().cudaProfilerStart()
+        loader_stats_start = (
+            live_loader.get_loader_stats()
+            if args.measure_loader_wait and live_loader is not None else None
+        )
         started = time.perf_counter()
         host_loader_wait = []
         input_device_events = []
@@ -587,6 +599,7 @@ def main():
             last_loss = train_step()
         torch.cuda.synchronize()
         finished = time.perf_counter()
+        loader_stats_end = live_loader.get_loader_stats() if loader_stats_start is not None else None
         if args.nsys_capture:
             torch.cuda.cudart().cudaProfilerStop()
         elapsed = torch.tensor(finished - started, device=rank)
@@ -606,6 +619,11 @@ def main():
                           "median_ms": statistics.median(ordered) * 1000,
                           "p95_ms": ordered[int(0.95 * (len(ordered) - 1))] * 1000,
                           "max_ms": ordered[-1] * 1000}
+            if loader_stats_end is not None:
+                local_wait["pipeline_delta"] = {
+                    key: loader_stats_end[key] - loader_stats_start[key]
+                    for key in loader_stats_end
+                }
             wait_by_rank = [None] * world
             dist.all_gather_object(wait_by_rank, local_wait)
         device_wait_by_rank = None
@@ -641,6 +659,9 @@ def main():
                               "stored_layer_stacks": nnue.model.layer_stacks.count,
                               "async_features": args.async_features,
                               "sharded_experiments": runner.last_experiments if args.mode == "sharded" else None,
+                              "ddp_tiled_prep": (
+                                  "prefetch" if live_loader is not None else "inline"
+                              ) if ddp_prefetch is not None else None,
                               "bucketed_l1_bias": (args.bucketed_l1_bias
                                                    or os.environ.get("NNUE_PROFILE_BUCKETED_BIAS") == "1"),
                               "bucketed_l1_fastpath_eligible": bucketed_bias_eligible,
