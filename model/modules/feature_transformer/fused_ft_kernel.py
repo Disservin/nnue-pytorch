@@ -33,9 +33,13 @@ def make_fused_double_ft_forward_kernel(
         capability = torch.cuda.get_device_capability()
         if capability == (9, 0) and l1_size % 128 == 0:
             target = 256
-        elif capability == (8, 9) and l1_size == 1024 and max_active_indices == 288:
-            # One column pair per thread improves the measured Ada net's
-            # gather throughput without changing feature accumulation order.
+        elif (
+            capability == (8, 9)
+            and l1_size == 1024
+            and max_active_indices in (260, 288)
+        ):
+            # One column pair per thread improves gather throughput on Ada
+            # for these layouts while preserving the feature summation order.
             target = 512
     num_threads = _num_threads(l1_half, target)
     output_thread_slice_size = l1_half // num_threads
