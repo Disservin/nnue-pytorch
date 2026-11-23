@@ -90,7 +90,9 @@ produces weaker networks.
 For trainer development, run local code and checks with `run_docker.sh`. See
 [Developing and testing with Docker](docs/development.md) for CPU and GPU
 workflows, the training pipeline test, Stockfish evaluation cross-checks, and
-logging. Direct `train.py` usage is documented in the
+logging. [Data loader performance](docs/data_loader_performance.md) explains
+the per-epoch loader report and which options to change when the loader limits
+training. Direct `train.py` usage is documented in the
 [wiki](https://github.com/official-stockfish/nnue-pytorch/wiki/Basic-training-procedure-(train.py)).
 
 ## Thanks
