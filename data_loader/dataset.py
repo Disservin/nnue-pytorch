@@ -120,6 +120,10 @@ class FenBatchProvider:
 
 
 class TrainingDataProvider:
+    # next() may be called from several prefetch threads at once: the C++
+    # stream's fetch is thread-safe and every batch is converted on its own.
+    concurrent_next = True
+
     def __init__(
         self,
         feature_set: str,
@@ -160,6 +164,7 @@ class TrainingDataProvider:
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.native_fetch_s = 0.0
+        self._native_fetch_lock = threading.Lock()
 
         if batch_size:
             self.stream = self.create_stream(
@@ -197,7 +202,9 @@ class TrainingDataProvider:
         v = self.fetch_next(self.stream)
         # Time spent waiting for the C++ decoder workers, as opposed to moving
         # the batch to the device afterwards.
-        self.native_fetch_s += time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
+        with self._native_fetch_lock:
+            self.native_fetch_s += elapsed
 
         if v:
             tensors = v.contents.get_tensors(
@@ -348,18 +355,19 @@ def _safe_put(stop_event, q, item):
 class LoaderStats:
     """Cumulative timing counters of a FixedNumBatchesDataset pipeline.
 
-    Each side writes only its own fields (the prefetch thread the producer
-    fields, the training thread the consumer fields), so no lock is needed;
-    readers take a ``snapshot()`` and diff two of them over an interval.
+    The training thread writes the consumer fields without a lock (it is the
+    only writer); the prefetch threads add to the producer fields under
+    ``producer_lock``. Readers take a ``snapshot()`` and diff two of them over
+    an interval. Producer times are summed over all prefetch threads.
 
     - ``consumer_wait_s``: time the training step spent blocked waiting for a
       batch. Time here is time the step could not run, i.e. the loader is
       what limits training speed.
-    - ``producer_put_wait_s``: time the prefetch thread spent blocked on a
+    - ``producer_put_wait_s``: time the prefetch threads spent blocked on a
       full queue: the loader had a batch ready but training was not yet
       asking for it (spare loader capacity).
-    - ``producer_fetch_s``: time the prefetch thread spent getting the next
-      batch from the C++ loader (waiting for decoder workers included).
+    - ``producer_fetch_s``: time the prefetch threads spent getting the next
+      batch onto the device (waiting for decoder workers included).
     - ``startup_wait_s``: the consumer wait for the very first batch, kept out
       of ``consumer_wait_s`` because it is pipeline startup, not throughput.
     """
@@ -371,6 +379,7 @@ class LoaderStats:
         "consumer_wait_s",
         "producer_batches",
         "producer_fetch_s",
+        "producer_lock",
         "producer_put_wait_s",
         "startup_wait_s",
     )
@@ -378,9 +387,56 @@ class LoaderStats:
     def __init__(self):
         for name in self.__slots__:
             setattr(self, name, 0)
+        self.producer_lock = threading.Lock()
+
+    def add_producer(self, **deltas) -> None:
+        with self.producer_lock:
+            for name, value in deltas.items():
+                setattr(self, name, getattr(self, name) + value)
 
     def snapshot(self) -> dict:
-        return {name: getattr(self, name) for name in self.__slots__}
+        with self.producer_lock:
+            return {
+                name: getattr(self, name)
+                for name in self.__slots__
+                if name != "producer_lock"
+            }
+
+
+class _SerializedNext:
+    """Calls next() on an iterator under a lock, for iterators (generators,
+    plain Python iterators) that must not be advanced from two threads at
+    once. Attribute reads go to the wrapped iterator."""
+
+    def __init__(self, iterator):
+        self._iterator = iterator
+        self._lock = threading.Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._iterator)
+
+    def __getattr__(self, name):
+        return getattr(self._iterator, name)
+
+
+class _ProducerCountdown:
+    """Counts the prefetch threads still running. Kept apart from the dataset
+    so that the threads hold no reference to it (it must stay collectable,
+    which is what stops them)."""
+
+    def __init__(self, n: int):
+        self._left = n
+        self._lock = threading.Lock()
+
+    def finished(self) -> bool:
+        """Called once per thread at the end of the data; whether it was the last one."""
+        with self._lock:
+            self._left -= 1
+            return self._left == 0
 
 
 class FixedNumBatchesDataset(Dataset):
@@ -392,15 +448,25 @@ class FixedNumBatchesDataset(Dataset):
         queue_size_limit=None,
         device=None,
         prefetch_hook=None,
+        num_threads=1,
     ):
         """``prefetch_hook(batch)``, when given, runs on the prefetch thread for every batch copied
         to a CUDA ``device``, on the prefetch stream, before the batch is handed out: index-only work
         the model can do ahead of the step (see NNUE.prefetch_hook). It must not modify the batch;
-        if it raises, a warning reports the error and the hook is no longer called."""
+        if it raises, a warning reports the error and the hook is no longer called.
+
+        ``num_threads`` prefetch threads, each with its own CUDA stream, prepare batches
+        concurrently: the per-batch host work (packing indices into pinned memory, the hook's host
+        sync) runs in parallel instead of in series. Each thread holds at most one batch beyond the
+        queue, so device memory grows by about one queue slot per thread. Batches reach the queue
+        in the order they finish, which with a shuffling loader changes nothing that matters."""
         super().__init__()
+        if num_threads < 1:
+            raise ValueError(f"num_threads must be >= 1, got {num_threads}")
         self.dataset = dataset
         self.iter = None  # Deferred to _start_prefetching
         self.num_batches = num_batches
+        self.num_threads = num_threads
         self.device = torch.device(device) if device is not None else None
         self.prefetch_hook = prefetch_hook
         self.prefetch_to_device = self.device is not None and self.device.type == "cuda"
@@ -410,7 +476,7 @@ class FixedNumBatchesDataset(Dataset):
             queue_size_limit = 10 if self.pin_memory else 100
 
         self._prefetch_queue = queue.Queue(maxsize=queue_size_limit)
-        self._prefetch_thread = None
+        self._prefetch_threads = []
         self._prefetch_device = None
         self._stop_prefetching = threading.Event()
         self._prefetch_started = False
@@ -433,14 +499,26 @@ class FixedNumBatchesDataset(Dataset):
         prefetch_device,
         prefetch_hook,
         stats=None,
+        on_finished=None,
     ):
+        """One prefetch thread. ``on_finished()`` is called once when the iterator is exhausted
+        and returns whether this was the last running thread, i.e. whether the end of the data
+        may be signalled to the consumer (other threads may still be delivering batches)."""
         if stats is None:
             stats = LoaderStats()
+        if on_finished is None:
+
+            def on_finished():
+                return True
 
         def put(item):
             t0 = time.perf_counter()
             _safe_put(stop_event, prefetch_queue, item)
-            stats.producer_put_wait_s += time.perf_counter() - t0
+            return time.perf_counter() - t0
+
+        def finish():
+            if on_finished():
+                _safe_put(stop_event, prefetch_queue, None)
 
         try:
             prefetch_stream = None
@@ -461,9 +539,10 @@ class FixedNumBatchesDataset(Dataset):
                         with torch.cuda.stream(prefetch_stream):
                             t0 = time.perf_counter()
                             item = next(iterator)
-                            stats.producer_fetch_s += time.perf_counter() - t0
+                            fetch_s = time.perf_counter() - t0
                             if item is None:
-                                _safe_put(stop_event, prefetch_queue, None)
+                                stats.add_producer(producer_fetch_s=fetch_s)
+                                finish()
                                 break
                             item = _recursive_to_device(
                                 item, prefetch_device, non_blocking=True
@@ -485,14 +564,19 @@ class FixedNumBatchesDataset(Dataset):
                     else:
                         t0 = time.perf_counter()
                         item = next(iterator)
-                        stats.producer_fetch_s += time.perf_counter() - t0
+                        fetch_s = time.perf_counter() - t0
                         if item is None:
-                            _safe_put(stop_event, prefetch_queue, None)
+                            stats.add_producer(producer_fetch_s=fetch_s)
+                            finish()
                             break
-                    put(item)
-                    stats.producer_batches += 1
+                    put_wait_s = put(item)
+                    stats.add_producer(
+                        producer_fetch_s=fetch_s,
+                        producer_put_wait_s=put_wait_s,
+                        producer_batches=1,
+                    )
                 except StopIteration:
-                    _safe_put(stop_event, prefetch_queue, None)
+                    finish()
                     break
         except Exception as e:  # noqa: BLE001
             _safe_put(stop_event, prefetch_queue, e)
@@ -511,19 +595,28 @@ class FixedNumBatchesDataset(Dataset):
                 ):
                     self.dataset.device = self._prefetch_device
                 self.iter = iter(self.dataset)
-                self._prefetch_thread = threading.Thread(
-                    target=FixedNumBatchesDataset._prefetch_worker,
-                    args=(
-                        self._stop_prefetching,
-                        self.iter,
-                        self._prefetch_queue,
-                        self._prefetch_device,
-                        self.prefetch_hook,
-                        self._stats,
-                    ),
-                    daemon=True,
-                )
-                self._prefetch_thread.start()
+                iterator = self.iter
+                if self.num_threads > 1 and not getattr(
+                    iterator, "concurrent_next", False
+                ):
+                    iterator = _SerializedNext(iterator)
+                countdown = _ProducerCountdown(self.num_threads)
+                for _ in range(self.num_threads):
+                    thread = threading.Thread(
+                        target=FixedNumBatchesDataset._prefetch_worker,
+                        args=(
+                            self._stop_prefetching,
+                            iterator,
+                            self._prefetch_queue,
+                            self._prefetch_device,
+                            self.prefetch_hook,
+                            self._stats,
+                            countdown.finished,
+                        ),
+                        daemon=True,
+                    )
+                    thread.start()
+                    self._prefetch_threads.append(thread)
                 self._prefetch_started = True
 
     def __len__(self):
@@ -574,6 +667,8 @@ class FixedNumBatchesDataset(Dataset):
         # Part of producer_fetch_s spent inside the C++ loader (the rest is
         # host-to-device transport); only this part scales with workers.
         snap["native_fetch_s"] = getattr(self.iter, "native_fetch_s", 0.0)
+        # Producer times are summed over this many prefetch threads.
+        snap["producer_threads"] = self.num_threads
         return snap
 
     def get_unique_stats(self) -> tuple[int, int, int]:
@@ -613,5 +708,6 @@ class FixedNumBatchesDataset(Dataset):
     def __del__(self):
         if hasattr(self, "_stop_prefetching"):
             self._stop_prefetching.set()
-        if hasattr(self, "_prefetch_thread") and self._prefetch_thread:
-            self._prefetch_thread.join(timeout=1.0)
+        for thread in getattr(self, "_prefetch_threads", ()):
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
