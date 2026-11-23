@@ -104,7 +104,23 @@ measured for pinned copies on this PCIe gen 3 x16 link. The link is not a limit.
 | Per-batch preparation from the prefetch threads | ~7% |
 | Other (fills, loss, cat / clamp) | ~6% |
 
-Some kernel runs 84% of the time. The training stream is idle 15.7% of the time, ~3.9 ms per step
-in gaps of ~0.5 ms between small kernels: the step launches ~145 kernels from Python, and
-between some of them the GPU waits for the host to launch the next one. Fewer loader workers
-(less CPU contention) did not change the step speed.
+Under `nsys` the training stream looked idle 15.7% of the time, but the profiler slows the host
+down: without it a step takes 23.2 ms (43.2 it/s) against the 22.6 ms of kernels, so the GPU is
+~97% busy and the ceiling with the current kernels is ~44 it/s. Further speed has to come from the
+kernels themselves (FT forward and backward, AdamW).
+
+Host time per step, measured with timers around each phase (no syncs added):
+
+| Phase | Host ms/step |
+|---|---|
+| forward + loss | 9.5 |
+| backward | 5.9 |
+| `WeightClipper` (hidden-layer clipping), eager | 2.5 |
+| `WeightClipper`, compiled | 0.5 |
+| optimizer step | 1.6 |
+| loader `__getitem__` | 1.0 |
+
+The hidden-layer clipping after every step was ~40 tiny eager kernels. It is now compiled on CUDA
+(bitwise identical results, 0.56 to 0.06 ms per call uncontended): 42.7 to 43.2 it/s. Lowering
+the loader threads' priority (`nice` 19) gave a further ~2.5% in a test (42.7 to 43.9 it/s) by
+leaving the training thread more CPU, but is not part of the trainer.

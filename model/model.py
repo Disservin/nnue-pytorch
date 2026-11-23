@@ -48,42 +48,13 @@ class NNUEModel(nn.Module):
         if include_input:
             self.input.clip_weights(self.quantization)
 
-        for group in self.weight_clipping:
-            for p in group["params"]:
-                if "min_weight" in group or "max_weight" in group:
-                    p_data_fp32 = p.data
-                    min_weight = group["min_weight"]
-                    max_weight = group["max_weight"]
-                    if "virtual_params" in group:
-                        virtual_params = group["virtual_params"]
-                        xs = p_data_fp32.shape[0] // virtual_params.shape[0]
-                        ys = p_data_fp32.shape[1] // virtual_params.shape[1]
-                        expanded_virtual_layer = virtual_params.repeat(xs, ys)
-                        if min_weight is not None:
-                            min_weight = (
-                                p_data_fp32.new_full(p_data_fp32.shape, min_weight)
-                                - expanded_virtual_layer
-                            )
-                        if max_weight is not None:
-                            max_weight = (
-                                p_data_fp32.new_full(p_data_fp32.shape, max_weight)
-                                - expanded_virtual_layer
-                            )
-                    if "stacked_layer" in group:
-                        ge = group["stacked_layer"].group_expansion()
-                        if ge is not None:
-                            gw = ge[0].detach()
-                            if not torch.is_tensor(min_weight):
-                                min_weight = p_data_fp32.new_full(
-                                    p_data_fp32.shape, min_weight
-                                )
-                            if not torch.is_tensor(max_weight):
-                                max_weight = p_data_fp32.new_full(
-                                    p_data_fp32.shape, max_weight
-                                )
-                            min_weight = min_weight - gw
-                            max_weight = max_weight - gw
-                    p_data_fp32.clamp_(min_weight, max_weight)
+        # Runs after every step. In eager mode the bounds are ~40 tiny kernels,
+        # whose launches cost more host time than the GPU spends on them; the
+        # compiled version fuses them and computes the same values.
+        if self.layer_stacks.l1.linear.weight.is_cuda:
+            _clip_hidden_weights_compiled(self.weight_clipping)
+        else:
+            _clip_hidden_weights(self.weight_clipping)
 
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
@@ -133,3 +104,47 @@ class NNUEModel(nn.Module):
         )
 
         return x
+
+
+def _clip_hidden_weights(weight_clipping) -> None:
+    """Clamp the hidden layers' weights so that, together with their virtual
+    (factorized) parts, they stay within the quantization range."""
+    for group in weight_clipping:
+        for p in group["params"]:
+            if "min_weight" in group or "max_weight" in group:
+                p_data_fp32 = p.data
+                min_weight = group["min_weight"]
+                max_weight = group["max_weight"]
+                if "virtual_params" in group:
+                    virtual_params = group["virtual_params"]
+                    xs = p_data_fp32.shape[0] // virtual_params.shape[0]
+                    ys = p_data_fp32.shape[1] // virtual_params.shape[1]
+                    expanded_virtual_layer = virtual_params.repeat(xs, ys)
+                    if min_weight is not None:
+                        min_weight = (
+                            p_data_fp32.new_full(p_data_fp32.shape, min_weight)
+                            - expanded_virtual_layer
+                        )
+                    if max_weight is not None:
+                        max_weight = (
+                            p_data_fp32.new_full(p_data_fp32.shape, max_weight)
+                            - expanded_virtual_layer
+                        )
+                if "stacked_layer" in group:
+                    ge = group["stacked_layer"].group_expansion()
+                    if ge is not None:
+                        gw = ge[0].detach()
+                        if not torch.is_tensor(min_weight):
+                            min_weight = p_data_fp32.new_full(
+                                p_data_fp32.shape, min_weight
+                            )
+                        if not torch.is_tensor(max_weight):
+                            max_weight = p_data_fp32.new_full(
+                                p_data_fp32.shape, max_weight
+                            )
+                        min_weight = min_weight - gw
+                        max_weight = max_weight - gw
+                p_data_fp32.clamp_(min_weight, max_weight)
+
+
+_clip_hidden_weights_compiled = torch.compile(_clip_hidden_weights, dynamic=False)
