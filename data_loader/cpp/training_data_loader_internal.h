@@ -85,7 +85,8 @@ struct SparseBatch final {
                 const LayerStackKeys&                                 ls_keys,
                 const std::vector<struct binpack::TrainingDataEntry>& entries,
                 std::shared_ptr<SparseBatchBufferPool>                buffer_pool = nullptr,
-                bool                                                  prepack     = false);
+                bool                                                  prepack     = false,
+                SparseBatchPinnedAllocator pinned = {});
     ~SparseBatch();
 
     // Packed int32 layout: white offsets [size + 1], black offsets [size + 1],
@@ -120,6 +121,8 @@ struct SparseBatch final {
     int*                                   m_int_block   = nullptr;
     std::shared_ptr<SparseBatchBufferPool> m_buffer_pool;
     SparseBatchBufferPool::Packed          m_packed;
+    void (*m_release_pinned)(void*) = nullptr;
+    int*                                   m_pinned_packed = nullptr;
     std::vector<int>                       m_feature_counts;
     void fill_targets(int i, const struct binpack::TrainingDataEntry& e);
     void fill_entry(const IFeatureExtractor& fs, int i, const struct binpack::TrainingDataEntry& e);
@@ -208,7 +211,8 @@ struct FeaturedBatchStream final: Stream<SparseBatch> {
                         int                          world_size                            = 1,
                         nnue::UniquePositionCounter* counter         = nullptr,
                         DataloaderIOConfig           io_config       = {},
-                        bool                         prepack_indices = false);
+                        bool                         prepack_indices = false,
+                        SparseBatchPinnedAllocator pinned = {});
     ~FeaturedBatchStream() final;
 
     SparseBatch* next() override;

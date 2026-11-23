@@ -1,7 +1,7 @@
 import ctypes
 import os  # noqa: F401
 
-from ._native import FenBatchPtr, SparseBatchPtr, c_lib
+from ._native import FenBatchPtr, PinnedBatchAllocator, SparseBatchPtr, c_lib
 from .config import (
     DEFAULT_LS_KEYS,
     CDataloaderDDPConfig,
@@ -95,6 +95,7 @@ def create_sparse_batch_stream(
     io_config: DataloaderIOConfig | None = None,
     ls_keys: str = DEFAULT_LS_KEYS,
     prepack_indices: bool = False,
+    pinned_allocator: PinnedBatchAllocator | None = None,
 ) -> ctypes.c_void_p:
     if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
@@ -104,7 +105,7 @@ def create_sparse_batch_stream(
     if io_config is None:
         io_config = DataloaderIOConfig()
 
-    handle = c_lib.dll.create_sparse_batch_stream(
+    args = (
         feature_set,
         ls_keys.encode("utf-8"),
         concurrency,
@@ -118,6 +119,10 @@ def create_sparse_batch_stream(
         CDataloaderIOConfig(io_config),
         prepack_indices,
     )
+    if pinned_allocator is not None and c_lib.create_pinned_stream is not None:
+        handle = c_lib.create_pinned_stream(*args, pinned_allocator)
+    else:
+        handle = c_lib.dll.create_sparse_batch_stream(*args)
     if not handle:
         raise RuntimeError("data loader stream creation failed — stale .so?")
     return handle

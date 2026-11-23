@@ -71,6 +71,25 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
                                                                   DataloaderHllConfig  hll_config,
                                                                   DataloaderIOConfig   io_config,
                                                                   bool prepack_indices) {
+    return create_sparse_batch_stream_pinned(
+      feature_set_c, ls_keys_c, concurrency, num_files, filenames, batch_size, cyclic,
+      config, ddp_config, hll_config, io_config, prepack_indices, {});
+}
+
+NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream_pinned(
+  const char*                feature_set_c,
+  const char*                ls_keys_c,
+  int                        concurrency,
+  int                        num_files,
+  const char* const*         filenames,
+  int                        batch_size,
+  bool                       cyclic,
+  DataloaderSkipConfig       config,
+  DataloaderDDPConfig        ddp_config,
+  DataloaderHllConfig        hll_config,
+  DataloaderIOConfig         io_config,
+  bool                       prepack_indices,
+  SparseBatchPinnedAllocator pinned) {
     auto skipPredicate = make_skip_predicate(config);
     auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
 
@@ -86,7 +105,7 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
     auto stream = new FeaturedBatchStream(
       std::move(feature), std::move(*ls_keys), concurrency, filenames_vec, batch_size, cyclic,
       skipPredicate, ddp_config.rank, ddp_config.world_size, counter.release(), io_config,
-      prepack_indices);
+      prepack_indices, pinned);
     return reinterpret_cast<SparseBatchStream*>(stream);
 }
 

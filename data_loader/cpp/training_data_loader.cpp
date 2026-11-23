@@ -601,7 +601,8 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
                          const LayerStackKeys&                  ls_keys,
                          const std::vector<TrainingDataEntry>&  entries,
                          std::shared_ptr<SparseBatchBufferPool> buffer_pool,
-                         bool                                   prepack) :
+                         bool                                   prepack,
+                         SparseBatchPinnedAllocator             pinned) :
 #ifdef NNUE_LOADER_STATISTICS
     entries_copy(entries),
 #endif
@@ -640,6 +641,20 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               feature_set,
 
     if (prepack)
     {
+        if (pinned.acquire && pinned.release)
+        {
+            const auto capacity = std::size_t(size) * 3 + 2
+                                + std::size_t(size) * 2 * max_active_features;
+            void* packed = nullptr;
+            if (auto* targets = static_cast<float*>(pinned.acquire(total_floats, capacity, &packed)))
+            {
+                is_white = targets;
+                outcome = targets + size;
+                score = targets + 2 * size;
+                m_pinned_packed = static_cast<int*>(packed);
+                m_release_pinned = pinned.release;
+            }
+        }
         fill_packed(feature_set, ls_keys, entries);
         return;
     }
@@ -665,12 +680,15 @@ void SparseBatch::fill_packed(const IFeatureExtractor&              fs,
     // The buffer is sized for the worst case, every row at max_active_features.
     const std::size_t dense_ids = std::size_t(size) * max_active_features;
     const std::size_t capacity  = std::size_t(size) * 3 + 2 + 2 * dense_ids;
-    if (m_buffer_pool)
-        m_packed = m_buffer_pool->acquire_packed(capacity);
-    else
-        m_packed = {std::unique_ptr<int[]>(new int[capacity]), capacity};
+    if (!m_pinned_packed)
+    {
+        if (m_buffer_pool)
+            m_packed = m_buffer_pool->acquire_packed(capacity);
+        else
+            m_packed = {std::unique_ptr<int[]>(new int[capacity]), capacity};
+    }
 
-    int* white_offsets = m_packed.data.get();
+    int* white_offsets = m_pinned_packed ? m_pinned_packed : m_packed.data.get();
     int* black_offsets = white_offsets + size + 1;
     int* white_ids     = black_offsets + size + 1;
     // Black IDs are appended compactly to the (otherwise unused) dense black
@@ -705,6 +723,8 @@ void SparseBatch::fill_packed(const IFeatureExtractor&              fs,
 }
 
 SparseBatch::~SparseBatch() {
+    if (m_release_pinned)
+        m_release_pinned(is_white);
     if (m_buffer_pool)
     {
         m_buffer_pool->release_packed(std::move(m_packed));
@@ -748,9 +768,10 @@ std::size_t SparseBatch::packed_size() const {
 bool SparseBatch::pack_indices(int* output, std::size_t capacity) const {
     if (!output || capacity < packed_size())
         return false;
-    if (m_packed.data)
+    const int* packed = m_pinned_packed ? m_pinned_packed : m_packed.data.get();
+    if (packed)
     {
-        std::memcpy(output, m_packed.data.get(), packed_size() * sizeof(int));
+        std::memcpy(output, packed, packed_size() * sizeof(int));
         return true;
     }
     int* white_offsets = output;
@@ -801,7 +822,8 @@ FeaturedBatchStream::FeaturedBatchStream(
   int                                           world_size,
   nnue::UniquePositionCounter*                  counter,
   DataloaderIOConfig                            io_config,
-  bool                                          prepack_indices) :
+  bool                                          prepack_indices,
+  SparseBatchPinnedAllocator                    pinned) :
     BaseType(calculate_num_reader_threads(concurrency, batch_size),
              filenames,
              cyclic,
@@ -828,7 +850,7 @@ FeaturedBatchStream::FeaturedBatchStream(
       std::size_t(m_batch_queue_capacity) + m_num_workers.load() + 1);
     m_stop_flag.store(false);
 
-    auto worker = [this]() {
+    auto worker = [this, pinned]() {
         std::vector<TrainingDataEntry> entries;
         entries.reserve(m_batch_size);
 
@@ -842,7 +864,7 @@ FeaturedBatchStream::FeaturedBatchStream(
             }
 
             auto batch = new SparseBatch(*m_feature_set, m_ls_keys, entries, m_buffer_pool,
-                                         m_prepack_indices);
+                                         m_prepack_indices, pinned);
 
             {
                 std::unique_lock lock(m_batch_mutex);

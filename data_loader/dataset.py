@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from . import stream
+from ._native import PinnedBatchAllocator, c_lib
 from ._transport import compact_transport_available
 from .config import (
     DEFAULT_LS_KEYS,
@@ -160,8 +161,12 @@ class TrainingDataProvider:
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.native_fetch_s = 0.0
+        self._pinned_allocator = None
 
         if batch_size:
+            prepack_indices = compact_transport_available(device, use_pinned_memory)
+            if prepack_indices and c_lib.create_pinned_stream is not None:
+                self._pinned_allocator = PinnedBatchAllocator(device)
             self.stream = self.create_stream(
                 self.feature_set,
                 self.num_workers,
@@ -175,7 +180,8 @@ class TrainingDataProvider:
                 ls_keys=ls_keys,
                 # Let the C++ workers build the packed transport layout when
                 # batches will take that path, instead of this thread.
-                prepack_indices=compact_transport_available(device, use_pinned_memory),
+                prepack_indices=prepack_indices,
+                pinned_allocator=self._pinned_allocator,
             )
         else:
             self.stream = self.create_stream(
@@ -199,14 +205,23 @@ class TrainingDataProvider:
         # the batch to the device afterwards.
         self.native_fetch_s += time.perf_counter() - t0
 
-        if v:
-            tensors = v.contents.get_tensors(
-                self.device, use_pinned_memory=self.use_pinned_memory
-            )
-            self.destroy_part(v)
-            return tensors
-        else:
+        if not v:
             raise StopIteration
+        try:
+            batch = v.contents
+            pinned_blocks = None
+            if self._pinned_allocator is not None and compact_transport_available(
+                self.device, self.use_pinned_memory
+            ):
+                pinned_blocks = self._pinned_allocator.for_batch(batch)
+            return batch.get_tensors(
+                self.device,
+                use_pinned_memory=self.use_pinned_memory,
+                pinned_blocks=pinned_blocks,
+            )
+        finally:
+            # Tensor-backed pinned storage is recycled by PyTorch after its copy.
+            self.destroy_part(v)
 
     def get_unique_stats(self) -> tuple[int, int, int]:
         """Return (preskip, total, unique)."""
@@ -221,7 +236,8 @@ class TrainingDataProvider:
         return stream.get_io_stats(self.stream)
 
     def __del__(self):
-        self.destroy_stream(self.stream)
+        if hasattr(self, "stream"):
+            self.destroy_stream(self.stream)
 
 
 class SparseBatchProvider(TrainingDataProvider):

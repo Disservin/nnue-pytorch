@@ -70,6 +70,21 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
                                                                   DataloaderIOConfig   io_config,
                                                                   bool prepack_indices);
 
+NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream_pinned(
+  const char*                feature_set_c,
+  const char*                ls_keys_c,
+  int                        concurrency,
+  int                        num_files,
+  const char* const*         filenames,
+  int                        batch_size,
+  bool                       cyclic,
+  DataloaderSkipConfig       config,
+  DataloaderDDPConfig        ddp_config,
+  DataloaderHllConfig        hll_config,
+  DataloaderIOConfig         io_config,
+  bool                       prepack_indices,
+  SparseBatchPinnedAllocator pinned);
+
 NNUE_API void NNUE_CDECL         destroy_sparse_batch_stream(SparseBatchStream* stream);
 NNUE_API SparseBatch* NNUE_CDECL fetch_next_sparse_batch(SparseBatchStream* stream);
 

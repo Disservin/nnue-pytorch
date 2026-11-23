@@ -134,6 +134,7 @@ def move_indices(
     native_owned: bool,
     pack: Callable[[CArgObject, int, int], bool],
     policy: CompactTransportPolicy,
+    pinned_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Copy feature IDs, skipping unused slots when that saves enough space.
 
@@ -171,9 +172,12 @@ def move_indices(
         and (prepacked or policy.should_pack(dense_elements, packed_elements))
     ):
         assert unpack_sparse_indices is not None
-        packed = torch.empty(packed_elements, dtype=torch.int32, pin_memory=True)
-        if not pack(ctypes.byref(batch), packed.data_ptr(), packed_elements):
-            raise RuntimeError("Native sparse batch packing failed")
+        if pinned_indices is None:
+            packed = torch.empty(packed_elements, dtype=torch.int32, pin_memory=True)
+            if not pack(ctypes.byref(batch), packed.data_ptr(), packed_elements):
+                raise RuntimeError("Native sparse batch packing failed")
+        else:
+            packed = pinned_indices[:packed_elements]
         return unpack_sparse_indices(
             packed.to(device=device, non_blocking=True),
             num_positions,

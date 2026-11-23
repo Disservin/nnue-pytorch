@@ -45,3 +45,10 @@ struct DataloaderFileStats {
     int           claimed;              // a read is currently in flight for this file
     int           exhausted;
 };
+
+// Optional host storage supplied by the caller. A null return requests the
+// regular native buffers. On success, release is called once with the target block.
+struct SparseBatchPinnedAllocator {
+    void* (*acquire)(std::size_t targets, std::size_t indices, void** packed) = nullptr;
+    void (*release)(void* targets) = nullptr;
+};

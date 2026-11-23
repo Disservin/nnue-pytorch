@@ -1,6 +1,7 @@
 import ctypes
 import glob
 import os
+import threading
 
 import numpy as np
 import torch
@@ -13,6 +14,57 @@ from .config import (
     CDataloaderIOConfig,
     CDataloaderSkipConfig,
 )
+
+
+_AcquirePinned = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)
+)
+_ReleasePinned = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+class PinnedBatchAllocator(ctypes.Structure):
+    """Keeps worker-written tensors alive until their native batch is destroyed."""
+
+    _fields_ = [("acquire", _AcquirePinned), ("release", _ReleasePinned)]
+
+    def __init__(self, device):
+        super().__init__()
+        self.buffers = buffers = {}
+        lock = threading.Lock()
+
+        @_AcquirePinned
+        def acquire(target_elements, index_elements, packed):
+            with lock:
+                # Bound the pinned memory used by the native worker queue.
+                if len(buffers) >= 2:
+                    return None
+                try:
+                    with torch.cuda.device(device):
+                        targets = torch.empty(
+                            target_elements, device="cpu", dtype=torch.float32, pin_memory=True
+                        )
+                        indices = torch.empty(
+                            index_elements, device="cpu", dtype=torch.int32, pin_memory=True
+                        )
+                except (RuntimeError, MemoryError):
+                    return None
+                address = targets.data_ptr()
+                buffers[address] = targets, indices
+                packed[0] = indices.data_ptr()
+                return address
+
+        @_ReleasePinned
+        def release(address):
+            with lock:
+                # Nonblocking copies use the original tensors, so the pinned
+                # allocator keeps their storage alive until DMA completes.
+                buffers.pop(address, None)
+
+        self.acquire = acquire
+        self.release = release
+
+    def for_batch(self, batch):
+        return self.buffers.get(ctypes.cast(batch.is_white, ctypes.c_void_p).value)
 
 
 class SparseBatch(ctypes.Structure):
@@ -36,6 +88,7 @@ class SparseBatch(ctypes.Structure):
         use_pinned_memory: bool = False,
         *,
         transport_policy: CompactTransportPolicy | None = None,
+        pinned_blocks: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -51,10 +104,15 @@ class SparseBatch(ctypes.Structure):
         # is_white, outcome, score(3 * size floats)
         total_floats = size * 3
 
-        float_block_cpu = torch.from_numpy(
-            np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
-        )
-        float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
+        pinned_indices = None
+        if pinned_blocks is None:
+            float_block_cpu = torch.from_numpy(
+                np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
+            )
+            float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
+        else:
+            targets, pinned_indices = pinned_blocks
+            float_block_gpu = targets.to(device=device, non_blocking=True)
         int_block_gpu = move_indices(
             self,
             device,
@@ -62,6 +120,7 @@ class SparseBatch(ctypes.Structure):
             native_owned=isinstance(self._b_base_, NativeSparseBatchPointer),
             pack=c_lib.pack_sparse_batch,
             policy=transport_policy or CompactTransportPolicy(),
+            pinned_indices=pinned_indices,
         )
 
         us = float_block_gpu[0:size].view(size, 1)
@@ -227,6 +286,15 @@ class CDataLoaderAPI:
             CDataloaderIOConfig,
             ctypes.c_bool,  # prepack_indices
         ]
+
+        pinned_create = getattr(self.dll, "create_sparse_batch_stream_pinned", None)
+        if pinned_create is not None:
+            pinned_create.restype = ctypes.c_void_p
+            pinned_create.argtypes = [
+                *self.dll.create_sparse_batch_stream.argtypes,
+                PinnedBatchAllocator,
+            ]
+        self.create_pinned_stream = pinned_create
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
         self.dll.destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
