@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from . import stream
-from ._transport import compact_transport_available
+from ._transport import PinnedStaging, compact_transport_available
 from .config import (
     DEFAULT_LS_KEYS,
     DataloaderDDPConfig,
@@ -160,6 +160,8 @@ class TrainingDataProvider:
         self.use_pinned_memory = use_pinned_memory
         self.device = device
         self.native_fetch_s = 0.0
+        self._staging = None
+        self._staging_device = None
 
         if batch_size:
             self.stream = self.create_stream(
@@ -199,14 +201,23 @@ class TrainingDataProvider:
         # the batch to the device afterwards.
         self.native_fetch_s += time.perf_counter() - t0
 
-        if v:
-            tensors = v.contents.get_tensors(
-                self.device, use_pinned_memory=self.use_pinned_memory
-            )
-            self.destroy_part(v)
-            return tensors
-        else:
+        if not v:
             raise StopIteration
+        try:
+            device = torch.device(self.device)
+            staging = None
+            if self.use_pinned_memory and device.type == "cuda":
+                if device.index is None:
+                    device = torch.device("cuda", torch.cuda.current_device())
+                if self._staging_device != device:
+                    self._staging = PinnedStaging()
+                    self._staging_device = device
+                staging = self._staging
+            return v.contents.get_tensors(
+                device, use_pinned_memory=self.use_pinned_memory, staging=staging
+            )
+        finally:
+            self.destroy_part(v)
 
     def get_unique_stats(self) -> tuple[int, int, int]:
         """Return (preskip, total, unique)."""

@@ -5,7 +5,7 @@ import os
 import numpy as np
 import torch
 
-from ._transport import CompactTransportPolicy, _pin_and_move, move_indices
+from ._transport import CompactTransportPolicy, PinnedStaging, _pin_and_move, move_indices
 from .config import (
     CDataloaderDDPConfig,
     CDataloaderFileStats,
@@ -36,6 +36,7 @@ class SparseBatch(ctypes.Structure):
         use_pinned_memory: bool = False,
         *,
         transport_policy: CompactTransportPolicy | None = None,
+        staging: PinnedStaging | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -54,7 +55,9 @@ class SparseBatch(ctypes.Structure):
         float_block_cpu = torch.from_numpy(
             np.ctypeslib.as_array(self.is_white, shape=(total_floats,))
         )
-        float_block_gpu = _pin_and_move(float_block_cpu, device, use_pinned_memory)
+        float_block_gpu = _pin_and_move(
+            float_block_cpu, device, use_pinned_memory, staging=staging
+        )
         int_block_gpu = move_indices(
             self,
             device,
@@ -62,6 +65,7 @@ class SparseBatch(ctypes.Structure):
             native_owned=isinstance(self._b_base_, NativeSparseBatchPointer),
             pack=c_lib.pack_sparse_batch,
             policy=transport_policy or CompactTransportPolicy(),
+            staging=staging,
         )
 
         us = float_block_gpu[0:size].view(size, 1)

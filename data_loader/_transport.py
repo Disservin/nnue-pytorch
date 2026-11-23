@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -38,6 +39,33 @@ class CompactTransportPolicy:
         )
 
 
+class PinnedStaging:
+    """Per-provider CUDA staging, with up to two buffers per dtype."""
+
+    def __init__(self):
+        self._slots: dict[torch.dtype, list[tuple[torch.Tensor, torch.cuda.Event]]] = {}
+
+    def acquire(self, shape, dtype):
+        elements = math.prod(shape)
+        slots = self._slots.setdefault(dtype, [])
+        for index, (buffer, ready) in enumerate(slots):
+            if ready.query():
+                if buffer.numel() < elements:
+                    buffer = torch.empty(
+                        elements, device="cpu", dtype=dtype, pin_memory=True
+                    )
+                    slots[index] = buffer, ready
+                return buffer[:elements].view(shape), ready
+
+        buffer = torch.empty(elements, device="cpu", dtype=dtype, pin_memory=True)
+        if len(slots) == 2:
+            # PyTorch's pinned allocator tracks the asynchronous copy for spill buffers.
+            return buffer.view(shape), None
+        ready = torch.cuda.Event()
+        slots.append((buffer, ready))
+        return buffer.view(shape), ready
+
+
 def _pin_and_move(
     t: torch.Tensor,
     device: str | torch.device,
@@ -45,6 +73,7 @@ def _pin_and_move(
     dtype: torch.dtype | None = None,
     *,
     copy_mode: Literal["memcpy", "torch"] = "memcpy",
+    staging: PinnedStaging | None = None,
 ) -> torch.Tensor:
     if dtype is None:
         dtype = t.dtype
@@ -53,9 +82,13 @@ def _pin_and_move(
     if torch.cuda.is_available() and use_pinned_memory:
         if copy_mode not in ("memcpy", "torch"):
             raise ValueError(f"copy_mode must be memcpy or torch, got {copy_mode!r}")
-        out = torch.empty(
-            t.shape, dtype=dtype, layout=t.layout, device="cpu", pin_memory=True
-        )
+        ready = None
+        if staging is not None and t.layout == torch.strided:
+            out, ready = staging.acquire(t.shape, dtype)
+        else:
+            out = torch.empty(
+                t.shape, dtype=dtype, layout=t.layout, device="cpu", pin_memory=True
+            )
         if (
             copy_mode == "memcpy"
             and t.device.type == "cpu"
@@ -72,7 +105,11 @@ def _pin_and_move(
             isinstance(device, torch.device) and device.type == "cpu"
         ):
             return out
-        return out.to(device=device, non_blocking=True)
+        try:
+            return out.to(device=device, non_blocking=True)
+        finally:
+            if ready is not None:
+                ready.record(torch.cuda.current_stream(device))
 
     out = torch.empty(t.shape, dtype=dtype, layout=t.layout, device="cpu")
     out.copy_(t)
@@ -134,6 +171,7 @@ def move_indices(
     native_owned: bool,
     pack: Callable[[CArgObject, int, int], bool],
     policy: CompactTransportPolicy,
+    staging: PinnedStaging | None = None,
 ) -> torch.Tensor:
     """Copy feature IDs, skipping unused slots when that saves enough space.
 
@@ -171,11 +209,20 @@ def move_indices(
         and (prepacked or policy.should_pack(dense_elements, packed_elements))
     ):
         assert unpack_sparse_indices is not None
-        packed = torch.empty(packed_elements, dtype=torch.int32, pin_memory=True)
+        ready = None
+        if staging is None:
+            packed = torch.empty(packed_elements, dtype=torch.int32, pin_memory=True)
+        else:
+            packed, ready = staging.acquire((packed_elements,), torch.int32)
         if not pack(ctypes.byref(batch), packed.data_ptr(), packed_elements):
             raise RuntimeError("Native sparse batch packing failed")
+        try:
+            device_packed = packed.to(device=device, non_blocking=True)
+        finally:
+            if ready is not None:
+                ready.record(torch.cuda.current_stream(device))
         return unpack_sparse_indices(
-            packed.to(device=device, non_blocking=True),
+            device_packed,
             num_positions,
             max_features_per_position,
             batch.num_active_white_features,
@@ -192,9 +239,9 @@ def move_indices(
             batch.num_active_white_features,
             batch.num_active_black_features,
         )
-        return _pin_and_move(dense, device, use_pinned_memory)
+        return _pin_and_move(dense, device, use_pinned_memory, staging=staging)
 
     dense = torch.from_numpy(
         np.ctypeslib.as_array(batch.white, shape=(dense_elements,))
     )
-    return _pin_and_move(dense, device, use_pinned_memory)
+    return _pin_and_move(dense, device, use_pinned_memory, staging=staging)
