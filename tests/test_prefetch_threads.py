@@ -1,4 +1,4 @@
-"""Several prefetch threads (FixedNumBatchesDataset num_threads): every batch arrives once, the end
+"""Several prefetch threads (DevicePrefetcher num_threads): every batch arrives once, the end
 of the data is signalled only after the last batch, and the bottleneck report averages the threads."""
 
 import threading
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from data_loader.dataset import FixedNumBatchesDataset
+from data_loader.dataset import DevicePrefetcher
 from trainer.callbacks import DataLoaderBottleneckMonitor
 
 
@@ -59,18 +59,16 @@ class _ConcurrentBatches:
 
 def _drain(ds):
     out = []
-    i = 0
     while True:
         try:
-            out.append(ds[i][0][0].item())
+            out.append(ds.next_batch()[0][0].item())
         except StopIteration:
             return out
-        i += 1
 
 
 @pytest.mark.parametrize("num_threads", [1, 2, 4])
 def test_every_batch_arrives_once_then_the_end(num_threads):
-    ds = FixedNumBatchesDataset(
+    ds = DevicePrefetcher(
         _Generated(37), num_batches=37, queue_size_limit=2, num_threads=num_threads
     )
     assert sorted(_drain(ds)) == [float(i) for i in range(37)]
@@ -78,7 +76,7 @@ def test_every_batch_arrives_once_then_the_end(num_threads):
 
 def test_concurrent_iterator_is_advanced_in_parallel():
     batches = _ConcurrentBatches(24, delay=0.02)
-    ds = FixedNumBatchesDataset(batches, 24, queue_size_limit=8, num_threads=4)
+    ds = DevicePrefetcher(batches, 24, queue_size_limit=8, num_threads=4)
     t0 = time.perf_counter()
     assert sorted(_drain(ds)) == [float(i) for i in range(24)]
     elapsed = time.perf_counter() - t0
@@ -88,7 +86,7 @@ def test_concurrent_iterator_is_advanced_in_parallel():
 
 def test_num_threads_must_be_positive():
     with pytest.raises(ValueError):
-        FixedNumBatchesDataset(_Generated(1), 1, num_threads=0)
+        DevicePrefetcher(_Generated(1), 1, num_threads=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -100,7 +98,7 @@ def test_device_batches_from_several_threads():
         with lock:
             seen.append(batch[0].is_cuda)
 
-    ds = FixedNumBatchesDataset(
+    ds = DevicePrefetcher(
         _Generated(16),
         16,
         device="cuda",
@@ -116,10 +114,10 @@ def test_report_averages_producer_time_over_threads():
     """Four threads that each spend all their time in transport are fully busy, not 400% busy,
     and the verdict names the thread count."""
     n = 40
-    ds = FixedNumBatchesDataset(
+    ds = DevicePrefetcher(
         _ConcurrentBatches(10**6, delay=0.02), n, queue_size_limit=2, num_threads=4
     )
-    ds[0]
+    ds.next_batch()
     monitor = DataLoaderBottleneckMonitor(ds, num_workers=8)
     monitor.cpus = 8
     trainer = SimpleNamespace(
@@ -132,8 +130,8 @@ def test_report_averages_producer_time_over_threads():
         _log_metrics=lambda *a, **k: None,
     )
     monitor.on_train_epoch_start(trainer)
-    for i in range(n):
-        ds[i]
+    for _ in range(n):
+        ds.next_batch()
     monitor.on_train_epoch_end(trainer)
     report = monitor.last_report
     assert 0.5 < report["transport"] <= 1.0
@@ -146,10 +144,10 @@ def test_dataset_is_collectable_while_its_threads_run():
     import gc
     import weakref
 
-    ds = FixedNumBatchesDataset(
+    ds = DevicePrefetcher(
         _ConcurrentBatches(10**9, delay=0.001), 10, queue_size_limit=2, num_threads=3
     )
-    ds[0]
+    ds.next_batch()
     threads = list(ds._prefetch_threads)
     ref = weakref.ref(ds)
     del ds
