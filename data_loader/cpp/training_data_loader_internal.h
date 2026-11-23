@@ -191,10 +191,13 @@ struct FeaturedBatchStream final: Stream<SparseBatch> {
     // more decode workers to keep the pipeline fed (B = 131072, 32 workers:
     // 42 batches/s with 1/4 of the workers as builders vs 28 with 1/2), so
     // the default ratio scales down with the batch size: 1/2 at B <= 65536
-    // down to 1/4 at B >= 131072.
+    // down to 5/16 at B >= 131072. At B = 131072, 32 workers, with 1/4 the
+    // 8 builders were saturated (~1.04 cores each) while the 24 readers had
+    // slack (~0.82): 46.9 batches/s with 1/4, 50.6 with 5/16, 49.6 with 3/8,
+    // 47.9 with 7/16.
     static double worker_thread_ratio(int batch_size) {
         const double t = std::min(std::max(std::log2(double(batch_size)) - 16.0, 0.0), 1.0);
-        return 0.5 - 0.25 * t;
+        return 0.5 - 0.1875 * t;
     }
 
     FeaturedBatchStream(std::shared_ptr<IFeatureExtractor>                            feature_set,
