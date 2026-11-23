@@ -71,14 +71,19 @@ errors and shutdown across all ranks. Do not advance model weights while
 preparing the current forward. See `benchmark_results.md` for measured cost
 and limitations.
 
-The following experiments are opt-in. Select the same runner options on all
-ranks. The benchmark reports which ones were active on the last step.
+The runner enables the following CUDA optimizations when their guards pass.
+Pass `False` to select a reference implementation and use the same settings
+on all ranks. The benchmark selects these options explicitly for comparisons.
 
 | Runner option | Benchmark flag | Behavior |
 | --- | --- | --- |
-| `uniform_loss=True` | `--uniform-loss` | With uniform weights and finite training targets, normalize the local loss sum by the exact global position count from feature gathering. Recipes with nonuniform weights use the usual denominator reduction. |
-| `overlap_replica_gradients=True` | `--overlap-replica-gradients` | On equal, nonempty batches with trainable FP32 replicas, split backward at FT output. Enqueue one replica reduction after L1 backward's all-gather, run the local FT backward, and wait before gradient clipping or AdamW. Uneven or empty batches use the generic path. |
-| `direct_packed_ft=True` | `--direct-packed-ft` | With native packed batches on supported NVIDIA CUDA, FT reads the gathered feature IDs through per-row ranges. Both scatter and aggregated FT backward use those ranges. In the benchmark set `NNUE_BENCH_NATIVE_PACKED=1`. |
+| `bucketed_bias` | `--bucketed-l1-bias` | Reduce L1 bias gradients by bucket on supported NVIDIA GPUs. The CUDA path checks the dtype, shape, scratch bound, and graph capture state. |
+| `uniform_loss` | `--uniform-loss` | For native-packed NVIDIA CUDA batches with uniform weights, normalize the local loss sum by the global position count from feature gathering. Weighted recipes use the usual denominator reduction. |
+| `overlap_replica_gradients` | `--overlap-replica-gradients` | On NVIDIA NCCL with equal, nonempty batches and trainable FP32 replicas, enqueue replica reduction after L1 backward's all-gather and run local FT backward while it completes. Wait before gradient clipping or AdamW. |
+
+Select `direct_packed_ft=True` to test FT consumption of gathered feature IDs
+through per-row ranges. For the benchmark, use `--direct-packed-ft` with
+`NNUE_BENCH_NATIVE_PACKED=1`.
 
 Use `--repeat-live-batch --matched-batch-cache DIR --matched-batch-count 8`
 to replay eight successive saved real batches in order. Choose the same
