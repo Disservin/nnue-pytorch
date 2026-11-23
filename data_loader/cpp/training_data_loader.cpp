@@ -616,8 +616,7 @@ SparseBatch::SparseBatch(const IFeatureExtractor&               fs,
         num_active_white_features +=
           fs.fill_features_sparse(e, white_ids + num_active_white_features, Color::White).first;
         num_active_black_features +=
-          fs.fill_features_sparse(e, black_parked + num_active_black_features, Color::Black)
-            .first;
+          fs.fill_features_sparse(e, black_parked + num_active_black_features, Color::Black).first;
         white_offsets[i + 1] = num_active_white_features;
         black_offsets[i + 1] = num_active_black_features;
         stack_parked[i]      = ls_keys.index(e.pos);
@@ -645,8 +644,8 @@ SparseBatch::~SparseBatch() {
 void SparseBatch::fill_targets(int i, const TrainingDataEntry& e) {
     is_white[i] = static_cast<float>(e.pos.sideToMove() == Color::White);
     // Search-tree samples have no result: outcome 2 makes the loss use the score alone.
-    outcome[i]  = e.ply == TREE_SAMPLE_PLY ? 2.0f : (e.result + 1.0f) / 2.0f;
-    score[i]    = e.score;
+    outcome[i] = e.ply == TREE_SAMPLE_PLY ? 2.0f : (e.result + 1.0f) / 2.0f;
+    score[i]   = e.score;
 }
 
 std::size_t SparseBatch::packed_size() const {
@@ -1036,7 +1035,7 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
     return [config, random_skip_threshold, tree_sample_skip_threshold, target_pc_weights_lut,
             target_pc_weights_total,
             early_ply_accept_prob = std::move(early_ply_accept_prob)](const TrainingDataEntry& e) {
-        static constexpr int    VALUE_NONE = 32002;
+        static constexpr int VALUE_NONE = 32002;
 
         if (e.ply == TREE_SAMPLE_PLY)
             return e.score == VALUE_NONE
@@ -1071,7 +1070,7 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
 
         if (config.random_fen_skipping && (prng() < random_skip_threshold))
             return true;
-        if (config.filtered && (e.isCapturingMove() || e.isInCheck()))
+        if (config.filtered && (e.isInCheck()))
             return true;
 
         if (config.wld_filtered)
