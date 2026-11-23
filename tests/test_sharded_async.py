@@ -36,7 +36,8 @@ def _worker(rank, port, backend):
         nnue = NNUE(_config(), max_epoch=3, num_batches_per_epoch=5, sharding=(rank, 4)).to(device)
         test_bias = os.environ.get("NNUE_TEST_BUCKETED_BIAS") == "1"
         runner = ShardedAdamWStep(nnue, gradient_clip_val=0.2,
-                                  compile_model=None if test_bias else False)
+                                  compile_model=None if test_bias else False,
+                                  bucketed_bias=False)
         if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
             import model.modules.sharded_l1 as sharded_l1
             from scripts.reference_l1_collective import ReferenceReduceScatter

@@ -18,13 +18,14 @@ from trainer.engine import is_one_cycle
 class ShardedAdamWStep:
     """Run AdamW on FT/L1 shards and a data-parallel tail.
 
-    ``bucketed_bias`` opts into a guarded CUDA bias-gradient reduction; it
-    falls back to eager for unsupported inputs and remains a caller choice
-    when restoring a checkpoint.
+    NVIDIA CUDA uses guarded bucketed L1 bias reduction and uniform-loss
+    normalization for native loader batches. NCCL can overlap dense replica
+    gradient reduction with local FT backward. Pass False for any of these
+    options to select its reference implementation.
     """
     def __init__(self, nnue, *, group=None, gradient_clip_val=2.0,
-                 compile_model: bool | None = None, bucketed_bias: bool = False,
-                 uniform_loss: bool = False, overlap_replica_gradients: bool = False,
+                 compile_model: bool | None = None, bucketed_bias: bool | None = None,
+                 uniform_loss: bool | None = None, overlap_replica_gradients: bool | None = None,
                  direct_packed_ft: bool = False):
         if not isinstance(nnue.model, ShardedNNUEModel):
             raise TypeError(
@@ -56,19 +57,23 @@ class ShardedAdamWStep:
         ) + len(self.replicated):
             raise ValueError("sharded and replicated parameters must be disjoint")
         device = next(nnue.parameters()).device
-        if compile_model is not None and not isinstance(compile_model, bool):
-            raise TypeError("compile_model must be a bool or None")
         for name, value in (
-            ("bucketed_bias", bucketed_bias), ("uniform_loss", uniform_loss),
+            ("compile_model", compile_model), ("bucketed_bias", bucketed_bias),
+            ("uniform_loss", uniform_loss),
             ("overlap_replica_gradients", overlap_replica_gradients),
-            ("direct_packed_ft", direct_packed_ft),
         ):
-            if not isinstance(value, bool):
-                raise TypeError(f"{name} must be a bool")
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a bool or None")
+        if not isinstance(direct_packed_ft, bool):
+            raise TypeError("direct_packed_ft must be a bool")
         self.compile_model = device.type == "cuda" if compile_model is None else compile_model
-        self.bucketed_bias = bucketed_bias
+        self._nvidia_cuda = device.type == "cuda" and torch.version.hip is None
+        self.bucketed_bias = self._nvidia_cuda if bucketed_bias is None else bucketed_bias
         self.uniform_loss = uniform_loss
-        self.overlap_replica_gradients = overlap_replica_gradients
+        self.overlap_replica_gradients = (
+            self._nvidia_cuda and self.world > 1 and dist.get_backend(group) == "nccl"
+            if overlap_replica_gradients is None else overlap_replica_gradients
+        )
         self.direct_packed_ft = direct_packed_ft
         self.last_experiments = {}
         self._batch_jitter_generator = None
@@ -139,7 +144,11 @@ class ShardedAdamWStep:
         self.optimizer.zero_grad(set_to_none=True)
         enabled = self.global_step >= self.nnue.config.fake_quant_warmup_steps
         loss_params = self.nnue.config.loss_params
-        uniform = self.uniform_loss and loss_params.w1 == 0 and 0 <= loss_params.w2 < float("inf")
+        use_uniform = self.uniform_loss
+        if use_uniform is None:
+            # The native loader supplies finite targets derived from integer records.
+            use_uniform = self._nvidia_cuda and isinstance(batch[2], dict)
+        uniform = use_uniform and loss_params.w1 == 0 and 0 <= loss_params.w2 < float("inf")
         overlap = (
             self.overlap_replica_gradients and self.world > 1 and bool(self.replicated)
             and all(p.requires_grad and p.dtype == torch.float32 for p in self.replicated)

@@ -412,9 +412,9 @@ Individual sanitized windows are in `l1_factor_ablation_results.json`.
 
 ### Guarded bucketed L1 bias reduction
 
-The bucketed bias-gradient path is available explicitly through
+These runs selected the bucketed bias-gradient path explicitly through
 `ShardedAdamWStep(..., bucketed_bias=True)` or the benchmark's
-`--bucketed-l1-bias`; it is not the default. It keeps the eager PyTorch
+`--bucketed-l1-bias`. It keeps the eager PyTorch
 forward gather and bounds behavior, accepts valid negative indices, masks
 invalid router accesses before narrowing int64 IDs, and does not read index
 values back to the host. It only selects the fast CUDA path for supported
@@ -457,8 +457,7 @@ and 1.73–2.09 s per bucketed run acquiring batches; that host time can overlap
 GPU work. Four additional 3000-step windows per path on an earlier guard
 iteration varied more widely: 8.81–10.25M baseline and 9.92–10.64M bucketed.
 The code versions and individual windows are identified in
-`bucketed_bias_hardened_results.json`. These live results do not establish a
-consistent throughput win, so the path remains opt-in.
+`bucketed_bias_hardened_results.json`. Live throughput varied by run.
 
 The final GPU suite passed 37 tests, including the original bias-gradient
 tests, concentrated buckets, noncontiguous indices/gradients, negative and
