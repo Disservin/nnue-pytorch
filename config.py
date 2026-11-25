@@ -70,6 +70,12 @@ class TrainingConfig:
     seed: int = 42
     """Torch seed to use."""
 
+    sharded: bool = False
+    """Split the feature transformer and L1 weights across the ranks instead of
+    replicating them in DDP. Removes the full-batch FT gradient all-reduce,
+    which dominates multi-GPU step time on PCIe-only systems. Requires AdamW
+    and at least two processes; checkpoints are full-model compatible."""
+
     resume_from_model: str | None = None
     """Initializes training using the weights from the given .pt model."""
 
