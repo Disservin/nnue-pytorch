@@ -467,3 +467,50 @@ streams, cross-device execution and four-rank compiled AdamW parity. A
 separate four-rank test compared two QAT/AdamW steps on the real 92-stack
 model and saved batch, including gradients, parameters and optimizer states.
 These are correctness tests, not convergence or net-strength measurements.
+
+### PCIe-only host: sharded training from train.py
+
+This system has two A100-PCIE-40GB GPUs on PCIe 3.0 x16 with no NVLink. The
+visible link is Gen3 x16, `nvidia-smi topo` reports a host-bridge (NODE)
+connection, and a two-rank fp32 NCCL all-reduce sustains about 15.5 GB/s
+aggregate: 565 MiB in 76.3 ms, 283 MiB in 38.3 ms, 141 MiB in 19.2 ms.
+
+The threats recipe's model has 542 MiB of feature-transformer parameters
+(59808x1024, 4560x1024, 73728x1024 and 768x1024 virtual). DDP reduces all of
+them at the end of backward, after the last FT gradient is produced, so
+almost none of that time overlaps compute. The recipe's validation and
+optimizer settings otherwise match `scripts/nettest_benchmark_settings.py`.
+
+Run command: `torchrun --standalone --nproc-per-node=N ddp_launcher.py
+train.py <recipe options>` with the 60-file training mixture, global batch
+131072, `--epoch-size 52428800` (400 steps), 32 loader workers per rank,
+`--threads 1`, and `--num-workers`/affinity set by the launcher. The sharded
+run adds `--sharded`. Numbers are the slope between 80% and 100% of the run,
+after compilation; three-second windows make them approximate.
+
+| Configuration | it/s (131072-pos batches) | ms/batch |
+| --- | ---: | ---: |
+| One A100, DDP | 26.7 | 37 |
+| Two A100, DDP | 10.0 | 100 |
+| Two A100, `--sharded` | 26.7 | 37 |
+
+Single-GPU numbers are loader-bursty (the queue ran dry on 78% of fetches at
+32 workers) but the GPU was the limiting side in the measured window. Both
+multi-GPU runs had a full device queue, so DDP is GPU/communication bound.
+The sharded run uses the guarded bucketed L1 bias reduction and dense replica
+gradient overlap by default; its communication is one 16.8 MiB L1
+reduce-scatter, one 16.8 MiB all-gather and the replicated tail reduction.
+
+The earlier benchmark-script measurement on the same host and data, with
+bucketed bias disabled and replica overlap explicitly off, was 22.2 it/s
+(2.91M positions/s); enabling replica-overlap reached 25.4 it/s. Running the
+same training loop from `train.py` with both defaults reaches 26.7 it/s.
+
+Checkpointing: `--sharded` writes a full-model checkpoint (588 MiB for this
+recipe) on rank 0 plus one 882 MiB `<path>.rankN` file per rank with shard
+weights, AdamW state, schedulers and RNG. A 40-step smoke run with validation
+and a second epoch resumed from those files at the same throughput.
+
+This comparison is a throughput measurement. The existing two-rank NCCL test
+compares sharded and full-model AdamW gradients, losses, parameters and
+optimizer state; no convergence or net-strength comparison was performed.
