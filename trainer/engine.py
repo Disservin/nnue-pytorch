@@ -87,10 +87,13 @@ class SimpleTrainer:
     distributed-data-parallel handling.
     """
 
+    # Subclasses that synchronize gradients themselves turn this off.
+    wrap_in_ddp = True
+
     def __init__(
         self,
         model: nn.Module,
-        optimizer: torch.optim.Optimizer | None,
+        optimizer: torch.optim.Optimizer,
         schedulers: Iterable[Any] | None,
         max_epochs: int,
         check_val_every_n_epoch: int,
@@ -104,7 +107,6 @@ class SimpleTrainer:
         world_size: int,
         local_rank: int,
         checkpoint_writer: Any | None = None,
-        step_runner: Any | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -130,7 +132,6 @@ class SimpleTrainer:
         self.world_size = world_size
         self.local_rank = local_rank
         self.checkpoint_writer = checkpoint_writer
-        self.step_runner = step_runner
 
         # Parity aliases used by callbacks and future train.py code.
         self.is_global_zero = self.rank == 0
@@ -158,7 +159,7 @@ class SimpleTrainer:
         # plain NNUE object as ``self.model``.
         self.model.to(self.device)
         self._ddp_model: nn.Module | None = None
-        if self.world_size > 1 and self.step_runner is None:
+        if self.world_size > 1 and self.wrap_in_ddp:
             inner_model = _unwrap_module(self.model).model
             inner_model.to(self.device)
             kwargs = {
@@ -197,13 +198,8 @@ class SimpleTrainer:
             logger.log_metrics(metrics, step=step)
 
     def _training_step(self, batch):
-        if self.step_runner is not None:
-            loss = self.step_runner.step(batch)
-            _unwrap_module(self.model).loss_metrics["train_loss_epoch"].update(
-                loss.detach()
-            )
-            return {"loss": loss, "train_loss": loss.detach()}
         if self._ddp_model is not None:
+            # DDP wraps the inner NNUEModel; run its forward to get scorenet,
             # then compute the loss on the plain NNUE object.
             (
                 us,
@@ -234,6 +230,32 @@ class SimpleTrainer:
         else:
             outputs = self.model.train_step(batch, self.current_epoch, self.global_step)
         return outputs
+
+    def _optimization_step(self, batch):
+        """Forward, backward and optimizer step for one batch; returns outputs."""
+        outputs = self._training_step(batch)
+        loss = outputs["loss"]
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        if self.gradient_clip_val is not None and self.gradient_clip_val > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.gradient_clip_val
+            )
+
+        self.optimizer.step()
+
+        # Step OneCycleLR-style schedulers every optimizer step.
+        for sch in self._schedulers:
+            if is_one_cycle(sch):
+                sch.step()
+
+        self.global_step += 1
+        return outputs
+
+    def _validation_step(self, batch):
+        return self.model.val_step(batch, self.current_epoch, self.global_step)
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -341,30 +363,7 @@ class SimpleTrainer:
                 self.model.on_train_batch_start(batch, batch_idx)
             self._call_callbacks("on_train_batch_start", self, batch, batch_idx)
 
-            outputs = self._training_step(batch)
-
-            if self.step_runner is None:
-                loss = outputs["loss"]
-                self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                if self.gradient_clip_val is not None and self.gradient_clip_val > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.gradient_clip_val
-                    )
-
-                self.optimizer.step()
-
-                # Step OneCycleLR-style schedulers every optimizer step.
-                for sch in self._schedulers:
-                    if is_one_cycle(sch):
-                        sch.step()
-
-                self.global_step += 1
-            else:
-                # The runner owns zero_grad, backward, clipping, the optimizer
-                # step and the per-step schedulers.
-                self.global_step = self.step_runner.global_step
+            outputs = self._optimization_step(batch)
 
             # Store the raw loss tensor (GPU).  Only convert to float
             # when logging is due or when a callback needs the scalar.
@@ -442,16 +441,7 @@ class SimpleTrainer:
                     "on_validation_batch_start", self, batch, batch_idx
                 )
 
-                if self.step_runner is not None:
-                    val_loss = self.step_runner.val_step(batch)
-                    self.model.loss_metrics["val_loss_epoch"].update(
-                        val_loss.detach()
-                    )
-                    outputs = {"val_loss": val_loss}
-                else:
-                    outputs = self.model.val_step(
-                        batch, self.current_epoch, self.global_step
-                    )
+                outputs = self._validation_step(batch)
                 # Accumulate on the device: a per-batch float() would force a
                 # GPU-to-CPU sync in every iteration.
                 val_loss = outputs["val_loss"]

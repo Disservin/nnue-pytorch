@@ -23,6 +23,9 @@ if typing.TYPE_CHECKING:  # pragma: no cover
     from .sharded_adamw import ShardedAdamWStep
 
 
+CHECKPOINT_FORMAT = "nnue-sharded-v1"
+
+
 class ShardedTrainer(SimpleTrainer):
     """Train a ``ShardedNNUEModel`` with a ``ShardedAdamWStep`` runner.
 
@@ -35,8 +38,26 @@ class ShardedTrainer(SimpleTrainer):
       without them the rank's optimizer starts fresh.
     """
 
+    wrap_in_ddp = False
+
     def __init__(self, *, step_runner: ShardedAdamWStep, **kwargs):
-        super().__init__(step_runner=step_runner, **kwargs)
+        self.step_runner = step_runner
+        super().__init__(
+            optimizer=step_runner.optimizer, schedulers=step_runner.schedulers, **kwargs
+        )
+
+    # The runner owns zero_grad, backward, clipping, the optimizer step and
+    # the per-step schedulers.
+    def _optimization_step(self, batch):
+        loss = self.step_runner.step(batch).detach()
+        self.model.loss_metrics["train_loss_epoch"].update(loss)
+        self.global_step = self.step_runner.global_step
+        return {"loss": loss, "train_loss": loss}
+
+    def _validation_step(self, batch):
+        val_loss = self.step_runner.val_step(batch)
+        self.model.loss_metrics["val_loss_epoch"].update(val_loss)
+        return {"val_loss": val_loss}
 
     # -- checkpoints --------------------------------------------------
     def _full_model_for_save(self):
@@ -83,7 +104,7 @@ class ShardedTrainer(SimpleTrainer):
                 unwrapped.lambda_scheduler.jitter_buffer.detach().cpu()
             )
             checkpoint = {
-                "format": "nnue-sharded-v1",
+                "format": CHECKPOINT_FORMAT,
                 "epoch": self.current_epoch,
                 "global_step": self.global_step,
                 "state_dict": state,
@@ -98,7 +119,7 @@ class ShardedTrainer(SimpleTrainer):
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint.get("format") != "nnue-sharded-v1":
+        if checkpoint.get("format") != CHECKPOINT_FORMAT:
             raise ValueError(
                 f"{path} is not a sharded-training checkpoint; resume sharded "
                 "runs from their own last.ckpt"

@@ -409,12 +409,9 @@ def main():
         # the model must already be on its rank's device.
         nnue.to(device)
         step_runner = ShardedAdamWStep(nnue, gradient_clip_val=2.0)
-        optimizer, schedulers = step_runner.optimizer, step_runner.schedulers
     else:
-        step_runner = None
-        optimizer_and_schedulers = nnue.configure_optimizers()
         optimizer, schedulers = _normalize_optimizer_and_schedulers(
-            optimizer_and_schedulers
+            nnue.configure_optimizers()
         )
 
     train, val = make_data_loaders(
@@ -434,10 +431,9 @@ def main():
         prefetch_device=device if accelerator == "cuda" else None,
         rank=rank,
         world_size=world_size,
+        # The sharded FT backward does not use the tiled preparation.
         prefetch_hook=(
-            nnue.prefetch_hook()
-            if accelerator == "cuda" and step_runner is None
-            else None
+            nnue.prefetch_hook() if accelerator == "cuda" and not args.sharded else None
         ),
     )
 
@@ -473,11 +469,8 @@ def main():
     else:
         checkpoint_writer = None
 
-    trainer_class = ShardedTrainer if args.sharded else SimpleTrainer
-    trainer = trainer_class(
+    trainer_args = dict(
         model=nnue,
-        optimizer=optimizer,
-        schedulers=schedulers,
         max_epochs=args.max_epochs,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         gradient_clip_val=2.0,
@@ -490,8 +483,13 @@ def main():
         world_size=world_size,
         local_rank=local_rank,
         checkpoint_writer=checkpoint_writer,
-        step_runner=step_runner,
     )
+    if args.sharded:
+        trainer = ShardedTrainer(step_runner=step_runner, **trainer_args)
+    else:
+        trainer = SimpleTrainer(
+            optimizer=optimizer, schedulers=schedulers, **trainer_args
+        )
 
     if actual_threads > 0:
         t_set_num_threads(actual_threads)
