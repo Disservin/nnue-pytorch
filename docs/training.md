@@ -48,7 +48,8 @@ GPUs and every rank file; a DDP checkpoint keeps resuming with DDP. Resuming
 from a `.pt` model works in both modes, but sharding starts a fresh
 optimizer.
 
-See [Multi-GPU benchmark notes](benchmark_results.md) for measurements.
+See [Sharded multi-GPU training](sharded_training.md) for how it works and
+what it was measured to gain.
 
 ## Local trainer development
 
