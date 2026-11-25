@@ -498,8 +498,12 @@ Single-GPU numbers are loader-bursty (the queue ran dry on 78% of fetches at
 32 workers) but the GPU was the limiting side in the measured window. Both
 multi-GPU runs had a full device queue, so DDP is GPU/communication bound.
 The sharded run uses the guarded bucketed L1 bias reduction and dense replica
-gradient overlap by default; its communication is one 16.8 MiB L1
-reduce-scatter, one 16.8 MiB all-gather and the replicated tail reduction.
+gradient overlap by default. Its communication per step is dominated by the
+feature exchange: each rank's packed active features (~50 MiB for this
+feature set and batch at ~190 active features/position) are all-gathered so
+both ranks can run their FT column shard on every position. It also has one
+16.8 MiB L1 reduce-scatter, one 16.8 MiB gradient all-gather and the
+replicated tail reduction.
 
 The earlier benchmark-script measurement on the same host and data, with
 bucketed bias disabled and replica overlap explicitly off, was 22.2 it/s
@@ -514,3 +518,31 @@ and a second epoch resumed from those files at the same throughput.
 This comparison is a throughput measurement. The existing two-rank NCCL test
 compares sharded and full-model AdamW gradients, losses, parameters and
 optimizer state; no convergence or net-strength comparison was performed.
+
+### Can two GPUs beat one on this host?
+
+At the recipe's global batch of 131072 they do not: sharded training matches
+one GPU (26.7 it/s) rather than exceeding it. A two-rank Nsight Systems
+capture attributes about 6 ms/step to the FT forward and tiled/aggregated
+backward at half width, 2-3 ms to the L1 reduce-scatter, and about 8 ms to
+the three all-gathers, plus the same optimizer, clipping and host overheads
+as one GPU. The compute saved by halving FT/L1 width is therefore spent on
+the feature and activation exchange.
+
+Measured attempts to close that gap, each with the same recipe and data:
+
+| Change | Result |
+| --- | --- |
+| Tiled FT backward instead of the aggregated kernel, prep built at gather time | FT backward kernel 11.6 -> 4.2 ms, but the tile preparation (sort + one host sync) cancels the gain; 26.7 it/s |
+| Same, with a sync-free preparation sized from the gather's host entry count | global sort costs what the tile sort's sync cost; 26.7 it/s |
+| Uniform loss normalization when `w1 == 0` (drops the denominator all-reduce) | 26.7 it/s; the reduction was already overlapped |
+| Host-size exchange over Gloo with no NCCL `wait()` | invalid: NCCL output readiness is not stream-ordered, so the unpack raced and faulted |
+| Global batch 262144 (per-GPU batch 131072) | two GPUs 13.3 it/s of 262144 = 3.49M positions/s; one GPU 10.0 it/s of 262144 = 2.62M positions/s; one GPU at 131072 = 3.5M positions/s |
+
+So two GPUs are 1.33x one GPU when both are given a 262144 batch, but they
+still do not exceed one GPU running the recipe's 131072 batch in
+positions/s. The remaining lever is the size of the feature exchange
+(16-bit ID packing, including a separate escape for the 17-bit K32H3 rows,
+would save roughly 5-10%); removing the L1 gradient all-gather would change
+each shard's gradients to local positions only, which the parity tests in
+this branch deliberately avoid.
