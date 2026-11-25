@@ -76,11 +76,15 @@ class TrainingConfig:
     seed: int = 42
     """Torch seed to use."""
 
-    sharded: bool = False
-    """Split the feature transformer and L1 weights across the ranks instead of
-    replicating them in DDP. Removes the full-batch FT gradient all-reduce,
-    which dominates multi-GPU step time on PCIe-only systems. Requires AdamW
-    and at least two processes; checkpoints are full-model compatible."""
+    multi_gpu: Literal["auto", "sharded", "ddp"] = "auto"
+    """How to split work across several processes (torchrun). 'sharded' splits
+    the feature transformer and L1 weights across the GPUs, which avoids
+    all-reducing the full FT gradient every step: much faster without NVLink
+    and about even with it, at less memory per GPU. It needs CUDA, AdamW, no
+    SWA and an L1 size divisible by twice the GPU count. 'ddp' replicates the
+    model on every GPU. 'auto' shards when that is supported and otherwise
+    uses DDP; resuming from a .ckpt keeps the mode the checkpoint was saved
+    with. Ignored for single-process runs."""
 
     resume_from_model: str | None = None
     """Initializes training using the weights from the given .pt model."""

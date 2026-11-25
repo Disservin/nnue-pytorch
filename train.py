@@ -36,7 +36,7 @@ from trainer.checkpoint_writer import AsyncCheckpointWriter
 from trainer.engine import SimpleTrainer, init_distributed
 from trainer.loggers import CSVLogger, TensorBoardLogger
 from trainer.sharded_adamw import ShardedAdamWStep
-from trainer.sharded_trainer import ShardedTrainer
+from trainer.sharded_trainer import ShardedTrainer, is_sharded_checkpoint
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
@@ -179,6 +179,44 @@ def prepare_stack_table(args) -> None:
             )
 
 
+def _use_sharding(args, accelerator: str, world_size: int) -> bool:
+    """Resolve --multi-gpu: True for FT/L1 sharding, False for DDP."""
+    if world_size < 2 or args.multi_gpu == "ddp":
+        if (
+            world_size > 1
+            and args.resume_from_checkpoint
+            and is_sharded_checkpoint(args.resume_from_checkpoint)
+        ):
+            raise ValueError(
+                f"{args.resume_from_checkpoint} was saved by sharded training; "
+                "resume it with --multi-gpu auto or sharded"
+            )
+        return False
+
+    reasons = []
+    if accelerator != "cuda":
+        reasons.append("it needs CUDA")
+    if args.nnue_config.optimizer_config.optimizer_name.lower() != "adamw":
+        reasons.append("it supports only the AdamW optimizer")
+    if 0 <= args.swa_start_epoch < args.max_epochs:
+        reasons.append("it does not support SWA")
+    l1 = args.nnue_config.model_config.L1
+    if l1 % (2 * world_size):
+        reasons.append(f"L1={l1} is not divisible by 2 x {world_size} GPUs")
+    if args.resume_from_checkpoint and not is_sharded_checkpoint(
+        args.resume_from_checkpoint
+    ):
+        reasons.append("the resumed checkpoint was saved by DDP training")
+
+    if not reasons:
+        return True
+    if args.multi_gpu == "sharded":
+        raise ValueError("--multi-gpu sharded: " + "; ".join(reasons))
+    if is_master_process():
+        print("Multi-GPU: using DDP instead of sharding because " + "; ".join(reasons))
+    return False
+
+
 def main():
     args = tyro.cli(TrainingConfig)
     actual_threads, actual_workers = args.threads, args.num_workers
@@ -266,9 +304,10 @@ def main():
 
     max_epoch = args.max_epochs or 800
     prepare_stack_table(args)
-    sharding = (rank, world_size) if args.sharded else None
-    if sharding is not None and world_size < 2:
-        raise ValueError("--sharded requires at least two processes (torchrun)")
+    sharded = _use_sharding(args, accelerator, world_size)
+    sharding = (rank, world_size) if sharded else None
+    if is_master_process() and world_size > 1:
+        print(f"Multi-GPU: {'sharded FT/L1' if sharded else 'DDP'} over {world_size} processes")
     if args.resume_from_model is None:
         if args.nnue_config.init_seed >= 0:
             torch.manual_seed(args.nnue_config.init_seed)
@@ -293,6 +332,8 @@ def main():
             nnue = resume
             nnue.train()
         else:
+            if not isinstance(resume, M.NNUE):
+                raise ValueError(f"{args.resume_from_model} is not an NNUE model")
             nnue = M.NNUE(
                 config=args.nnue_config,
                 max_epoch=max_epoch,
@@ -300,19 +341,9 @@ def main():
                 param_index=args.dataloader_config.param_index,
                 sharding=sharding,
             )
-            full_model = resume.model if isinstance(resume, M.NNUE) else None
-            if full_model is None:
-                raise ValueError(
-                    "--resume-from-model must be a full NNUE model for --sharded"
-                )
-            nnue.model.load_unsharded(full_model)
-            if isinstance(resume, M.NNUE):
-                nnue.lambda_scheduler.load_state_dict(
-                    resume.lambda_scheduler.state_dict()
-                )
-                nnue.lambda_scheduler.jitter_buffer.copy_(
-                    resume.lambda_scheduler.jitter_buffer
-                )
+            nnue.model.load_unsharded(resume.model)
+            nnue.lambda_scheduler.load_state_dict(resume.lambda_scheduler.state_dict())
+            nnue.lambda_scheduler.jitter_buffer.copy_(resume.lambda_scheduler.jitter_buffer)
         # we can set the following here just like that because when resuming
         # from .pt the optimizer is only created after the training is started
         nnue.max_epoch = max_epoch
@@ -376,7 +407,7 @@ def main():
         # On MPS, torch.compile is currently unstable
         if is_master_process():
             print("Disabling torch.compile for accelerator='mps'.")
-    elif args.sharded:
+    elif sharded:
         # The distributed forward contains collectives and must stay eager;
         # ShardedAdamWStep compiles the local FT merge, tail and loss pieces.
         torch._dynamo.config.cache_size_limit = 64
@@ -400,11 +431,7 @@ def main():
     else:
         device = torch.device("cpu")
 
-    if args.sharded:
-        if 0 <= args.swa_start_epoch < args.max_epochs:
-            raise ValueError("--swa-start-epoch is not supported with --sharded")
-        if accelerator != "cuda":
-            raise ValueError("--sharded currently requires CUDA/NCCL")
+    if sharded:
         # The runner broadcasts replicated parameters during construction, so
         # the model must already be on its rank's device.
         nnue.to(device)
@@ -433,7 +460,7 @@ def main():
         world_size=world_size,
         # The sharded FT backward does not use the tiled preparation.
         prefetch_hook=(
-            nnue.prefetch_hook() if accelerator == "cuda" and not args.sharded else None
+            nnue.prefetch_hook() if accelerator == "cuda" and not sharded else None
         ),
     )
 
@@ -464,7 +491,7 @@ def main():
 
     # The sharded trainer writes rank-local state before the merged checkpoint,
     # so it takes the synchronous path (the writer only owns rank 0's file).
-    if rank == 0 and args.async_checkpoint_save and not args.sharded:
+    if rank == 0 and args.async_checkpoint_save and not sharded:
         checkpoint_writer = AsyncCheckpointWriter()
     else:
         checkpoint_writer = None
@@ -484,7 +511,7 @@ def main():
         local_rank=local_rank,
         checkpoint_writer=checkpoint_writer,
     )
-    if args.sharded:
+    if sharded:
         trainer = ShardedTrainer(step_runner=step_runner, **trainer_args)
     else:
         trainer = SimpleTrainer(

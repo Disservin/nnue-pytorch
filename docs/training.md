@@ -21,31 +21,34 @@ additional CPU and memory resources for engine testing.
 
 ## Multi-GPU training
 
-The default multi-process mode wraps the model in DDP, which replicates the
-feature transformer on every rank and all-reduces its full gradient. That
-gradient is the largest tensor in the network; on hosts without NVLink it can
-dominate step time and make two GPUs slower than one.
-
-`--sharded` splits the feature transformer and L1 weights across the ranks
-instead. Each rank stores one paired-column shard and the replicated tail; the
-distributed forward exchanges L1 activations with a reduce-scatter/all-gather
-pair, so the multi-hundred-MiB weight gradient is never reduced. Use it with
-AdamW and at least two processes:
+Launch one process per GPU with `torchrun`:
 
 ```
-torchrun --standalone --nproc-per-node=2 ddp_launcher.py train.py \
-    --sharded [the usual training options]
+torchrun --standalone --nproc-per-node=2 ddp_launcher.py train.py [the usual training options]
 ```
 
-Checkpoints stay compatible with the rest of the tooling: rank 0 writes the
-normal full-model checkpoint, and every rank additionally writes
-`<checkpoint>.rankN` with its shard weights, AdamW moments, schedulers and RNG.
-Resuming requires the same world size and every rank's state file; resuming
-from a plain `.pt` model initialises the shards but starts a fresh optimizer.
-SWA and non-CUDA backends are not supported in this mode.
+By default (`--multi-gpu auto`) the feature transformer and L1 weights are
+split across the GPUs. Each GPU stores one column shard of them plus a copy
+of the small remaining layers, and the GPUs exchange the active features and
+L1 activations of the batch instead of all-reducing the full FT gradient
+(hundreds of MiB) every step. Without NVLink this makes multi-GPU training
+several times faster than DDP; with NVLink both are about even, and sharding
+uses less memory per GPU.
 
-See [Multi-GPU benchmark notes](benchmark_results.md) for measured throughput
-on PCIe-only and NVLink hosts and for the communication accounting.
+Sharding needs CUDA, the AdamW optimizer, no SWA, and an L1 size divisible by
+twice the number of GPUs. When one of these does not hold, `auto` falls back
+to DDP and prints why. `--multi-gpu sharded` makes that an error instead, and
+`--multi-gpu ddp` always replicates the model.
+
+Sharded checkpoints are full-model checkpoints written by rank 0, so the
+conversion and evaluation tools read them as usual. Every rank also writes
+`<checkpoint>.rankN` with its shard's AdamW state, schedulers and RNG.
+Resuming from such a checkpoint keeps sharding and needs the same number of
+GPUs and every rank file; a DDP checkpoint keeps resuming with DDP. Resuming
+from a `.pt` model works in both modes, but sharding starts a fresh
+optimizer.
+
+See [Multi-GPU benchmark notes](benchmark_results.md) for measurements.
 
 ## Local trainer development
 

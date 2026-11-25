@@ -26,6 +26,12 @@ if typing.TYPE_CHECKING:  # pragma: no cover
 CHECKPOINT_FORMAT = "nnue-sharded-v1"
 
 
+def is_sharded_checkpoint(path: str) -> bool:
+    """Whether *path* was written by ShardedTrainer (memory-mapped, cheap)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    return isinstance(checkpoint, dict) and checkpoint.get("format") == CHECKPOINT_FORMAT
+
+
 class ShardedTrainer(SimpleTrainer):
     """Train a ``ShardedNNUEModel`` with a ``ShardedAdamWStep`` runner.
 
