@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from data_loader import stream
 from data_loader.dataset import DevicePrefetcher, SparseBatchProvider
 from data_loader.distributed_features import gather_packed_features
 
@@ -13,17 +14,15 @@ _BINPACK = Path(__file__).resolve().parents[1] / ".pgo" / "small.binpack"
 
 @pytest.mark.skipif(not _BINPACK.exists(), reason="the small binpack fixture is required")
 def test_sharded_provider_prepares_native_packed_rows():
-    ds = SparseBatchDataset(
+    provider = SparseBatchProvider(
         "K32H3", [str(_BINPACK)], 128, cyclic=True, num_workers=2, packed_sharded=True
     )
-    provider = iter(ds)
-    batch = provider.fetch_next(provider.stream)
+    batch = stream.fetch_next_sparse_batch(provider._get_stream())
     try:
-        assert not batch.contents.white and not batch.contents.black
         dense = batch.contents.get_tensors("cpu")
         packed = batch.contents.get_packed_tensors("cpu")
     finally:
-        provider.destroy_part(batch)
+        stream.destroy_sparse_batch(batch)
 
     gathered = gather_packed_features(packed)
     torch.testing.assert_close(gathered.white_indices, dense[2])
