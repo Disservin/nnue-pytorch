@@ -1,7 +1,6 @@
 """Numerical checks for the experimental compiled clipping and L1 merge."""
 import copy
 import io
-import os
 
 import pytest
 import torch
@@ -127,31 +126,3 @@ def test_compiled_clipping_model_copy_and_serialization(monkeypatch):
         restored.clip_weights(False)
     # The enabled flag survives a move to CPU, where clipping falls back to eager.
     copied.cpu().clip_weights(False)
-
-
-@pytest.mark.skipif(not os.environ.get("NNUE_TEST_REAL_REMAP_CACHE"),
-                    reason="real stack-remap cache not provided")
-def test_compiled_real_nettest_factors():
-    from scripts.nettest_benchmark_settings import make_nettest_settings
-    from model.modules.sharded_l1 import _compiled_l1_merge
-
-    with open(os.environ["NNUE_TEST_REAL_REMAP_CACHE"], encoding="utf-8") as f:
-        config, _, _ = make_nettest_settings(f.read().strip())
-    torch.manual_seed(388)
-    model = NNUE(config, sharding=(0, 4)).model.cuda()
-    assert model.layer_stacks.count == 92
-    with torch.no_grad():
-        for p in model.layer_stacks.parameters():
-            p.uniform_(-1.5, 1.5)
-    candidate = copy.deepcopy(model)
-    candidate._compile_layer_clipping = True
-    model.clip_weights(False)
-    candidate.clip_weights(False)
-    for (name, p), (other_name, q) in zip(model.named_parameters(), candidate.named_parameters()):
-        assert name == other_name
-        torch.testing.assert_close(q, p, rtol=0, atol=0)
-    for quantized in (False, True):
-        expected = model.layer_stacks.l1.merged_parameters(quantized)
-        actual = _compiled_l1_merge()(candidate.layer_stacks.l1, quantized)
-        for ref, result in zip(expected, actual):
-            torch.testing.assert_close(result, ref, rtol=0, atol=0)

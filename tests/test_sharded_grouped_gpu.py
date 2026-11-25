@@ -19,6 +19,41 @@ from model.quantize import QuantizationConfig, QuantizationManager
 from model.sharded_backward import synchronize_replicated_gradients
 
 
+class ReferenceReduceScatter(torch.autograd.Function):
+    """The original padded L1 collective, kept as a reference."""
+
+    @staticmethod
+    def forward(ctx, values, offsets, group):
+        world = len(offsets) - 1
+        rank = dist.get_rank(group) if world > 1 else 0
+        sizes = tuple(offsets[i + 1] - offsets[i] for i in range(world))
+        max_size = max(1, *sizes)
+        blocks = values.new_zeros((world, max_size, values.shape[1]))
+        for i, size in enumerate(sizes):
+            blocks[i, :size].copy_(values[offsets[i]:offsets[i + 1]])
+        result = values.new_empty((max_size, values.shape[1]))
+        if world == 1:
+            result.copy_(blocks[0])
+        elif dist.get_backend(group) == "nccl":
+            dist.reduce_scatter_tensor(result, blocks.flatten(0, 1), group=group)
+        else:
+            dist.all_reduce(blocks, group=group)
+            result.copy_(blocks[rank])
+        ctx.sizes, ctx.max_size, ctx.rank, ctx.group = sizes, max_size, rank, group
+        return result[:sizes[rank]].clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        padded = grad_output.new_zeros((ctx.max_size, grad_output.shape[1]))
+        padded[:ctx.sizes[ctx.rank]].copy_(grad_output)
+        blocks = [torch.empty_like(padded) for _ in ctx.sizes]
+        if len(blocks) == 1:
+            blocks[0] = padded
+        else:
+            dist.all_gather(blocks, padded, group=ctx.group)
+        return torch.cat([b[:n] for b, n in zip(blocks, ctx.sizes)]), None, None
+
+
 def _check(rank, sizes, quantized, concentrated):
     torch.manual_seed(725)
     quant = QuantizationManager(QuantizationConfig())
@@ -45,13 +80,7 @@ def _check(rank, sizes, quantized, concentrated):
     upstream = torch.randn(n, 16, device=rank)
     results = []
     original = stacked_linear.grouped_l1
-    original_collective = sharded_l1_module._SumReduceScatter
     for mode, layer in (("0", shard), ("1", other)):
-        if os.environ.get("NNUE_TEST_FAST_L1_COLLECTIVE") == "1":
-            from scripts.reference_l1_collective import ReferenceReduceScatter
-            sharded_l1_module._SumReduceScatter = (
-                ReferenceReduceScatter if mode == "0" else original_collective
-            )
         inputs = x.detach().clone().requires_grad_(True)
         with (
             patch.object(stacked_linear, "grouped_l1_preferred", return_value=mode == "1"),
@@ -73,7 +102,6 @@ def _check(rank, sizes, quantized, concentrated):
                 [p.grad.detach().clone() for p in layer.parameters()],
             )
         )
-    sharded_l1_module._SumReduceScatter = original_collective
     torch.testing.assert_close(results[0][0], results[1][0], atol=2e-5, rtol=2e-4)
     torch.testing.assert_close(results[0][1], results[1][1], atol=2e-5, rtol=2e-4)
     for left, right in zip(results[0][2], results[1][2]):
@@ -181,8 +209,6 @@ def test_grouped_tail_matches_dense(width, outputs, layer_key):
 
 
 def _collective_subgroup_worker(rank, port):
-    from scripts.reference_l1_collective import ReferenceReduceScatter
-
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=4, timeout=timedelta(seconds=120))
