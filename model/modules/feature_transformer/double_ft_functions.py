@@ -16,8 +16,6 @@ def double_feature_transform(
     backend: str = "auto",
     *,
     sharded_backward: bool = False,
-    packed_payload: torch.Tensor | None = None,
-    packed_feature_width: int | None = None,
 ) -> torch.Tensor:
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
@@ -35,9 +33,6 @@ def double_feature_transform(
         impl = "fused" if cuda_capable else "torch"
     else:
         impl = backend
-
-    if packed_payload is not None and impl != "fused":
-        raise ValueError("packed FT ranges require the fused CUDA backend")
 
     if impl == "fused":
         if not cupy_available:
@@ -58,8 +53,6 @@ def double_feature_transform(
             max_ft_activation,
             l1_size,
             sharded_backward,
-            packed_payload,
-            packed_feature_width,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":

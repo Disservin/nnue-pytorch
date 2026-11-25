@@ -13,7 +13,6 @@ from data_loader import stream
 from data_loader.distributed_features import (
     _unpack_rows,
     _unpack_rows_reference,
-    begin_native_packed_features,
     gather_packed_features,
     unpack_counted_rows,
     unpack_distributed_rows,
@@ -31,47 +30,6 @@ def _batch(rank, n, width=7):
     targets = torch.full((n, 1), rank, dtype=torch.float32)
     stacks = torch.arange(n, dtype=torch.int64) + rank * 100
     return us, 1 - us, white, black, targets, targets + 1, stacks
-
-
-def _pack_dense_batch(batch):
-    us, them, white, black, outcome, score, stacks = batch
-    n, width = white.shape
-    wm, bm = white >= 0, black >= 0
-    wi, bi = white[wm], black[bm]
-    zero = torch.zeros(1, dtype=torch.int32, device=white.device)
-    wo = torch.cat((zero, wm.sum(1, dtype=torch.int32).cumsum(0, dtype=torch.int32)))
-    bo = torch.cat((zero, bm.sum(1, dtype=torch.int32).cumsum(0, dtype=torch.int32)))
-    packed = torch.cat((wo, bo, wi, bi, stacks.int()))
-    native = {"format": "native_offsets_v1", "packed": packed, "size": n,
-              "width": width, "nw": wi.numel(), "nb": bi.numel()}
-    return us, them, native, None, outcome, score, stacks
-
-
-def _check_packed_matches_dense(batch):
-    expected = gather_packed_features(batch)
-    actual = gather_packed_features(_pack_dense_batch(batch))
-    for field in ("us", "them", "white_indices", "black_indices", "layer_stack_indices"):
-        assert torch.equal(getattr(actual, field), getattr(expected, field))
-    assert actual.offsets == expected.offsets
-    native = _pack_dense_batch(batch)
-    if batch[0].is_cuda:
-        producer = torch.cuda.Stream(device=batch[0].device)
-        producer.wait_stream(torch.cuda.current_stream(batch[0].device))
-        with torch.cuda.stream(producer):
-            pending = begin_native_packed_features(native)
-    else:
-        pending = begin_native_packed_features(native)
-    asynchronous = pending.finish()
-    assert pending.finish() is asynchronous
-    for field in ("us", "them", "white_indices", "black_indices", "layer_stack_indices"):
-        assert torch.equal(getattr(asynchronous, field), getattr(expected, field))
-    assert asynchronous.offsets == expected.offsets
-
-
-def test_packed_batch_respects_replaced_stack_tensor():
-    batch = _pack_dense_batch(_batch(0, 3))
-    batch = (*batch[:6], torch.tensor([-8, 42, 123], dtype=torch.int64))
-    assert torch.equal(gather_packed_features(batch).layer_stack_indices, batch[6])
 
 
 def _check(rank, sizes, device="cpu", width=7):
@@ -94,7 +52,6 @@ def _check(rank, sizes, device="cpu", width=7):
         offsets.append(offsets[-1] + size)
     assert result.offsets == tuple(offsets)
     assert result.local_slice == slice(offsets[rank], offsets[rank + 1])
-    _check_packed_matches_dense(batches[rank])
 
 
 def _worker(rank, port):
@@ -109,11 +66,6 @@ def _worker(rank, port):
         # Width mismatch is detected by every rank before the payload gather.
         batch = _batch(rank, 2, width=8 if rank == 0 else 7)
         with pytest.raises(ValueError, match="same maximum"):
-            gather_packed_features(batch)
-        batch = _batch(rank, 2)
-        if rank == 0:
-            batch = _pack_dense_batch(batch)
-        with pytest.raises(ValueError, match="same feature batch format"):
             gather_packed_features(batch)
     finally:
         dist.destroy_process_group()
@@ -150,30 +102,6 @@ def test_native_loader_batch():
         stream.destroy_sparse_batch(ptr)
 
 
-def test_native_packed_survives_release():
-    fens = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "8/8/8/4k3/8/3K4/8/8 b - - 0 1"]
-    ptr = stream.get_sparse_batch_from_fens(
-        "Full_Threats+PP_3Wide+K32H3", fens, [0, 10], [1, 0], [0, 1]
-    )
-    try:
-        dense = ptr.contents.get_tensors("cpu")
-        packed = ptr.contents.get_packed_tensors("cpu")
-    finally:
-        stream.destroy_sparse_batch(ptr)
-    expected, actual = gather_packed_features(dense), gather_packed_features(packed)
-    for field in ("us", "them", "white_indices", "black_indices", "layer_stack_indices"):
-        assert torch.equal(getattr(actual, field), getattr(expected, field))
-    assert torch.equal(packed[4], dense[4]) and torch.equal(packed[5], dense[5])
-
-
-def test_native_packing_rejects_python_owned_batch():
-    from data_loader._native import SparseBatch
-
-    with pytest.raises(ValueError, match="native-owned"):
-        SparseBatch().get_packed_tensors("cpu")
-
-
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="Gloo is unavailable",
@@ -193,11 +121,6 @@ def _nccl_worker(rank, port):
         for sizes in ([3, 3, 3, 3], [1, 0, 4, 2], [0, 0, 0, 0]):
             _check(rank, sizes, device=torch.device("cuda", rank))
         _check(rank, [3, 0, 1, 2], device=torch.device("cuda", rank), width=0)
-        mixed = tuple(t.cuda(rank) for t in _batch(rank, 2))
-        if rank == 0:
-            mixed = _pack_dense_batch(mixed)
-        with pytest.raises(ValueError, match="same feature batch format"):
-            gather_packed_features(mixed)
         batches = []
         for i, n in enumerate([2, 0, 3, 1]):
             batch = list(_batch(i, n))
@@ -296,10 +219,7 @@ def test_fused_unpack_empty_rows_noncurrent_device(width, streamed):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None
                     or unpack_distributed_rows is None, reason="NVIDIA CUDA and Triton required")
 def test_variable_payload_lengths_do_not_recompile_decoder():
-    from data_loader._cuda_transport import (
-        _unpack_distributed_kernel, _unpack_native_distributed_kernel,
-        unpack_native_distributed_rows,
-    )
+    from data_loader._cuda_transport import _unpack_distributed_kernel
     if not hasattr(_unpack_distributed_kernel, "device_caches"):
         pytest.skip("Triton does not expose a per-device kernel cache")
     torch.cuda.set_device(0)
@@ -311,11 +231,8 @@ def test_variable_payload_lengths_do_not_recompile_decoder():
     dense_payload = torch.cat((wm.sum(1, dtype=torch.int32), bm.sum(1, dtype=torch.int32),
                                u.flatten().view(torch.int32), v.flatten().view(torch.int32),
                                stacks.int(), wi, bi))
-    native = _pack_dense_batch(batch)[2]["packed"]
-    native_payload = torch.cat((native, u.flatten().view(torch.int32), v.flatten().view(torch.int32)))
     for kernel, fn, source in (
         (_unpack_distributed_kernel, unpack_distributed_rows, dense_payload),
-        (_unpack_native_distributed_kernel, unpack_native_distributed_rows, native_payload),
     ):
         expected_cache_size = None
         for extra in (0, 1, 17, 257):
@@ -335,13 +252,9 @@ def test_variable_payload_lengths_do_not_recompile_decoder():
             cwm, cbm = cw >= 0, cb >= 0
             cwi, cbi = cw[cwm], cb[cbm]
             new_dims = [(n, 7, cwi.numel(), cbi.numel())]
-            if kernel is _unpack_native_distributed_kernel:
-                payload = torch.cat((_pack_dense_batch(changed)[2]["packed"],
-                                     cu.flatten().view(torch.int32), cv.flatten().view(torch.int32)))
-            else:
-                payload = torch.cat((cwm.sum(1, dtype=torch.int32), cbm.sum(1, dtype=torch.int32),
-                                     cu.flatten().view(torch.int32), cv.flatten().view(torch.int32),
-                                     cs.int(), cwi, cbi))
+            payload = torch.cat((cwm.sum(1, dtype=torch.int32), cbm.sum(1, dtype=torch.int32),
+                                 cu.flatten().view(torch.int32), cv.flatten().view(torch.int32),
+                                 cs.int(), cwi, cbi))
             result = fn(payload.unsqueeze(0), new_dims, 7)
             torch.testing.assert_close(result[2], cw, rtol=0, atol=0)
             torch.testing.assert_close(result[3], cb, rtol=0, atol=0)

@@ -47,7 +47,7 @@ def _batch(rank, n, step):
     return tuple(values)
 
 
-def _worker(rank, port, batch_jitter, experimental=False):
+def _worker(rank, port, batch_jitter, overlap=False):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -57,14 +57,8 @@ def _worker(rank, port, batch_jitter, experimental=False):
         model_module.get_feature_cls = lambda _: [_Feature]
         sharded_model_module.get_feature_cls = lambda _: [_Feature]
         config = _config()
-        options = {}
-        if experimental:
-            config.loss_params.w1 = 0
-            options = {
-                "uniform_loss": True,
-                "overlap_replica_gradients": True,
-                "direct_packed_ft": True,
-            }
+        # Overlap is NCCL-only by default; force it to test the Gloo path.
+        options = {"overlap_replica_gradients": overlap}
         if batch_jitter:
             cfg = config.loss_params.lambda_config
             cfg.start_lambda = cfg.end_lambda = 0.5
@@ -101,11 +95,9 @@ def _worker(rank, port, batch_jitter, experimental=False):
         snapshot = None
         for step in range(3):
             sizes = ([2, 0, 3, 1], [1, 2, 0, 4], [0, 1, 4, 1])[step]
-            if experimental:
-                if step < 2:
-                    sizes = [2] * 4
-                else:
-                    config.loss_params.w1 = 8
+            if overlap and step < 2:
+                # Overlap applies only to equal local batches.
+                sizes = [2] * 4
             batches = [_batch(i, n, step) for i, n in enumerate(sizes)]
             global_batch = tuple(
                 torch.cat([part[i] for part in batches]) for i in range(7)
@@ -123,12 +115,6 @@ def _worker(rank, port, batch_jitter, experimental=False):
             torch.nn.utils.clip_grad_norm_(full.model.parameters(), 0.2)
             reference_optimizer.step()
             got = runner.step(batches[rank])
-            if experimental:
-                assert runner.last_experiments == {
-                    "uniform_loss": step < 2,
-                    "overlap_replica_gradients": step < 2,
-                    "direct_packed_ft": False,
-                }
             torch.testing.assert_close(got, loss.detach(), atol=3e-6, rtol=2e-5)
             if batch_jitter:
                 jitter = sharded.lambda_scheduler.jitter_buffer
@@ -188,15 +174,15 @@ def _worker(rank, port, batch_jitter, experimental=False):
     not dist.is_available() or not dist.is_gloo_available(), reason="Gloo unavailable"
 )
 @pytest.mark.parametrize(
-    ("batch_jitter", "experimental"),
+    ("batch_jitter", "overlap"),
     [(False, False), (True, False), (True, True)],
-    ids=["no-jitter", "batch-jitter", "experimental"],
+    ids=["no-jitter", "batch-jitter", "overlap"],
 )
-def test_four_rank_adamw_and_resume(batch_jitter, experimental):
+def test_four_rank_adamw_and_resume(batch_jitter, overlap):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, batch_jitter, experimental), nprocs=4, join=True)
+    mp.spawn(_worker, args=(port, batch_jitter, overlap), nprocs=4, join=True)
 
 
 def test_reject_non_adamw():
@@ -221,12 +207,6 @@ def test_compilation_selection_on_cpu(monkeypatch):
     monkeypatch.setattr(requested, "enable_compiled_loss", lambda: calls.append("loss"))
     assert ShardedAdamWStep(requested, compile_model=True).compile_model
     assert calls == [{"fullgraph": True}, {}, "loss"]
-    invalid = NNUE(_config(), sharding=(0, 1))
-    with pytest.raises(TypeError, match="compile_model"):
-        ShardedAdamWStep(invalid, compile_model="yes")
-    invalid_bias = NNUE(_config(), sharding=(0, 1))
-    with pytest.raises(TypeError, match="bucketed_bias"):
-        ShardedAdamWStep(invalid_bias, bucketed_bias="yes")
 
 
 def test_real_features_allocate_only_shard_width():

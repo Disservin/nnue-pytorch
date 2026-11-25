@@ -42,19 +42,14 @@ def global_weighted_loss(
 
 def backward_weighted_loss(
     local_numerator, local_weight, replicated_parameters, group=None, *,
-    global_count=None, ft_backward=None,
+    ft_backward=None,
 ):
     """Backpropagate the local weighted contribution, then sum replica gradients.
 
     Start with cleared gradients and call exactly once per optimizer step on
     every rank. Returns the detached local contribution, not the global loss.
     """
-    if global_count is None:
-        loss = global_weighted_loss(local_numerator, local_weight, group)
-    else:
-        if global_count <= 0:
-            raise ValueError("global loss weight must be finite and positive")
-        loss = local_numerator / global_count
+    loss = global_weighted_loss(local_numerator, local_weight, group)
     loss.backward()
     if ft_backward is None:
         synchronize_replicated_gradients(replicated_parameters, group)

@@ -47,9 +47,7 @@ def remap_tablebase_score(
     return torch.where(is_mate, remapped_score, score)
 
 
-def calculate_sf_loss_components(
-    scorenet, score, outcome, loss_params, actual_lambda, *, uniform_weights=False
-):
+def calculate_sf_loss_components(scorenet, score, outcome, loss_params, actual_lambda):
     """Return the weighted loss numerator and target-derived weight sum."""
     score = remap_tablebase_score(
         score,
@@ -78,9 +76,6 @@ def calculate_sf_loss_components(
     loss = torch.pow(torch.abs(pt - qf), loss_params.pow_exp)
     if loss_params.qp_asymmetry != 0.0:
         loss = loss * ((qf > pt) * loss_params.qp_asymmetry + 1)
-
-    if uniform_weights:
-        return loss.sum(), None
 
     weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow(
         (pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2
@@ -459,15 +454,13 @@ class NNUE(nn.Module):
         current_step: int,
         *,
         batch_jitter_generator: torch.Generator | None = None,
-        uniform_weights: bool = False,
     ):
         """Return local weighted numerator and denominator for sharded training."""
         scorenet, score, outcome, actual_lambda = self._loss_inputs(
             scorenet, batch, current_step, batch_jitter_generator=batch_jitter_generator
         )
         return self._sf_loss_components_fn(
-            scorenet, score, outcome, self.config.loss_params, actual_lambda,
-            uniform_weights=uniform_weights,
+            scorenet, score, outcome, self.config.loss_params, actual_lambda
         )
 
     def _loss_inputs(
