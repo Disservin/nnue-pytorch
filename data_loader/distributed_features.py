@@ -5,13 +5,6 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-try:
-    from ._cuda_transport import unpack_counted_rows, unpack_distributed_rows
-except ImportError:
-    unpack_counted_rows = None
-    unpack_distributed_rows = None
-
-
 @dataclass(frozen=True)
 class GlobalFeatureBatch:
     us: torch.Tensor
@@ -29,7 +22,20 @@ class GlobalFeatureBatch:
         return slice(self.offsets[self.rank], self.offsets[self.rank + 1])
 
 
-def _unpack_rows_reference(counts: torch.Tensor, ids: torch.Tensor, width: int) -> torch.Tensor:
+try:
+    from ._cuda_transport import unpack_counted_rows
+except ImportError:
+    unpack_counted_rows = None
+
+
+def _unpack_rows(counts: torch.Tensor, ids: torch.Tensor, width: int) -> torch.Tensor:
+    """Rows of ``width`` IDs, -1 padded, holding ``counts[i]`` IDs each."""
+    if counts.is_cuda and torch.version.hip is None and unpack_counted_rows is not None:
+        return unpack_counted_rows(counts, ids, width)
+    return _unpack_rows_torch(counts, ids, width)
+
+
+def _unpack_rows_torch(counts: torch.Tensor, ids: torch.Tensor, width: int) -> torch.Tensor:
     rows = counts.numel()
     result = torch.full((rows, width), -1, dtype=torch.int32, device=counts.device)
     if ids.numel():
@@ -42,16 +48,6 @@ def _unpack_rows_reference(counts: torch.Tensor, ids: torch.Tensor, width: int) 
         column = torch.arange(ids.numel(), device=counts.device) - starts[row]
         result[row, column] = ids
     return result
-
-
-def _unpack_rows(counts: torch.Tensor, ids: torch.Tensor, width: int) -> torch.Tensor:
-    if counts.device.type == "cuda" and torch.version.hip is None and unpack_counted_rows:
-        return unpack_counted_rows(counts, ids, width)
-    return _unpack_rows_reference(counts, ids, width)
-
-
-def _use_fused_unpack(device):
-    return device.type == "cuda" and torch.version.hip is None and unpack_distributed_rows is not None
 
 
 def gather_packed_features(
@@ -131,24 +127,23 @@ def gather_packed_features(
         offsets.append(offsets[-1] + b)
     offsets = tuple(offsets)
 
-    if _use_fused_unpack(white.device):
-        fields = unpack_distributed_rows(gathered, dimensions, width)
-        return GlobalFeatureBatch(*fields, offsets, rank)
-
-    all_us, all_them, all_white, all_black, all_stacks = [], [], [], [], []
+    # Unpack every rank's rows with one call per perspective.
+    us_parts, them_parts, stack_parts = [], [], []
+    white_counts, black_counts, white_ids, black_ids = [], [], [], []
     for packed, (b, _, nw, nb) in zip(gathered, dimensions):
-        wc, bc = packed[:b], packed[b : 2 * b]
-        all_us.append(packed[2 * b : 3 * b].view(torch.float32).reshape(b, 1))
-        all_them.append(packed[3 * b : 4 * b].view(torch.float32).reshape(b, 1))
-        all_stacks.append(packed[4 * b : 5 * b].to(torch.int64))
-        all_white.append(_unpack_rows(wc, packed[5 * b : 5 * b + nw], width))
-        all_black.append(_unpack_rows(bc, packed[5 * b + nw : 5 * b + nw + nb], width))
+        white_counts.append(packed[:b])
+        black_counts.append(packed[b : 2 * b])
+        us_parts.append(packed[2 * b : 3 * b].view(torch.float32).reshape(b, 1))
+        them_parts.append(packed[3 * b : 4 * b].view(torch.float32).reshape(b, 1))
+        stack_parts.append(packed[4 * b : 5 * b].to(torch.int64))
+        white_ids.append(packed[5 * b : 5 * b + nw])
+        black_ids.append(packed[5 * b + nw : 5 * b + nw + nb])
     return GlobalFeatureBatch(
-        torch.cat(all_us),
-        torch.cat(all_them),
-        torch.cat(all_white),
-        torch.cat(all_black),
-        torch.cat(all_stacks),
+        torch.cat(us_parts),
+        torch.cat(them_parts),
+        _unpack_rows(torch.cat(white_counts), torch.cat(white_ids), width),
+        _unpack_rows(torch.cat(black_counts), torch.cat(black_ids), width),
+        torch.cat(stack_parts),
         offsets,
         rank,
     )

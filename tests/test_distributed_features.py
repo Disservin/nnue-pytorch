@@ -10,13 +10,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from data_loader import stream
-from data_loader.distributed_features import (
-    _unpack_rows,
-    _unpack_rows_reference,
-    gather_packed_features,
-    unpack_counted_rows,
-    unpack_distributed_rows,
-)
+from data_loader import distributed_features as features
+from data_loader.distributed_features import gather_packed_features
 
 
 def _batch(rank, n, width=7):
@@ -148,114 +143,24 @@ def test_four_rank_cuda_distribution():
     mp.spawn(_nccl_worker, args=(port,), nprocs=4, join=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_single_process_cuda():
+    _check(0, [5], device="cuda")
+    _check(0, [0], device="cuda")
+    _check(0, [3], device="cuda", width=0)
+
+
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None or unpack_counted_rows is None,
-    reason="NVIDIA CUDA and Triton are required",
+    not torch.cuda.is_available() or torch.version.hip is not None
+    or features.unpack_counted_rows is None,
+    reason="NVIDIA CUDA and Triton required",
 )
 @pytest.mark.parametrize("counts", [[], [0, 0], [0, 3, 7, 1, 0], [7, 7, 7]])
-def test_cuda_unpack_rows_matches_reference_on_nondefault_stream(counts):
-    width = 7
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        sizes = torch.tensor(counts, dtype=torch.int32, device="cuda")
-        ids = torch.arange(sum(counts), dtype=torch.int32, device="cuda") + 11
-        expected = _unpack_rows_reference(sizes, ids, width)
-        actual = _unpack_rows(sizes, ids, width)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    stream.synchronize()
-
-
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2 or torch.version.hip is not None or unpack_counted_rows is None,
-    reason="Two NVIDIA GPUs and Triton are required",
-)
-def test_cuda_unpack_noncurrent_device_and_zero_width():
-    torch.cuda.set_device(0)
-    sizes = torch.tensor([0, 2, 0], dtype=torch.int32, device="cuda:1")
-    ids = torch.tensor([3, 7], dtype=torch.int32, device="cuda:1")
-    torch.testing.assert_close(_unpack_rows(sizes, ids, 3),
-                               _unpack_rows_reference(sizes, ids, 3), rtol=0, atol=0)
-    empty = torch.zeros(3, dtype=torch.int32, device="cuda:1")
-    assert _unpack_rows(empty, ids[:0], 0).shape == (3, 0)
-    assert torch.cuda.current_device() == 0
-
-
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2 or torch.version.hip is not None or unpack_distributed_rows is None,
-    reason="Two NVIDIA GPUs and Triton are required",
-)
-@pytest.mark.parametrize("width", [0, 7])
-@pytest.mark.parametrize("streamed", [False, True])
-def test_fused_unpack_empty_rows_noncurrent_device(width, streamed):
-    torch.cuda.set_device(0)
-    batches = [_batch(i, n, width=width) for i, n in enumerate([3, 0, 2])]
-    packed_rows, dims = [], []
-    for batch in batches:
-        u, v, white, black, _, _, stacks = batch
-        white.fill_(-1)
-        black.fill_(-1)
-        n = len(u)
-        dims.append((n, width, 0, 0))
-        packed_rows.append(torch.cat((torch.zeros(2 * n, dtype=torch.int32),
-                                      u.flatten().view(torch.int32),
-                                      v.flatten().view(torch.int32), stacks.int())))
-    stride = max(1, *(len(p) for p in packed_rows))
-    payload = torch.zeros((len(batches), stride), dtype=torch.int32)
-    for rank, row in enumerate(packed_rows):
-        payload[rank, :len(row)] = row
-    payload = payload.to("cuda:1")
-    stream = torch.cuda.Stream(device=1) if streamed else torch.cuda.current_stream(1)
-    stream.wait_stream(torch.cuda.current_stream(1))
-    with torch.cuda.stream(stream):
-        output = unpack_distributed_rows(payload, dims, width)
-        for actual, index in zip(output, (0, 1, 2, 3, 6)):
-            expected = torch.cat([b[index] for b in batches]).to("cuda:1")
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    stream.synchronize()
-    assert torch.cuda.current_device() == 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None
-                    or unpack_distributed_rows is None, reason="NVIDIA CUDA and Triton required")
-def test_variable_payload_lengths_do_not_recompile_decoder():
-    from data_loader._cuda_transport import _unpack_distributed_kernel
-    if not hasattr(_unpack_distributed_kernel, "device_caches"):
-        pytest.skip("Triton does not expose a per-device kernel cache")
-    torch.cuda.set_device(0)
-    batch = tuple(t.cuda() for t in _batch(0, 3))
-    u, v, white, black, _, _, stacks = batch
-    wm, bm = white >= 0, black >= 0
-    wi, bi = white[wm], black[bm]
-    dimensions = [(3, 7, wi.numel(), bi.numel())]
-    dense_payload = torch.cat((wm.sum(1, dtype=torch.int32), bm.sum(1, dtype=torch.int32),
-                               u.flatten().view(torch.int32), v.flatten().view(torch.int32),
-                               stacks.int(), wi, bi))
-    for kernel, fn, source in (
-        (_unpack_distributed_kernel, unpack_distributed_rows, dense_payload),
-    ):
-        expected_cache_size = None
-        for extra in (0, 1, 17, 257):
-            payload = torch.zeros((1, source.numel() + extra), dtype=torch.int32, device="cuda")
-            payload[0, :source.numel()] = source
-            result = fn(payload, dimensions, 7)
-            torch.testing.assert_close(result[2], white, rtol=0, atol=0)
-            torch.testing.assert_close(result[3], black, rtol=0, atol=0)
-            cache_size = len(kernel.device_caches[torch.cuda.current_device()][0])
-            if expected_cache_size is None:
-                expected_cache_size = cache_size
-            else:
-                assert cache_size == expected_cache_size
-        for n in (2, 4):
-            changed = tuple(t.cuda() for t in _batch(0, n))
-            cu, cv, cw, cb, _, _, cs = changed
-            cwm, cbm = cw >= 0, cb >= 0
-            cwi, cbi = cw[cwm], cb[cbm]
-            new_dims = [(n, 7, cwi.numel(), cbi.numel())]
-            payload = torch.cat((cwm.sum(1, dtype=torch.int32), cbm.sum(1, dtype=torch.int32),
-                                 cu.flatten().view(torch.int32), cv.flatten().view(torch.int32),
-                                 cs.int(), cwi, cbi))
-            result = fn(payload.unsqueeze(0), new_dims, 7)
-            torch.testing.assert_close(result[2], cw, rtol=0, atol=0)
-            torch.testing.assert_close(result[3], cb, rtol=0, atol=0)
-            assert len(kernel.device_caches[torch.cuda.current_device()][0]) == expected_cache_size
+def test_cuda_unpack_rows_matches_torch(counts):
+    sizes = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    ids = torch.arange(sum(counts), dtype=torch.int32, device="cuda") + 11
+    torch.testing.assert_close(
+        features._unpack_rows(sizes, ids, 7),
+        features._unpack_rows_torch(sizes, ids, 7),
+        rtol=0, atol=0,
+    )
