@@ -35,6 +35,8 @@ from trainer.callbacks import (
 from trainer.checkpoint_writer import AsyncCheckpointWriter
 from trainer.engine import SimpleTrainer, init_distributed
 from trainer.loggers import CSVLogger, TensorBoardLogger
+from trainer.sharded_adamw import ShardedAdamWStep
+from trainer.sharded_trainer import ShardedTrainer
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
@@ -264,6 +266,9 @@ def main():
 
     max_epoch = args.max_epochs or 800
     prepare_stack_table(args)
+    sharding = (rank, world_size) if args.sharded else None
+    if sharding is not None and world_size < 2:
+        raise ValueError("--sharded requires at least two processes (torchrun)")
     if args.resume_from_model is None:
         if args.nnue_config.init_seed >= 0:
             torch.manual_seed(args.nnue_config.init_seed)
@@ -272,18 +277,42 @@ def main():
             max_epoch=max_epoch,
             num_batches_per_epoch=args.num_batches_per_epoch,
             param_index=args.dataloader_config.param_index,
+            sharding=sharding,
         )
     else:
         assert os.path.exists(args.resume_from_model)
         try:
-            nnue = torch.load(
+            resume = torch.load(
                 args.resume_from_model, weights_only=False, map_location="cpu"
             )
-            nnue.train()
         except ModuleNotFoundError as e:
             raise RuntimeError(
                 f"Could not load checkpoint: {e}. The model to be resumed was probably saved with a different version of the code."
             )
+        if sharding is None:
+            nnue = resume
+            nnue.train()
+        else:
+            nnue = M.NNUE(
+                config=args.nnue_config,
+                max_epoch=max_epoch,
+                num_batches_per_epoch=args.num_batches_per_epoch,
+                param_index=args.dataloader_config.param_index,
+                sharding=sharding,
+            )
+            full_model = resume.model if isinstance(resume, M.NNUE) else None
+            if full_model is None:
+                raise ValueError(
+                    "--resume-from-model must be a full NNUE model for --sharded"
+                )
+            nnue.model.load_unsharded(full_model)
+            if isinstance(resume, M.NNUE):
+                nnue.lambda_scheduler.load_state_dict(
+                    resume.lambda_scheduler.state_dict()
+                )
+                nnue.lambda_scheduler.jitter_buffer.copy_(
+                    resume.lambda_scheduler.jitter_buffer
+                )
         # we can set the following here just like that because when resuming
         # from .pt the optimizer is only created after the training is started
         nnue.max_epoch = max_epoch
@@ -347,6 +376,12 @@ def main():
         # On MPS, torch.compile is currently unstable
         if is_master_process():
             print("Disabling torch.compile for accelerator='mps'.")
+    elif args.sharded:
+        # The distributed forward contains collectives and must stay eager;
+        # ShardedAdamWStep compiles the local FT merge, tail and loss pieces.
+        torch._dynamo.config.cache_size_limit = 64
+        if is_master_process():
+            print("Sharded training: compiling local FT merge, tail and loss.")
     else:
         # Compile only the inner NNUEModel; the outer NNUE shell handles loss,
         # lambda scheduling and checkpointing in plain Python.
@@ -365,6 +400,23 @@ def main():
     else:
         device = torch.device("cpu")
 
+    if args.sharded:
+        if 0 <= args.swa_start_epoch < args.max_epochs:
+            raise ValueError("--swa-start-epoch is not supported with --sharded")
+        if accelerator != "cuda":
+            raise ValueError("--sharded currently requires CUDA/NCCL")
+        # The runner broadcasts replicated parameters during construction, so
+        # the model must already be on its rank's device.
+        nnue.to(device)
+        step_runner = ShardedAdamWStep(nnue, gradient_clip_val=2.0)
+        optimizer, schedulers = step_runner.optimizer, step_runner.schedulers
+    else:
+        step_runner = None
+        optimizer_and_schedulers = nnue.configure_optimizers()
+        optimizer, schedulers = _normalize_optimizer_and_schedulers(
+            optimizer_and_schedulers
+        )
+
     train, val = make_data_loaders(
         train_datasets,
         val_datasets,
@@ -382,12 +434,11 @@ def main():
         prefetch_device=device if accelerator == "cuda" else None,
         rank=rank,
         world_size=world_size,
-        prefetch_hook=nnue.prefetch_hook() if accelerator == "cuda" else None,
-    )
-
-    optimizer_and_schedulers = nnue.configure_optimizers()
-    optimizer, schedulers = _normalize_optimizer_and_schedulers(
-        optimizer_and_schedulers
+        prefetch_hook=(
+            nnue.prefetch_hook()
+            if accelerator == "cuda" and step_runner is None
+            else None
+        ),
     )
 
     refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
@@ -415,12 +466,15 @@ def main():
         swa_callback = ExplicitSWA(args.swa_start_epoch, tb_logger.log_dir)
         trainer_callbacks.append(swa_callback)
 
-    if rank == 0 and args.async_checkpoint_save:
+    # The sharded trainer writes rank-local state before the merged checkpoint,
+    # so it takes the synchronous path (the writer only owns rank 0's file).
+    if rank == 0 and args.async_checkpoint_save and not args.sharded:
         checkpoint_writer = AsyncCheckpointWriter()
     else:
         checkpoint_writer = None
 
-    trainer = SimpleTrainer(
+    trainer_class = ShardedTrainer if args.sharded else SimpleTrainer
+    trainer = trainer_class(
         model=nnue,
         optimizer=optimizer,
         schedulers=schedulers,
@@ -436,6 +490,7 @@ def main():
         world_size=world_size,
         local_rank=local_rank,
         checkpoint_writer=checkpoint_writer,
+        step_runner=step_runner,
     )
 
     if actual_threads > 0:
