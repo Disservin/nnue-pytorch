@@ -17,12 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from data_loader import (
-    DataloaderSkipConfig,
-    FixedNumBatchesDataset,
-    SparseBatchDataset,
-    SparseBatchProvider,
-)
+from data_loader import DataloaderSkipConfig, DevicePrefetcher, SparseBatchProvider
 from data_loader.config import DataloaderDDPConfig, DataloaderIOConfig
 from model.config import ModelConfig, NNUEConfig
 from model.nnue import NNUE
