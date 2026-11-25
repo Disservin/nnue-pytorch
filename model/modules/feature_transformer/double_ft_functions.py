@@ -14,8 +14,6 @@ def double_feature_transform(
     max_ft_activation: float,
     l1_size: int,
     backend: str = "auto",
-    *,
-    sharded_backward: bool = False,
 ) -> torch.Tensor:
     # Resolve backend
     cupy_available = _HAS_CUPY_KERNELS
@@ -52,7 +50,6 @@ def double_feature_transform(
             bias,
             max_ft_activation,
             l1_size,
-            sharded_backward,
         )
     elif impl in ("sparse", "torch"):
         if impl == "sparse":

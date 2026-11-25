@@ -99,15 +99,13 @@ class ComposedFeatureTransformer(nn.Module):
         first_row = self.NUM_INPUTS - last.NUM_INPUTS
         return first_row, last.NUM_INPUTS // last.NUM_BUCKETS
 
-    _sharded_backward = False
-
     def prefetch_preparer(self):
         """``prepare(white_indices, black_indices)`` for the loader to run on training batches once
         they are on the GPU, or None when the tiled backward does not handle this layer: it builds
         the backward's tile structure and registers it by the index tensor
         (tiled_ft_prep.register_prep), and FusedDoubleFtFunction claims it during the step."""
         l1_size, num_inputs = self.l1_size, self.NUM_INPUTS
-        if self._sharded_backward or not tiled_ft_backward.enabled(l1_size, num_inputs):
+        if not tiled_ft_backward.enabled(l1_size, num_inputs):
             return None
         buckets = self.list_buckets()
 
@@ -171,7 +169,6 @@ class ComposedFeatureTransformer(nn.Module):
             ft_max_act,
             self.l1_size,
             backend,
-            sharded_backward=self._sharded_backward,
         )
 
         # We multiply by a correction factor,

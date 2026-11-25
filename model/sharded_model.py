@@ -122,7 +122,14 @@ class ShardedNNUEModel(NNUEModel):
         return self.forward_global_batch(global_batch, fake_quantize_acts, fake_quantize_weights, group)
 
     def gather_batch(self, batch, group=None):
-        return gather_packed_features(batch, group)
+        global_batch = gather_packed_features(batch, group)
+        if self.training:
+            # The loader's prefetch hook prepares the tiled FT backward for
+            # the local batch; this FT runs on the gathered global batch.
+            prepare = self.input.prefetch_preparer()
+            if prepare is not None:
+                prepare(global_batch.white_indices, global_batch.black_indices)
+        return global_batch
 
     def forward_global_batch(
         self, global_batch, fake_quantize_acts=True, fake_quantize_weights=True, group=None,

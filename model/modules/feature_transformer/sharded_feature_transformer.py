@@ -60,8 +60,6 @@ class ShardedFeatureTransformer(ComposedFeatureTransformer):
     model; rank-specific initialization uses the CPU random generator.
     """
 
-    _sharded_backward = True
-
     def __init__(
         self,
         feature_classes: list[Callable[[int], InputFeature]],
