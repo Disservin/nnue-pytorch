@@ -69,7 +69,6 @@ Four H200 NVL GPUs with NVLink, 16 loader workers per rank:
 | --- | ---: | ---: |
 | Compiled DDP | 9.3–9.4M pos/s | 8.0–8.7M pos/s |
 | Sharded | 10.5–10.6M pos/s | 8.1–8.7M pos/s |
-| Sharded, bucketed L1 bias gradient (now the default) | 11.4–11.6M pos/s | 7.5–8.9M pos/s |
 
 With NVLink, sharding is faster on a fixed batch, but the live ranges
 overlap: there, loader throughput and rank imbalance dominate the

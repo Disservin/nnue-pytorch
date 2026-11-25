@@ -20,14 +20,13 @@ class ShardedAdamWStep:
     """Run AdamW on FT/L1 shards and a data-parallel tail.
 
     Every rank must call ``step`` and ``val_step`` in the same order. The
-    defaults compile the local FT merge, post-L1 tail and loss on CUDA, use
-    the bucketed L1 bias-gradient reduction on NVIDIA GPUs and overlap the
-    dense replica gradient reduction with the local FT backward on NCCL.
-    Pass False to select the reference implementation of any of them.
+    defaults compile the local FT merge, post-L1 tail and loss on CUDA and
+    overlap the dense replica gradient reduction with the local FT backward
+    on NCCL. Pass False to select the reference implementation of either.
     """
 
     def __init__(self, nnue, *, group=None, gradient_clip_val=2.0,
-                 compile_model: bool | None = None, bucketed_bias: bool | None = None,
+                 compile_model: bool | None = None,
                  overlap_replica_gradients: bool | None = None):
         if not isinstance(nnue.model, ShardedNNUEModel):
             raise TypeError("ShardedAdamWStep requires a sharded NNUE model")
@@ -51,7 +50,6 @@ class ShardedAdamWStep:
         device = next(nnue.parameters()).device
         nvidia_cuda = device.type == "cuda" and torch.version.hip is None
         self.compile_model = device.type == "cuda" if compile_model is None else compile_model
-        self.bucketed_bias = nvidia_cuda if bucketed_bias is None else bucketed_bias
         self.overlap_replica_gradients = (
             nvidia_cuda and self.world > 1 and dist.get_backend(group) == "nccl"
             if overlap_replica_gradients is None else overlap_replica_gradients
@@ -70,7 +68,6 @@ class ShardedAdamWStep:
                     self._init_batch_jitter(src, device)
         nnue.model._compile_layer_clipping = self.compile_model
         nnue.model.layer_stacks.l1._compile_l1_merge = self.compile_model
-        nnue.model.layer_stacks.l1._bucketed_bias = self.bucketed_bias
         if self.compile_model:
             # Compile only the local pieces. The distributed forward itself
             # includes collectives and remains eager.
