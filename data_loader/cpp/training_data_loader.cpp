@@ -54,8 +54,7 @@ struct K32H3 {
     };
     // clang-format on
 
-    template<typename Board>
-    static int block_idx(const Board& pos, Color color) {
+    static int block_idx(const Position& pos, Color color) {
         if (pos.piecesBB(Piece(PieceType::Queen, !color)).any())
             return 2;
         for (Color c : {Color::White, Color::Black})
@@ -65,9 +64,9 @@ struct K32H3 {
         return 0;
     }
 
-    template<typename Board>
     static std::pair<int, int>
-    fill_features_board(const Board& pos, int* features, Color color) {
+    fill_features_sparse(const TrainingDataEntry& e, int* features, Color color) {
+        auto&      pos    = e.pos;
         const auto ksq    = pos.kingSquare(color);
         const int  kb     = KingBuckets[static_cast<int>(orient_flip_2(color, ksq, ksq))];
         const int  bucket = block_idx(pos, color) * NUM_KING_BUCKETS + kb;
@@ -222,9 +221,9 @@ struct FullThreats {
                    + (Bitboard::fromBits((1ULL << (int) to) - 1) & attacks).count());
     }
 
-    template<typename Board>
     static std::pair<int, int>
-    fill_features_board(const Board& pos, int* features, Color color) {
+    fill_features_sparse(const TrainingDataEntry& e, int* features, Color color) {
+        auto& pos    = e.pos;
         auto  pieces = pos.piecesBB();
         // Kings are never targets; exclude them upfront
         auto  piecesNoK   = pieces & ~pos.piecesBB(whiteKing) & ~pos.piecesBB(blackKing);
@@ -330,9 +329,9 @@ struct PP_3Wide {
         return hi * (hi - 1) / 2 + lo;
     }
 
-    template<typename Board>
     static std::pair<int, int>
-    fill_features_board(const Board& pos, int* features, Color color) {
+    fill_features_sparse(const TrainingDataEntry& e, int* features, Color color) {
+        auto& pos         = e.pos;
         auto  allPawns    = pos.piecesBB(whitePawn) | pos.piecesBB(blackPawn);
         auto  ksq         = pos.kingSquare(color);
         Color order[2][2] = {{Color::White, Color::Black}, {Color::Black, Color::White}};
@@ -407,20 +406,6 @@ struct ComposedFeatureExtractor: IFeatureExtractor {
 
         return {total_written, m_inputs};
     }
-
-    std::pair<int, int>
-    fill_features_compact(const CompactFeatureBoard& board, int* features, Color color) const override {
-        int total_written = 0;
-        int input_offset = 0;
-        for (auto& ext : extractors) {
-            auto [written, ext_inputs] = ext->fill_features_compact(board, features + total_written, color);
-            for (int i = 0; i < written; ++i)
-                features[total_written + i] += input_offset;
-            input_offset += ext_inputs;
-            total_written += written;
-        }
-        return {total_written, m_inputs};
-    }
 };
 
 template<typename T>
@@ -429,11 +414,7 @@ struct SimpleExtractor: IFeatureExtractor {
     int max_active_features() const override { return T::MAX_ACTIVE_FEATURES; }
     std::pair<int, int>
     fill_features_sparse(const TrainingDataEntry& e, int* features, Color color) const override {
-        return T::fill_features_board(e.pos, features, color);
-    }
-    std::pair<int, int>
-    fill_features_compact(const CompactFeatureBoard& board, int* features, Color color) const override {
-        return T::fill_features_board(board, features, color);
+        return T::fill_features_sparse(e, features, color);
     }
 };
 
@@ -477,31 +458,27 @@ std::shared_ptr<IFeatureExtractor> get_feature(std::string_view name) {
 }
 
 // Piece-count band: (pieces - 1) / 4
-template<typename Board>
-static int piece_count(const Board& pos) { return (pos.piecesBB().count() - 1) / 4; }
+static int piece_count(const Position& pos) { return (pos.piecesBB().count() - 1) / 4; }
 
 // 0 if no queens on the board
 // 1 if only the non-side-to-move has a queen
 // 2 if only the side-to-move has a queen
 // 3 if both sides have a queen
-template<typename Board>
-static int queens(const Board& pos) {
+static int queens(const Position& pos) {
     const Color stm = pos.sideToMove();
     return 2 * pos.piecesBB(Piece(PieceType::Queen, stm)).any()
          + pos.piecesBB(Piece(PieceType::Queen, !stm)).any();
 }
 
 // 0 if pawns stand on both board halves (files a-d and e-h), 1 if on one half only, 2 if none
-template<typename Board>
-static int pawn_halves(const Board& pos) {
+static int pawn_halves(const Position& pos) {
     const Bitboard pawns     = pos.piecesBB(whitePawn) | pos.piecesBB(blackPawn);
     const Bitboard queenSide = Bitboard::betweenFiles(fileA, fileD);
     return !pawns.any() ? 2 : (pawns & queenSide).any() && (pawns & ~queenSide).any() ? 0 : 1;
 }
 
 // 1 if some side has two or more officers (knights, bishops, rooks, queens)
-template<typename Board>
-static int many_officers(const Board& pos) {
+static int many_officers(const Position& pos) {
     const Bitboard pawnsKings = pos.piecesBB(whitePawn) | pos.piecesBB(blackPawn)
                               | pos.piecesBB(whiteKing) | pos.piecesBB(blackKing);
     const auto officers = [&](Color c) { return (pos.piecesBB(c) & ~pawnsKings).count(); };
@@ -515,13 +492,6 @@ int LayerStackKeys::index(const Position& pos) const {
     return index;
 }
 
-int LayerStackKeys::index(const CompactFeatureBoard& pos) const {
-    int index = 0;
-    for (const auto& key : keys)
-        index = index * key.states + key.compact_value(pos);
-    return index;
-}
-
 std::optional<LayerStackKeys> get_layer_stack_keys(std::string_view names) {
     LayerStackKeys result;
     std::size_t    start = 0;
@@ -532,13 +502,13 @@ std::optional<LayerStackKeys> get_layer_stack_keys(std::string_view names) {
         auto name = names.substr(start, pos == std::string_view::npos ? pos : pos - start);
 
         if (name == "piececount")
-            result.keys.push_back({8, piece_count<Position>, piece_count<CompactFeatureBoard>});
+            result.keys.push_back({8, piece_count});
         else if (name == "queen")
-            result.keys.push_back({4, queens<Position>, queens<CompactFeatureBoard>});
+            result.keys.push_back({4, queens});
         else if (name == "pawnhalf")
-            result.keys.push_back({3, pawn_halves<Position>, pawn_halves<CompactFeatureBoard>});
+            result.keys.push_back({3, pawn_halves});
         else if (name == "manyoffi")
-            result.keys.push_back({2, many_officers<Position>, many_officers<CompactFeatureBoard>});
+            result.keys.push_back({2, many_officers});
         else
         {
             std::cerr << "Unknown layer-stack key: " << name << std::endl;

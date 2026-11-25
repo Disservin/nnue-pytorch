@@ -11,30 +11,6 @@ struct SparseBatch;
 struct FenBatch;
 struct FenBatchStream;
 struct SparseBatchStream;
-struct CompactBatch;
-struct CompactBatchStream;
-
-// Each 32-byte record uses Bulletformat's extra bytes: offset 29 is the
-// rule-50 counter, 30 is original black-to-move, and 31 is search-tree flag.
-
-NNUE_API CompactBatchStream* NNUE_CDECL create_compact_batch_stream(
-  int workers, int nfiles, const char* const* files, int batch_size, bool cyclic,
-  DataloaderSkipConfig config, DataloaderIOConfig io);
-NNUE_API void NNUE_CDECL destroy_compact_batch_stream(CompactBatchStream* stream);
-NNUE_API CompactBatch* NNUE_CDECL fetch_next_compact_batch(CompactBatchStream* stream);
-NNUE_API const char* NNUE_CDECL compact_batch_stream_error(CompactBatchStream* stream);
-NNUE_API void NNUE_CDECL destroy_compact_batch(CompactBatch* batch);
-NNUE_API std::size_t NNUE_CDECL compact_batch_size(const CompactBatch* batch);
-NNUE_API const std::uint8_t* NNUE_CDECL compact_batch_records(const CompactBatch* batch);
-
-// Decode n records (exactly n*32 bytes) and extract the normal SparseBatch.
-// On failure, returns null and writes a human-readable message to error.
-NNUE_API SparseBatch* NNUE_CDECL get_sparse_batch_from_compact_parallel(
-  const char* feature_set, const char* ls_keys, const std::uint8_t* records,
-  std::size_t record_bytes, int workers, char* error, std::size_t error_capacity);
-NNUE_API SparseBatch* NNUE_CDECL get_sparse_batch_from_compact_backend(
-  const char* feature_set, const char* ls_keys, const std::uint8_t* records,
-  std::size_t record_bytes, int workers, bool direct, char* error, std::size_t error_capacity);
 
 // batches
 NNUE_API SparseBatch* NNUE_CDECL get_sparse_batch_from_fens(const char*        feature_set_c,

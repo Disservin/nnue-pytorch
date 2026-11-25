@@ -94,18 +94,9 @@ find_package(Threads REQUIRED)
 
 # ---- Targets ----
 
-add_library(training_data_loader SHARED training_data_loader.cpp training_data_loader_abi.cpp compact_batch.cpp)
+add_library(training_data_loader SHARED training_data_loader.cpp training_data_loader_abi.cpp)
 target_compile_options(training_data_loader PRIVATE)
 target_link_libraries(training_data_loader PRIVATE Threads::Threads)
-
-option(NNUE_COMPACT_TESTS "Build the compact binpack integration test" OFF)
-if(NNUE_COMPACT_TESTS)
-  enable_testing()
-  add_executable(test_compact_batch ../../tests/test_compact_batch.cpp)
-  target_include_directories(test_compact_batch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-  target_link_libraries(test_compact_batch PRIVATE training_data_loader Threads::Threads)
-  add_test(NAME compact_batch COMMAND test_compact_batch "${CMAKE_CURRENT_BINARY_DIR}/compact_test_fixture.binpack")
-endif()
 
 set_target_properties(training_data_loader PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
