@@ -124,54 +124,25 @@ class ShardedTrainer(SimpleTrainer):
             del full
 
     def load_checkpoint(self, path: str):
+        """Resume from ``path`` and this rank's ``path.rankN`` state."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if checkpoint.get("format") != CHECKPOINT_FORMAT:
             raise ValueError(
                 f"{path} is not a sharded-training checkpoint; resume sharded "
                 "runs from their own last.ckpt"
             )
-
-        unwrapped = _unwrap_module(self.model)
-        model = unwrapped.model
-        with torch.random.fork_rng(devices=[]):
-            full = NNUEModel(model.feature_name, model.model_config)
-        state = dict(checkpoint["state_dict"])
-        lambda_state = state.pop("lambda_scheduler_state_dict", None)
-        jitter_value = state.pop("jitter_buffer_value", None)
-        full.load_state_dict(
-            {name.removeprefix("model."): value for name, value in state.items()}
-        )
-        model.load_unsharded(full)
-        if lambda_state is not None:
-            unwrapped.lambda_scheduler.load_state_dict(lambda_state)
-        if jitter_value is not None:
-            unwrapped.lambda_scheduler.jitter_buffer.copy_(
-                jitter_value.to(
-                    device=unwrapped.lambda_scheduler.jitter_buffer.device,
-                    dtype=unwrapped.lambda_scheduler.jitter_buffer.dtype,
-                )
-            )
-        del full
-
-        self.current_epoch = checkpoint.get("epoch", 0)
-        self.global_step = checkpoint.get("global_step", 0)
-
         rank_path = f"{path}.rank{self.rank}"
-        if os.path.exists(rank_path):
-            rank_state = torch.load(
-                rank_path, map_location=self.device, weights_only=False
-            )
-            self.step_runner.load_state_dict(rank_state)
-        elif dist.is_initialized() and dist.get_world_size() > 1:
+        if not os.path.exists(rank_path):
             raise RuntimeError(
                 f"missing per-rank sharded state {rank_path}; sharded resume "
                 "requires the same world size and every rank's state file"
             )
-        else:
-            self.step_runner.global_step = self.global_step
-
-        scheduler_states = checkpoint.get("lr_schedulers", [])
-        for sch, value in zip(self._schedulers, scheduler_states):
-            sch.load_state_dict(value)
+        # The rank state holds the shard weights, AdamW and lambda state,
+        # schedulers and RNG; the merged checkpoint only adds the loop state.
+        self.step_runner.load_state_dict(
+            torch.load(rank_path, map_location=self.device, weights_only=False)
+        )
+        self.current_epoch = checkpoint["epoch"]
+        self.global_step = checkpoint["global_step"]
         self._call_callbacks("on_load_checkpoint", self, checkpoint)
         return checkpoint

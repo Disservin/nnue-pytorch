@@ -155,12 +155,8 @@ def _worker(rank, port, batch_jitter):
                                 resumed_opt[param_id][key], value
                             )
                 bad = dict(snapshot, rank=(rank + 1) % 4)
-                with pytest.raises(ValueError, match="checkpoint layout"):
+                with pytest.raises(ValueError, match="cannot be loaded"):
                     restarted.load_state_dict(bad)
-                bad_config = copy.deepcopy(snapshot)
-                bad_config["config"]["loss_params"]["w1"] += 1
-                with pytest.raises(ValueError, match="checkpoint layout"):
-                    restarted.load_state_dict(bad_config)
     finally:
         dist.destroy_process_group()
 

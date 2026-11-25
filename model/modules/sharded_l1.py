@@ -142,31 +142,14 @@ class ShardedL1(FactorizedStackedLinear):
     @torch.no_grad()
     def load_unsharded(self, full: FactorizedStackedLinear):
         """Copy paired weight columns and the complete replicated bias."""
-        if (
-            full.in_features != self.layout.full_width
-            or full.out_features != self.out_features
-            or full.count != self.count
-            or full.quantization.config != self.quantization.config
-            or len(full.group_maps) != len(self.group_maps)
-        ):
-            raise ValueError("unsharded L1 configuration does not match")
         for i in range(len(self.group_maps)):
             if not torch.equal(
                 getattr(full, f"group_map_{i}").cpu(),
                 getattr(self, f"group_map_{i}").cpu(),
             ):
                 raise ValueError("unsharded L1 group maps do not match")
-        source, target = dict(full.named_parameters()), dict(self.named_parameters())
-        if source.keys() != target.keys():
-            raise ValueError("unsharded L1 parameters do not match")
-        for name, dest in target.items():
-            src = source[name]
-            expected = (
-                (*src.shape[:-1], self.in_features) if src.ndim == 2 else src.shape
-            )
-            if dest.shape != expected:
-                raise ValueError(f"incompatible L1 parameter shape for {name}")
-        for name, dest in target.items():
+        source = dict(full.named_parameters())
+        for name, dest in self.named_parameters():
             src = source[name]
             dest.copy_(self.layout.select_columns(src) if src.ndim == 2 else src)
 

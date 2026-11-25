@@ -97,28 +97,7 @@ class ShardedFeatureTransformer(ComposedFeatureTransformer):
 
     @torch.no_grad()
     def load_unsharded(self, full: ComposedFeatureTransformer) -> None:
-        """Copy paired columns from an existing, compatible full transformer.
-
-        Constructing a shard directly does not allocate full-size FT weights;
-        this optional conversion is intended for checkpoint migration and tests.
-        """
-        if (
-            full.l1_size != self.layout.full_width
-            or full.FEATURE_NAME != self.FEATURE_NAME
-            or full.quantization.config != self.quantization.config
-        ):
-            raise ValueError("unsharded transformer configuration does not match")
+        """Copy this shard's paired columns from a full transformer."""
         source = dict(full.named_parameters())
-        target = dict(self.named_parameters())
-        if source.keys() != target.keys():
-            raise ValueError("unsharded transformer parameters do not match")
-        # Check everything before copying so a mismatch cannot leave a partial load.
-        for name, dest in target.items():
-            src = source[name]
-            if (
-                src.shape[:-1] != dest.shape[:-1]
-                or src.shape[-1] != self.layout.full_width
-            ):
-                raise ValueError(f"incompatible FT parameter shape for {name}")
-        for name, dest in target.items():
+        for name, dest in self.named_parameters():
             dest.copy_(self.layout.select_columns(source[name]))

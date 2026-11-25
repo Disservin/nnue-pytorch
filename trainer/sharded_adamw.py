@@ -5,7 +5,6 @@ clipping, the optimizer step and the per-step schedulers. Its state is per
 rank and requires the same process-group layout on resume.
 """
 
-from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
@@ -152,63 +151,41 @@ class ShardedAdamWStep:
             dist.all_reduce(weight, op=dist.ReduceOp.SUM, group=self.group)
         return numerator / weight
 
-    def _group_parameter_names(self):
-        names = {id(p): name for name, p in self.nnue.named_parameters()}
-        return [
-            [names[id(p)] for p in group["params"]]
-            for group in self.optimizer.param_groups
-        ]
-
     def state_dict(self):
-        """Return rank state with PyTorch's normal shallow tensor references.
+        """This rank's shard, optimizer, scheduler and RNG state.
 
-        Serialize or deep-copy it before further optimizer steps. Each rank must
-        save its own checkpoint.
+        The tensors are live references: serialize the result before further
+        steps. Every rank saves its own state.
         """
         device = next(self.nnue.parameters()).device
-        state = {
-            "format": "sharded-adamw-v1",
+        return {
             "rank": self.rank,
             "world_size": self.world,
             "global_step": self.global_step,
-            "parameter_groups": self._group_parameter_names(),
-            "config": asdict(self.nnue.config),
             "max_steps": self.nnue.max_steps,
-            "gradient_clip_val": self.gradient_clip_val,
-            "device_type": device.type,
             "nnue": self.nnue.state_dict(),
             "schedulers": [scheduler.state_dict() for scheduler in self.schedulers],
             "cpu_rng": torch.get_rng_state(),
-            "cuda_rng": torch.cuda.get_rng_state(device)
-            if device.type == "cuda"
-            else None,
+            "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+            "batch_jitter_rng": None
+            if self._batch_jitter_generator is None
+            else self._batch_jitter_generator.get_state(),
         }
-        if self._batch_jitter_generator is not None:
-            state["batch_jitter_rng"] = self._batch_jitter_generator.get_state()
-        return state
 
     def load_state_dict(self, state):
-        """Restore a checkpoint produced by the same rank and world size."""
-        batch_jitter_rng = state.get("batch_jitter_rng")
-        if (
-            state.get("format") != "sharded-adamw-v1"
-            or state.get("rank") != self.rank
-            or state.get("world_size") != self.world
-            or state.get("parameter_groups") != self._group_parameter_names()
-            or state.get("config") != asdict(self.nnue.config)
-            or state.get("gradient_clip_val") != self.gradient_clip_val
-            or state.get("device_type") != next(self.nnue.parameters()).device.type
-            or len(state.get("schedulers", ())) != len(self.schedulers)
-            or (batch_jitter_rng is None) != (self._batch_jitter_generator is None)
-        ):
-            raise ValueError("incompatible sharded AdamW checkpoint layout")
+        """Restore the state this rank saved; needs the same world size."""
+        if (state["rank"], state["world_size"]) != (self.rank, self.world):
+            raise ValueError(
+                f"sharded state of rank {state['rank']}/{state['world_size']} cannot "
+                f"be loaded by rank {self.rank}/{self.world}"
+            )
         self.nnue.load_state_dict(state["nnue"])
         for scheduler, value in zip(self.schedulers, state["schedulers"]):
             scheduler.load_state_dict(value)
         self.global_step = state["global_step"]
         self.nnue.max_steps = state["max_steps"]
-        if self._batch_jitter_generator is not None:
-            self._batch_jitter_generator.set_state(batch_jitter_rng.cpu())
+        if self._batch_jitter_generator is not None and state["batch_jitter_rng"] is not None:
+            self._batch_jitter_generator.set_state(state["batch_jitter_rng"].cpu())
         torch.set_rng_state(state["cpu_rng"].cpu())
         if state["cuda_rng"] is not None:
             torch.cuda.set_rng_state(
