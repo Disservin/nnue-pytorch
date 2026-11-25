@@ -203,6 +203,32 @@ class ShardedAdamWStep:
             dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=self.group)
         return loss
 
+    @torch.no_grad()
+    def val_step(self, batch):
+        """Return the global validation loss for one local batch.
+
+        Every rank gathers the local feature batches, runs the sharded
+        forward in evaluation mode and reduces the weighted loss components.
+        The batch must already be on the collective device.
+        """
+        if self.nnue.training:
+            raise RuntimeError("sharded validation steps require evaluation mode")
+        enabled = self.global_step >= self.nnue.config.fake_quant_warmup_steps
+        global_batch = self.nnue.model.gather_batch(batch, self.group)
+        prediction = self.nnue.model.forward_global_batch(
+            global_batch,
+            self.nnue.config.use_fake_act_quantization and enabled,
+            self.nnue.config.use_fake_weight_quantization and enabled,
+            self.group,
+        )
+        numerator, weight = self.nnue.compute_loss_components_with_scorenet(
+            prediction, batch, self.global_step
+        )
+        if self.world > 1:
+            dist.all_reduce(numerator, op=dist.ReduceOp.SUM, group=self.group)
+            dist.all_reduce(weight, op=dist.ReduceOp.SUM, group=self.group)
+        return numerator / weight
+
     def _group_parameter_names(self):
         names = {id(p): name for name, p in self.nnue.named_parameters()}
         return [
