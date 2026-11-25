@@ -47,7 +47,7 @@ def _batch(rank, n, step):
     return tuple(values)
 
 
-def _worker(rank, port, batch_jitter, overlap=False):
+def _worker(rank, port, batch_jitter):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -57,8 +57,6 @@ def _worker(rank, port, batch_jitter, overlap=False):
         model_module.get_feature_cls = lambda _: [_Feature]
         sharded_model_module.get_feature_cls = lambda _: [_Feature]
         config = _config()
-        # Overlap is NCCL-only by default; force it to test the Gloo path.
-        options = {"overlap_replica_gradients": overlap}
         if batch_jitter:
             cfg = config.loss_params.lambda_config
             cfg.start_lambda = cfg.end_lambda = 0.5
@@ -90,14 +88,11 @@ def _worker(rank, port, batch_jitter, overlap=False):
                 sharded.model.layer_stacks.l2.linear.weight.add_(rank)
                 if batch_jitter:
                     sharded.lambda_scheduler.jitter_buffer.fill_(rank)
-        runner = ShardedAdamWStep(sharded, gradient_clip_val=0.2, **options)
+        runner = ShardedAdamWStep(sharded, gradient_clip_val=0.2)
         reference_rng = runner.state_dict().get("batch_jitter_rng")
         snapshot = None
         for step in range(3):
-            sizes = ([2, 0, 3, 1], [1, 2, 0, 4], [0, 1, 4, 1])[step]
-            if overlap and step < 2:
-                # Overlap applies only to equal local batches.
-                sizes = [2] * 4
+            sizes = [2 + step] * 4
             batches = [_batch(i, n, step) for i, n in enumerate(sizes)]
             global_batch = tuple(
                 torch.cat([part[i] for part in batches]) for i in range(7)
@@ -138,7 +133,7 @@ def _worker(rank, port, batch_jitter, overlap=False):
                 resumed = NNUE(
                     config, max_epoch=3, num_batches_per_epoch=5, sharding=(rank, 4)
                 )
-                restarted = ShardedAdamWStep(resumed, gradient_clip_val=0.2, **options)
+                restarted = ShardedAdamWStep(resumed, gradient_clip_val=0.2)
                 restarted.load_state_dict(snapshot)
                 assert restarted.global_step == snapshot["global_step"]
                 assert resumed.max_steps == snapshot["max_steps"]
@@ -173,16 +168,12 @@ def _worker(rank, port, batch_jitter, overlap=False):
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(), reason="Gloo unavailable"
 )
-@pytest.mark.parametrize(
-    ("batch_jitter", "overlap"),
-    [(False, False), (True, False), (True, True)],
-    ids=["no-jitter", "batch-jitter", "overlap"],
-)
-def test_four_rank_adamw_and_resume(batch_jitter, overlap):
+@pytest.mark.parametrize("batch_jitter", [False, True], ids=["no-jitter", "batch-jitter"])
+def test_four_rank_adamw_and_resume(batch_jitter):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, batch_jitter, overlap), nprocs=4, join=True)
+    mp.spawn(_worker, args=(port, batch_jitter), nprocs=4, join=True)
 
 
 def test_reject_non_adamw():

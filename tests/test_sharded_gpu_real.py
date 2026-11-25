@@ -57,7 +57,7 @@ def _worker(rank, port):
         sharded.to(device)
         reference_optimizer = full.configure_optimizers()[0][0]
         runner = ShardedAdamWStep(sharded, gradient_clip_val=0.2)
-        parts = [_batch(0, 3), _batch(1, 2)]
+        parts = [_batch(0, 3), _batch(1, 3)]
         global_batch = tuple(
             torch.cat([p[i] for p in parts]).to(device) for i in range(7)
         )

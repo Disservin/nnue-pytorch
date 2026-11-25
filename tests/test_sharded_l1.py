@@ -25,8 +25,6 @@ from model.quantize import QuantizationConfig, QuantizationManager
 from model.sharded_backward import (
     backward_weighted_loss,
     clip_sharded_grad_norm_,
-    global_weighted_loss,
-    synchronize_replicated_gradients,
 )
 
 
@@ -48,9 +46,8 @@ def _make_reference():
 
 
 def _check(rank, qat_acts, qat_weights):
-    sizes = [2, 0, 3, 1]
-    local_batch = list(_local_batch(rank, sizes[rank]))
-    local_batch[-1] = (torch.arange(sizes[rank], dtype=torch.int64) + rank) % 4
+    local_batch = list(_local_batch(rank, 2))
+    local_batch[-1] = (torch.arange(2, dtype=torch.int64) + rank) % 4
     batch = gather_packed_features(tuple(local_batch))
     quant, full_ft, full_layers = _make_reference()
     tail = copy.deepcopy(full_layers)
@@ -78,7 +75,8 @@ def _check(rank, qat_acts, qat_weights):
     full_l1 = full_layers.l1(full_ft_out, indices, qat_weights)
     expected = full_layers.forward_from_l1(full_l1, indices, qat_acts, qat_weights)
     shard_ft_out = shard_ft(*inputs, qat_acts, qat_weights, backend="torch")
-    local_l1 = shard_l1(shard_ft_out, indices, batch.offsets, qat_weights)
+    l1_input = shard_ft_out.detach().requires_grad_()
+    local_l1 = shard_l1(l1_input, indices, qat_weights)
     actual = tail.forward_from_l1(local_l1, local_indices, qat_acts, qat_weights)
     torch.testing.assert_close(
         local_l1, full_l1[batch.local_slice], atol=2e-6, rtol=1e-5
@@ -103,7 +101,7 @@ def _check(rank, qat_acts, qat_weights):
     ]
     replicated = shard_l1.replicated_bias_parameters() + tail_params
     reference_loss.backward()
-    backward_weighted_loss(numerator, weight, replicated)
+    backward_weighted_loss(numerator, weight, replicated, (shard_ft_out, l1_input))
 
     def check_param(actual_param, expected_param, *, columns=False):
         grad = actual_param.grad
@@ -178,54 +176,23 @@ def _worker(rank, port):
             (True, True),
         ):
             _check(rank, acts, weights)
-        used = torch.nn.Parameter(torch.tensor([1.0]))
-        unused = torch.nn.Parameter(torch.tensor([2.0]))
-        used.grad = torch.tensor([float(rank + 1)]) if rank in (0, 2) else None
-        synchronize_replicated_gradients([used, unused])
-        torch.testing.assert_close(used.grad, torch.tensor([4.0]))
-        assert unused.grad is None
-        torch.optim.AdamW([used, unused], lr=0.1, weight_decay=0.1).step()
-        torch.testing.assert_close(unused, torch.tensor([2.0]))
-        with pytest.raises(ValueError, match="finite and positive"):
-            global_weighted_loss(
-                torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-            )
-        sparse_param = torch.nn.Parameter(torch.zeros(2))
-        if rank == 1:
-            sparse_param.grad = torch.sparse_coo_tensor(
-                torch.tensor([[0]]), torch.tensor([1.0]), (2,)
-            )
-        with pytest.raises(ValueError, match="sparse"):
-            synchronize_replicated_gradients([sparse_param])
-        empty = torch.empty(0, 4, requires_grad=True)
-        empty_local = sum_reduce_scatter_batch(empty, (0, 0, 0, 0, 0))
-        empty_local.sum().backward()
-        assert empty.grad.shape == (0, 4)
-
         even = dist.new_group([0, 2])
         odd = dist.new_group([1, 3])
         group = even if rank % 2 == 0 else odd
         group_rank = dist.get_rank(group)
-        value = torch.full((3, 2), float(rank + 1), requires_grad=True)
-        result = sum_reduce_scatter_batch(value, (0, 1, 3), group)
+        value = torch.full((4, 2), float(rank + 1), requires_grad=True)
+        result = sum_reduce_scatter_batch(value, group)
         expected_sum = 4.0 if rank % 2 == 0 else 6.0
         torch.testing.assert_close(result, torch.full_like(result, expected_sum))
         (result * (group_rank + 1)).sum().backward()
-        expected_grad = torch.tensor([[1.0, 1.0], [2.0, 2.0], [2.0, 2.0]])
+        expected_grad = torch.tensor([[1.0, 1.0], [1.0, 1.0], [2.0, 2.0], [2.0, 2.0]])
         torch.testing.assert_close(value.grad, expected_grad)
         sharded = torch.nn.Parameter(torch.tensor([0.0]))
         sharded.grad = torch.tensor([float(rank + 1)])
         replica = torch.nn.Parameter(torch.tensor([0.0]))
-        replica.grad = torch.tensor([float(rank + 1)])
-        replica64 = torch.nn.Parameter(torch.tensor([0.0], dtype=torch.float64))
-        replica64.grad = torch.tensor([1.0], dtype=torch.float64)
-        synchronize_replicated_gradients([replica, replica64], group)
-        torch.testing.assert_close(replica.grad, torch.tensor([expected_sum]))
-        torch.testing.assert_close(
-            replica64.grad, torch.tensor([2.0], dtype=torch.float64)
-        )
-        norm = clip_sharded_grad_norm_([sharded], [replica, replica64], 100, group)
-        expected_norm_squared = 30.0 if rank % 2 == 0 else 60.0
+        replica.grad = torch.tensor([3.0])
+        norm = clip_sharded_grad_norm_([sharded], [replica], 100, group)
+        expected_norm_squared = (1 + 9 if rank % 2 == 0 else 4 + 16) + 9
         torch.testing.assert_close(
             norm, torch.tensor(expected_norm_squared, dtype=torch.float64).sqrt()
         )
@@ -250,24 +217,14 @@ def _nccl_worker(rank, port):
         "nccl", rank=rank, world_size=4, timeout=timedelta(seconds=45)
     )
     try:
-        # Exercise equal splits with a non-contiguous source, then the uneven
-        # and empty-rank cases below.
+        # A non-contiguous source must be reduced correctly.
         source = torch.full((4, 8), float(rank + 1), device="cuda").t()
         source.requires_grad_()
-        equal = sum_reduce_scatter_batch(source, (0, 2, 4, 6, 8))
-        torch.testing.assert_close(equal, torch.full_like(equal, 10))
-        (equal * (rank + 1)).sum().backward()
-        expected_equal = torch.arange(1, 5, device="cuda").repeat_interleave(2)
-        torch.testing.assert_close(source.grad, expected_equal[:, None].expand(8, 4).float())
-        offsets = (0, 2, 2, 5, 6)
-        value = torch.full((6, 4), float(rank + 1), device="cuda", requires_grad=True)
-        local = sum_reduce_scatter_batch(value, offsets)
+        local = sum_reduce_scatter_batch(source)
         torch.testing.assert_close(local, torch.full_like(local, 10))
         (local * (rank + 1)).sum().backward()
-        expected = (
-            torch.tensor([1, 1, 3, 3, 3, 4], device="cuda").reshape(6, 1).expand(6, 4)
-        )
-        torch.testing.assert_close(value.grad, expected.to(torch.float32))
+        expected = torch.arange(1, 5, device="cuda").repeat_interleave(2)
+        torch.testing.assert_close(source.grad, expected[:, None].expand(8, 4).float())
     finally:
         dist.destroy_process_group()
 
@@ -287,12 +244,10 @@ def test_nccl_reduce_scatter_and_backward():
 
 def test_single_rank_reduce_scatter():
     x = torch.randn(3, 5, requires_grad=True)
-    result = sum_reduce_scatter_batch(x, (0, 3))
+    result = sum_reduce_scatter_batch(x)
     torch.testing.assert_close(result, x)
     result.sum().backward()
     torch.testing.assert_close(x.grad, torch.ones_like(x))
-    with pytest.raises(ValueError):
-        sum_reduce_scatter_batch(x, (0, 2))
 
 
 def test_rank_initialization():

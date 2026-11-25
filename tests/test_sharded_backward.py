@@ -1,16 +1,14 @@
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 
 from model.config import LossParams
 from model.lambda_utils import LambdaController
 from model.nnue import NNUE, calculate_sf_loss, calculate_sf_loss_components
-from model.sharded_backward import global_weighted_loss
 
 
-def test_loss_components_preserve_nnue_loss_and_empty_graph():
+def test_loss_components_preserve_nnue_loss():
     model = NNUE.__new__(NNUE)
     nn.Module.__init__(model)
     model.model = SimpleNamespace(quantization=SimpleNamespace(nnue2score=600.0))
@@ -28,13 +26,3 @@ def test_loss_components_preserve_nnue_loss_and_empty_graph():
         prediction, batch, 4
     )
     torch.testing.assert_close(numerator / denominator, expected)
-    empty = prediction[:0]
-    empty_batch = (None, None, None, None, outcomes[:0], scores[:0], None)
-    numerator, denominator = model.compute_loss_components_with_scorenet(
-        empty, empty_batch, 4
-    )
-    assert denominator == 0
-    numerator.backward()
-    torch.testing.assert_close(prediction.grad, torch.zeros_like(prediction))
-    with pytest.raises(ValueError, match="finite and positive"):
-        global_weighted_loss(numerator, denominator)

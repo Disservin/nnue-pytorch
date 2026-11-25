@@ -115,12 +115,6 @@ class ShardedNNUEModel(NNUEModel):
                 if name in full_buffers:
                     full_buffers[name].copy_(src)
 
-    def forward_batch(
-        self, batch, fake_quantize_acts=True, fake_quantize_weights=True, group=None
-    ):
-        global_batch = self.gather_batch(batch, group)
-        return self.forward_global_batch(global_batch, fake_quantize_acts, fake_quantize_weights, group)
-
     def gather_batch(self, batch, group=None):
         global_batch = gather_packed_features(batch, group)
         if self.training:
@@ -133,8 +127,12 @@ class ShardedNNUEModel(NNUEModel):
 
     def forward_global_batch(
         self, global_batch, fake_quantize_acts=True, fake_quantize_weights=True, group=None,
-        *, split_ft_backward=False,
     ):
+        """Return the local predictions and the detached FT boundary.
+
+        The boundary ``(ft_output, l1_input)`` lets the step run the local FT
+        backward separately, while the replica gradients are being reduced.
+        """
         indices = self.layer_stacks.stack_remap[global_batch.layer_stack_indices]
         x = self.input(
             global_batch.us,
@@ -144,21 +142,18 @@ class ShardedNNUEModel(NNUEModel):
             fake_quantize_acts,
             fake_quantize_weights,
         )
-        if split_ft_backward:
-            ft_output = x
-            x = ft_output.detach().requires_grad_(True)
-        l1 = self.layer_stacks.l1(
-            x, indices, global_batch.offsets, fake_quantize_weights, group
-        )
+        ft_output = x
+        x = ft_output.detach().requires_grad_(x.requires_grad)
+        l1 = self.layer_stacks.l1(x, indices, fake_quantize_weights, group)
         prediction = self.layer_stacks.forward_from_l1(
             l1,
             indices[global_batch.local_slice],
             fake_quantize_acts,
             fake_quantize_weights,
         )
-        return (prediction, (ft_output, x)) if split_ft_backward else prediction
+        return prediction, (ft_output, x)
 
     def forward(self, *args, **kwargs):
         raise RuntimeError(
-            "ShardedNNUEModel requires forward_batch and a synchronized training step"
+            "ShardedNNUEModel runs through ShardedAdamWStep, which synchronizes the ranks"
         )

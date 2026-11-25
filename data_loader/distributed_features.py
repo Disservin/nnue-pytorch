@@ -59,7 +59,7 @@ def gather_packed_features(
     rows must have the loader's normal trailing -1 padding, and layer-stack
     values must originate from the loader's int32 layer-stack indices. The
     collective uses the input device (CUDA for NCCL, CPU for Gloo). All ranks
-    must call this function for each step, even ranks with an empty batch.
+    must call this function for each step with equal-size batches.
 
     Each rank packs its active feature IDs and pads the payload to the
     largest rank's size for the all_gather. Exchanging those sizes
@@ -111,8 +111,8 @@ def gather_packed_features(
     else:
         infos[0] = info
     dimensions = [tuple(map(int, item.tolist())) for item in infos]
-    if any(w != width for _, w, _, _ in dimensions):
-        raise ValueError("all ranks must use the same maximum feature count")
+    if any(b != n or w != width for b, w, _, _ in dimensions):
+        raise ValueError("all ranks must use the same batch size and maximum feature count")
     padded_length = max(1, *(5 * b + nw + nb for b, _, nw, nb in dimensions))
     padded = torch.zeros(padded_length, dtype=torch.int32, device=white.device)
     padded[: payload.numel()] = payload

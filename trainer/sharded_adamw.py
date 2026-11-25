@@ -6,7 +6,6 @@ rank and requires the same process-group layout on resume.
 """
 
 from dataclasses import asdict
-from itertools import pairwise
 
 import torch
 import torch.distributed as dist
@@ -19,15 +18,14 @@ from trainer.engine import is_one_cycle
 class ShardedAdamWStep:
     """Run AdamW on FT/L1 shards and a data-parallel tail.
 
-    Every rank must call ``step`` and ``val_step`` in the same order. The
-    defaults compile the local FT merge, post-L1 tail and loss on CUDA and
-    overlap the dense replica gradient reduction with the local FT backward
-    on NCCL. Pass False to select the reference implementation of either.
+    Every rank must call ``step`` and ``val_step`` in the same order, with
+    equal-size local batches. On CUDA the local FT merge, post-L1 tail and
+    loss are compiled unless ``compile_model=False``. The replica gradient
+    reduction overlaps the local FT backward.
     """
 
     def __init__(self, nnue, *, group=None, gradient_clip_val=2.0,
-                 compile_model: bool | None = None,
-                 overlap_replica_gradients: bool | None = None):
+                 compile_model: bool | None = None):
         if not isinstance(nnue.model, ShardedNNUEModel):
             raise TypeError("ShardedAdamWStep requires a sharded NNUE model")
         if nnue.config.optimizer_config.optimizer_name.lower() != "adamw":
@@ -48,12 +46,7 @@ class ShardedAdamWStep:
         self.sharded = nnue.model.sharded_parameters()
         self.replicated = nnue.model.replicated_parameters()
         device = next(nnue.parameters()).device
-        nvidia_cuda = device.type == "cuda" and torch.version.hip is None
         self.compile_model = device.type == "cuda" if compile_model is None else compile_model
-        self.overlap_replica_gradients = (
-            nvidia_cuda and self.world > 1 and dist.get_backend(group) == "nccl"
-            if overlap_replica_gradients is None else overlap_replica_gradients
-        )
         self._batch_jitter_generator = None
         # Replicas may have been created with different process seeds. Broadcast
         # them before creating optimizer state; never broadcast shard weights.
@@ -104,18 +97,6 @@ class ShardedAdamWStep:
             self.nnue.config.use_fake_weight_quantization and enabled,
         )
 
-    def _can_overlap(self, global_batch):
-        # The overlapped reduction needs every rank to send the same dense
-        # FP32 replica gradients, which equal nonempty local batches ensure.
-        if not (
-            self.overlap_replica_gradients and self.world > 1 and self.replicated
-            and all(p.requires_grad and p.dtype == torch.float32 for p in self.replicated)
-            and any(p.requires_grad for p in self.nnue.model.input.parameters())
-        ):
-            return False
-        sizes = [end - start for start, end in pairwise(global_batch.offsets)]
-        return sizes[0] > 0 and all(size == sizes[0] for size in sizes)
-
     def step(self, batch):
         """Run one local-batch forward/backward and return the global loss.
 
@@ -125,17 +106,15 @@ class ShardedAdamWStep:
             raise RuntimeError("sharded AdamW steps require training mode")
         self.optimizer.zero_grad(set_to_none=True)
         global_batch = self.nnue.model.gather_batch(batch, self.group)
-        overlap = self._can_overlap(global_batch)
-        result = self.nnue.model.forward_global_batch(
-            global_batch, *self._fake_quantize(), self.group, split_ft_backward=overlap
+        prediction, ft_boundary = self.nnue.model.forward_global_batch(
+            global_batch, *self._fake_quantize(), self.group
         )
-        prediction, ft_backward = result if overlap else (result, None)
         numerator, weight = self.nnue.compute_loss_components_with_scorenet(
             prediction, batch, self.global_step,
             batch_jitter_generator=self._batch_jitter_generator,
         )
         contribution = backward_weighted_loss(
-            numerator, weight, self.replicated, self.group, ft_backward=ft_backward
+            numerator, weight, self.replicated, ft_boundary, self.group
         )
         if self.gradient_clip_val is not None and self.gradient_clip_val > 0:
             clip_sharded_grad_norm_(
@@ -162,7 +141,7 @@ class ShardedAdamWStep:
         if self.nnue.training:
             raise RuntimeError("sharded validation steps require evaluation mode")
         global_batch = self.nnue.model.gather_batch(batch, self.group)
-        prediction = self.nnue.model.forward_global_batch(
+        prediction, _ = self.nnue.model.forward_global_batch(
             global_batch, *self._fake_quantize(), self.group
         )
         numerator, weight = self.nnue.compute_loss_components_with_scorenet(

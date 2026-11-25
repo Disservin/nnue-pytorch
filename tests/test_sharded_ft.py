@@ -189,8 +189,7 @@ def _worker(rank, port):
         "gloo", rank=rank, world_size=4, timeout=timedelta(seconds=30)
     )
     try:
-        sizes = [2, 0, 3, 1]
-        gathered = gather_packed_features(_local_batch(rank, sizes[rank]))
+        gathered = gather_packed_features(_local_batch(rank, 2))
         inputs = (
             gathered.us,
             gathered.them,

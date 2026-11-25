@@ -13,48 +13,11 @@ import torch.multiprocessing as mp
 
 from model.modules import stacked_linear
 from model.modules.sharded_l1 import ShardedL1
-import model.modules.sharded_l1 as sharded_l1_module
 from model.modules.stacked_linear import FactorizedStackedLinear, StackedLinear
 from model.quantize import QuantizationConfig, QuantizationManager
-from model.sharded_backward import synchronize_replicated_gradients
 
 
-class ReferenceReduceScatter(torch.autograd.Function):
-    """The original padded L1 collective, kept as a reference."""
-
-    @staticmethod
-    def forward(ctx, values, offsets, group):
-        world = len(offsets) - 1
-        rank = dist.get_rank(group) if world > 1 else 0
-        sizes = tuple(offsets[i + 1] - offsets[i] for i in range(world))
-        max_size = max(1, *sizes)
-        blocks = values.new_zeros((world, max_size, values.shape[1]))
-        for i, size in enumerate(sizes):
-            blocks[i, :size].copy_(values[offsets[i]:offsets[i + 1]])
-        result = values.new_empty((max_size, values.shape[1]))
-        if world == 1:
-            result.copy_(blocks[0])
-        elif dist.get_backend(group) == "nccl":
-            dist.reduce_scatter_tensor(result, blocks.flatten(0, 1), group=group)
-        else:
-            dist.all_reduce(blocks, group=group)
-            result.copy_(blocks[rank])
-        ctx.sizes, ctx.max_size, ctx.rank, ctx.group = sizes, max_size, rank, group
-        return result[:sizes[rank]].clone()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        padded = grad_output.new_zeros((ctx.max_size, grad_output.shape[1]))
-        padded[:ctx.sizes[ctx.rank]].copy_(grad_output)
-        blocks = [torch.empty_like(padded) for _ in ctx.sizes]
-        if len(blocks) == 1:
-            blocks[0] = padded
-        else:
-            dist.all_gather(blocks, padded, group=ctx.group)
-        return torch.cat([b[:n] for b, n in zip(blocks, ctx.sizes)]), None, None
-
-
-def _check(rank, sizes, quantized, concentrated):
+def _check(rank, local_size, quantized, concentrated):
     torch.manual_seed(725)
     quant = QuantizationManager(QuantizationConfig())
     full = FactorizedStackedLinear(256, 16, 32, quant, "ls_l1")
@@ -67,7 +30,7 @@ def _check(rank, sizes, quantized, concentrated):
     shard.load_unsharded(full)
     shard = shard.cuda(rank)
     other = copy.deepcopy(shard)
-    n = sum(sizes)
+    n = 2 * local_size
     x = torch.randn(n, 128, device=rank)
     x[:, ::3] = 0
     x[0].zero_()
@@ -76,7 +39,6 @@ def _check(rank, sizes, quantized, concentrated):
         if concentrated
         else torch.arange(n, device=rank) % 11
     )
-    offsets = (0, sizes[0], n)
     upstream = torch.randn(n, 16, device=rank)
     results = []
     original = stacked_linear.grouped_l1
@@ -86,15 +48,14 @@ def _check(rank, sizes, quantized, concentrated):
             patch.object(stacked_linear, "grouped_l1_preferred", return_value=mode == "1"),
             patch.object(stacked_linear, "grouped_l1", wraps=original) as kernel,
         ):
-            output = layer(inputs, indices, offsets, quantized)
+            output = layer(inputs, indices, quantized)
             if mode == "1":
                 kernel.assert_called_once()
             else:
                 kernel.assert_not_called()
-            (output * upstream[offsets[rank] : offsets[rank + 1]]).sum().div(
-                n
-            ).backward()
-        synchronize_replicated_gradients(layer.replicated_bias_parameters())
+            (output * upstream.chunk(2)[rank]).sum().div(n).backward()
+        for p in layer.replicated_bias_parameters():
+            dist.all_reduce(p.grad)
         results.append(
             (
                 output.detach(),
@@ -124,19 +85,19 @@ def _worker(rank, port):
     try:
         if stacked_linear.grouped_l1 is None:
             raise RuntimeError("grouped CUDA dependencies are required for this test")
-        for sizes in ([0, 9], [4, 5], [4, 4]):
+        for local_size in (1, 4, 9):
             for quantized in (False, True):
                 for concentrated in (False, True):
-                    _check(rank, sizes, quantized, concentrated)
+                    _check(rank, local_size, quantized, concentrated)
         # 288 / 2 = 144 columns, outside the full-warp kernel contract.
         quant = QuantizationManager(QuantizationConfig())
         fallback = ShardedL1(288, 16, 32, quant, rank=rank, world_size=2).cuda(rank)
-        x = torch.randn(5, 144, device=rank)
-        indices = torch.arange(5, device=rank)
+        x = torch.randn(4, 144, device=rank)
+        indices = torch.arange(4, device=rank)
         with patch.object(
             stacked_linear, "grouped_l1", wraps=stacked_linear.grouped_l1
         ) as kernel:
-            fallback(x, indices, (0, 2, 5))
+            fallback(x, indices)
             kernel.assert_not_called()
         autocast_layer = ShardedL1(256, 16, 32, quant, rank=rank, world_size=2).cuda(
             rank
@@ -148,7 +109,7 @@ def _worker(rank, port):
             torch.autocast("cuda"),
             torch.no_grad(),
         ):
-            autocast_layer(x[:, :128], indices, (0, 2, 5))
+            autocast_layer(x[:, :128], indices)
             kernel.assert_not_called()
     finally:
         dist.destroy_process_group()
@@ -206,38 +167,3 @@ def test_grouped_tail_matches_dense(width, outputs, layer_key):
         torch.autograd.grad(expected, parameters, upstream),
     ):
         torch.testing.assert_close(grad, ref, atol=3e-5, rtol=3e-4)
-
-
-def _collective_subgroup_worker(rank, port):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=4, timeout=timedelta(seconds=120))
-    try:
-        groups = [dist.new_group(ranks=[0, 2]), dist.new_group(ranks=[1, 3])]
-        group = groups[rank % 2]
-        for size in (2, 0):
-            torch.manual_seed(50 + rank)
-            values = torch.randn(3, size * 2, device=rank).t()
-            upstream = torch.randn(3, size, device=rank).t()
-            expected_x = values.detach().clone().requires_grad_()
-            actual_x = values.detach().clone().requires_grad_()
-            offsets = (0, size, 2 * size)
-            expected = ReferenceReduceScatter.apply(expected_x, offsets, group)
-            actual = sharded_l1_module._SumReduceScatter.apply(actual_x, offsets, group)
-            expected.backward(upstream)
-            actual.backward(upstream)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=0, atol=0)
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.skipif(
-    not dist.is_nccl_available() or torch.cuda.device_count() < 4,
-    reason="Four CUDA GPUs and NCCL required",
-)
-def test_equal_collective_subgroup_noncontiguous_and_empty():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_collective_subgroup_worker, args=(port,), nprocs=4, join=True)

@@ -56,12 +56,14 @@ def _worker(rank, port):
         "gloo", rank=rank, world_size=4, timeout=timedelta(seconds=30)
     )
     try:
-        for sizes in ([3, 3, 3, 3], [1, 0, 4, 2], [0, 0, 0, 0]):
+        for sizes in ([3, 3, 3, 3], [0, 0, 0, 0]):
             _check(rank, sizes)
-        # Width mismatch is detected by every rank before the payload gather.
+        # Mismatches are detected by every rank before the payload gather.
         batch = _batch(rank, 2, width=8 if rank == 0 else 7)
-        with pytest.raises(ValueError, match="same maximum"):
+        with pytest.raises(ValueError, match="same batch size"):
             gather_packed_features(batch)
+        with pytest.raises(ValueError, match="same batch size"):
+            gather_packed_features(_batch(rank, 2 + (rank == 1)))
     finally:
         dist.destroy_process_group()
 
@@ -113,11 +115,11 @@ def _nccl_worker(rank, port):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=4, timeout=timedelta(seconds=60))
     try:
-        for sizes in ([3, 3, 3, 3], [1, 0, 4, 2], [0, 0, 0, 0]):
+        for sizes in ([3, 3, 3, 3], [0, 0, 0, 0]):
             _check(rank, sizes, device=torch.device("cuda", rank))
-        _check(rank, [3, 0, 1, 2], device=torch.device("cuda", rank), width=0)
+        _check(rank, [2, 2, 2, 2], device=torch.device("cuda", rank), width=0)
         batches = []
-        for i, n in enumerate([2, 0, 3, 1]):
+        for i, n in enumerate([2, 2, 2, 2]):
             batch = list(_batch(i, n))
             batch[0] = torch.full((n, 1), 0.125 + i * 0.25)
             batch[1] = torch.full((n, 1), -3.25 - i)
