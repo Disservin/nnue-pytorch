@@ -1,4 +1,4 @@
-"""Numerical checks for the experimental compiled clipping and L1 merge."""
+"""Compiled dense clipping and L1 merge must match the eager versions."""
 import copy
 import io
 

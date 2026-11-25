@@ -26,13 +26,12 @@ def _is_h200(device):
     return "H200" in torch.cuda.get_device_name(device).upper()
 
 
-def _use_aggregated_backward(
-    l1_size, batch_size, max_active_features, device, *, mode="auto"
-):
-    """Select measured defaults; allow other NVIDIA GPUs to be benchmarked."""
-    if mode not in ("auto", "scatter", "aggregated"):
-        raise ValueError(f"mode must be auto, scatter, or aggregated, got {mode!r}")
-    if mode == "scatter" or torch.version.hip is not None:
+def _use_aggregated_backward(l1_size, batch_size, max_active_features, device):
+    """Whether the sharded FT backward uses the tile-aggregated kernel.
+
+    The thresholds are where it measured faster than the direct scatter.
+    """
+    if torch.version.hip is not None:
         return False
     if not (256 <= l1_size <= 4096 and l1_size % 128 == 0
             and 0 < max_active_features <= 288):
@@ -40,8 +39,6 @@ def _use_aggregated_backward(
     capability = torch.cuda.get_device_capability(device)
     if capability[0] < 8:
         return False
-    if mode == "aggregated":
-        return True
     if l1_size == 256:
         # Measured on four H200s for the 1024-wide, four-way sharded FT.
         # Other Hopper GPUs and feature sets retain the existing scatter path.

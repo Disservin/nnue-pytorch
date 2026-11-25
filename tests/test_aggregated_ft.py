@@ -131,7 +131,6 @@ def test_h200_256_selector_is_narrow(monkeypatch):
     assert ft._use_aggregated_backward(256, 131072, 260, "cuda:0")
     assert not ft._use_aggregated_backward(256, 32768, 260, "cuda:0")
     assert not ft._use_aggregated_backward(256, 131072, 288, "cuda:0")
-    assert not ft._use_aggregated_backward(256, 131072, 260, "cuda:0", mode="scatter")
     assert ft._aggregated_tile_size(256, 131072, 260, (9, 0)) == 14
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA H100")
     ft._is_h200.cache_clear()

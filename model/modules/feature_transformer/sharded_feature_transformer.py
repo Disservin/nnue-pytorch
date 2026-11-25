@@ -1,4 +1,4 @@
-"""Column-sharded feature transformer for the future tensor-parallel path."""
+"""Column-sharded feature transformer for sharded multi-GPU training."""
 
 from collections.abc import Callable
 from dataclasses import dataclass

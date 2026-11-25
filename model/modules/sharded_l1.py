@@ -209,9 +209,9 @@ class ShardedL1(FactorizedStackedLinear):
     ):
         """Compute global partial L1, reduce-scatter, then add local bias.
 
-        Normalize each rank's loss numerator by the global weight sum (or by
-        global sample count for an unweighted mean). Sum replicated bias and
-        tail gradients across ranks; never reduce FT or L1 weight-shard gradients.
+        Normalize each rank's loss numerator by the global weight sum. Sum
+        replicated bias and tail gradients across ranks; never reduce FT or L1
+        weight-shard gradients.
         """
         if (
             x.ndim != 2

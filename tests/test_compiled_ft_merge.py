@@ -1,4 +1,4 @@
-"""Compare experimental compiled FT materialization with eager autograd."""
+"""Compare the compiled FT weight merge with eager autograd."""
 import copy
 
 import pytest

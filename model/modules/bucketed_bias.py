@@ -1,4 +1,4 @@
-"""Optional, guarded bucketed reduction for sharded L1 bias gradients."""
+"""Bucketed reduction for sharded L1 bias gradients, with an eager fallback."""
 from functools import lru_cache
 
 import torch
