@@ -1,4 +1,4 @@
-"""Two-GPU production-shape smoke test of the real NNUE feature components."""
+"""Two NCCL GPUs: sharded AdamW steps of the real network match the full model."""
 
 import os
 import socket
@@ -15,7 +15,7 @@ from model.optimizers import OptimizerConfig
 from trainer.sharded_adamw import ShardedAdamWStep
 
 
-def _batch(rank, n):
+def _batch(rank, n, step=0):
     white = torch.full((n, 260), -1, dtype=torch.int32)
     black = torch.full_like(white, -1)
     for row in range(n):
@@ -23,7 +23,7 @@ def _batch(rank, n):
         black[row, :3] = torch.tensor([25 + row, 59808 + 20 + row, 64368 + 456 + row])
     us = ((torch.arange(n) + rank) % 2).float().reshape(-1, 1)
     outcome = (torch.arange(n) % 2).float().reshape(-1, 1)
-    score = (torch.arange(n).float().reshape(-1, 1) * 300) - 700 + rank * 200
+    score = (torch.arange(n).float().reshape(-1, 1) * 300) - 700 + rank * 200 + step * 50
     stacks = (torch.arange(n, dtype=torch.int64) * 31 + rank * 47) % 192
     return us, 1 - us, white, black, outcome, score, stacks
 
@@ -45,38 +45,32 @@ def _worker(rank, port):
         torch.manual_seed(99)
         full = NNUE(config, max_epoch=2, num_batches_per_epoch=2)
         sharded = NNUE(config, max_epoch=2, num_batches_per_epoch=2, sharding=(rank, 2))
-        sharded.model.input.load_unsharded(full.model.input)
-        sharded.model.layer_stacks.l1.load_unsharded(full.model.layer_stacks.l1)
-        sharded.model.layer_stacks.l2.load_state_dict(
-            full.model.layer_stacks.l2.state_dict()
-        )
-        sharded.model.layer_stacks.output.load_state_dict(
-            full.model.layer_stacks.output.state_dict()
-        )
+        sharded.model.load_unsharded(full.model)
         full.to(device)
         sharded.to(device)
         reference_optimizer = full.configure_optimizers()[0][0]
         runner = ShardedAdamWStep(sharded, gradient_clip_val=0.2)
-        parts = [_batch(0, 3), _batch(1, 3)]
-        global_batch = tuple(
-            torch.cat([p[i] for p in parts]).to(device) for i in range(7)
-        )
-        local_batch = tuple(t.to(device) for t in parts[rank])
-        reference_optimizer.zero_grad(set_to_none=True)
-        loss = full.compute_loss(global_batch, 0)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(full.model.parameters(), 0.2)
-        reference_optimizer.step()
-        got = runner.step(local_batch)
-        torch.testing.assert_close(got, loss.detach(), atol=2e-5, rtol=1e-4)
-        expected = dict(full.model.named_parameters())
-        for name, param in sharded.model.named_parameters():
-            reference = expected[name]
-            if name.startswith("input.") or (
-                name.startswith("layer_stacks.l1.") and param.ndim == 2
-            ):
-                reference = sharded.model.input.layout.select_columns(reference)
-            torch.testing.assert_close(param, reference, atol=2e-5, rtol=1e-4)
+        for step in range(2):
+            parts = [_batch(0, 3, step), _batch(1, 3, step)]
+            global_batch = tuple(
+                torch.cat([p[i] for p in parts]).to(device) for i in range(7)
+            )
+            local_batch = tuple(t.to(device) for t in parts[rank])
+            reference_optimizer.zero_grad(set_to_none=True)
+            loss = full.compute_loss(global_batch, step)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(full.model.parameters(), 0.2)
+            reference_optimizer.step()
+            got = runner.step(local_batch)
+            torch.testing.assert_close(got, loss.detach(), atol=2e-5, rtol=1e-4)
+            expected = dict(full.model.named_parameters())
+            for name, param in sharded.model.named_parameters():
+                reference = expected[name]
+                if name.startswith("input.") or (
+                    name.startswith("layer_stacks.l1.") and param.ndim == 2
+                ):
+                    reference = sharded.model.input.layout.select_columns(reference)
+                torch.testing.assert_close(param, reference, atol=2e-5, rtol=1e-4)
     finally:
         dist.destroy_process_group()
 

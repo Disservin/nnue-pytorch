@@ -74,14 +74,7 @@ def _worker(rank, port, batch_jitter):
         # Seed ranks differently: the step must synchronize replicated parameters.
         torch.manual_seed(100 + rank)
         sharded = NNUE(config, max_epoch=3, num_batches_per_epoch=5, sharding=(rank, 4))
-        sharded.model.input.load_unsharded(full.model.input)
-        sharded.model.layer_stacks.l1.load_unsharded(full.model.layer_stacks.l1)
-        sharded.model.layer_stacks.l2.load_state_dict(
-            full.model.layer_stacks.l2.state_dict()
-        )
-        sharded.model.layer_stacks.output.load_state_dict(
-            full.model.layer_stacks.output.state_dict()
-        )
+        sharded.model.load_unsharded(full.model)
         if rank:
             with torch.no_grad():
                 sharded.model.layer_stacks.l1.linear.bias.add_(rank)
