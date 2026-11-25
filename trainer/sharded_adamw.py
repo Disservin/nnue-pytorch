@@ -66,7 +66,6 @@ class ShardedAdamWStep:
                     dist.broadcast(buffer, src=src, group=group)
                 if nnue.config.loss_params.lambda_config.jitter_lambda_batch:
                     self._init_batch_jitter(src, device)
-        nnue.model._compile_layer_clipping = self.compile_model
         nnue.model.layer_stacks.l1._compile_l1_merge = self.compile_model
         if self.compile_model:
             # Compile only the local pieces. The distributed forward itself
