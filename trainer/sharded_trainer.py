@@ -73,7 +73,7 @@ class ShardedTrainer(SimpleTrainer):
 
         if self.rank == 0:
             state = {
-                name: value.detach().cpu()
+                f"model.{name}": value.detach().cpu()
                 for name, value in full.state_dict().items()
             }
             state["lambda_scheduler_state_dict"] = (
@@ -111,7 +111,9 @@ class ShardedTrainer(SimpleTrainer):
         state = dict(checkpoint["state_dict"])
         lambda_state = state.pop("lambda_scheduler_state_dict", None)
         jitter_value = state.pop("jitter_buffer_value", None)
-        full.load_state_dict(state)
+        full.load_state_dict(
+            {name.removeprefix("model."): value for name, value in state.items()}
+        )
         model.load_unsharded(full)
         if lambda_state is not None:
             unwrapped.lambda_scheduler.load_state_dict(lambda_state)
