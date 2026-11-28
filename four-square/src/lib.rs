@@ -39,7 +39,10 @@ mod model;
 mod rans;
 mod record;
 
-pub use container::{BlockIter, Dataset, IndexValidation, OpenOptions, ReadAt, Segment, Worker, Writer, BLOCK_RECORDS};
+pub use container::{
+    BlockEncoder, BlockIter, Dataset, EncodedBlock, IndexValidation, OpenOptions, ReadAt, Segment, Worker, Writer,
+    BLOCK_RECORDS,
+};
 pub use error::{Error, Result};
 pub use model::Model;
 pub use record::{castling, piece, BoardState, Labels, Outcome, Record, TREE_SAMPLE_PLY};

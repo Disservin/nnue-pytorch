@@ -655,3 +655,47 @@ fn broken_middle_segment_is_rejected() {
 
     assert_eq!(Dataset::open(join(&first, &second, &third)).unwrap().records(), 900);
 }
+
+#[test]
+fn encoded_blocks_match_pushed_records() {
+    let recs = records(31, 1000);
+    let model = train(&recs);
+    let mut enc = BlockEncoder::new(model.clone());
+    let mut w = Writer::new(Vec::new(), model.clone()).unwrap();
+    for chunk in recs.chunks(BLOCK_RECORDS) {
+        let block = enc.encode(chunk).unwrap();
+        assert_eq!(block.records(), chunk.len());
+        w.push_encoded(&block).unwrap();
+    }
+    assert_eq!(w.records(), 1000);
+    assert_eq!(w.finish().unwrap(), write(&model, &recs));
+
+    // A model with the same bytes is accepted.
+    let copy = Arc::new(Model::from_bytes(&model.to_bytes()).unwrap());
+    let mut w = Writer::new(Vec::new(), copy).unwrap();
+    w.push_encoded(&enc.encode(&recs[..256]).unwrap()).unwrap();
+}
+
+#[test]
+fn encoded_block_misuse_is_rejected() {
+    let recs = records(32, 600);
+    let model = train(&recs);
+    let mut enc = BlockEncoder::new(model.clone());
+    assert!(enc.encode(&[]).is_err());
+    assert!(enc.encode(&recs[..257]).is_err());
+
+    // Only the last block may be short.
+    let mut w = Writer::new(Vec::new(), model.clone()).unwrap();
+    w.push_encoded(&enc.encode(&recs[..100]).unwrap()).unwrap();
+    assert!(w.push_encoded(&enc.encode(&recs[100..356]).unwrap()).is_err());
+
+    // Pending pushed records.
+    let mut w = Writer::new(Vec::new(), model.clone()).unwrap();
+    w.push(&recs[0]).unwrap();
+    assert!(w.push_encoded(&enc.encode(&recs[1..257]).unwrap()).is_err());
+
+    // Another model.
+    let other = train(&records(33, 300));
+    let mut w = Writer::new(Vec::new(), other).unwrap();
+    assert!(matches!(w.push_encoded(&enc.encode(&recs[..256]).unwrap()), Err(Error::InvalidModel(_))));
+}

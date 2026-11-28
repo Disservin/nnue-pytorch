@@ -474,6 +474,51 @@ impl<S: ReadAt> Iterator for BlockIter<'_, S> {
     }
 }
 
+/// Encodes blocks away from the [`Writer`], so several threads can encode
+/// while one thread appends the blocks in order with [`Writer::push_encoded`].
+pub struct BlockEncoder {
+    model: Arc<Model>,
+    scratch: BlockScratch,
+}
+
+/// One encoded block: its payload and record count.
+pub struct EncodedBlock {
+    model: Arc<Model>,
+    payload: Vec<u8>,
+    records: usize,
+}
+
+impl EncodedBlock {
+    pub fn records(&self) -> usize {
+        self.records
+    }
+
+    /// Payload length in bytes.
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+}
+
+impl BlockEncoder {
+    pub fn new(model: Arc<Model>) -> Self {
+        Self { model, scratch: BlockScratch::default() }
+    }
+
+    /// Encode 1 to 256 records as one block.
+    pub fn encode(&mut self, records: &[Record]) -> Result<EncodedBlock> {
+        if records.is_empty() || records.len() > BLOCK_RECORDS {
+            return Err(Error::InvalidRecord(format!("a block holds 1 to 256 records, not {}", records.len())));
+        }
+        let mut payload = Vec::new();
+        codec::encode_block(&self.model, records, &mut self.scratch, &mut payload);
+        Ok(EncodedBlock { model: self.model.clone(), payload, records: records.len() })
+    }
+}
+
 /// Streaming FSQD writer. Call [`Writer::finish`] to write the index and
 /// footer; a dropped writer leaves an incomplete file.
 pub struct Writer<W: Write> {
@@ -483,6 +528,8 @@ pub struct Writer<W: Write> {
     offsets: Vec<u64>,
     offset: u64,
     records: u64,
+    /// A block shorter than 256 records was written: it must be the last.
+    short_written: bool,
     scratch: BlockScratch,
     payload: Vec<u8>,
 }
@@ -507,6 +554,7 @@ impl<W: Write> Writer<W> {
             offsets: Vec::new(),
             offset: HEADER_LEN + model_bytes.len() as u64,
             records: 0,
+            short_written: false,
             scratch: BlockScratch::default(),
             payload: Vec::new(),
         })
@@ -523,21 +571,48 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
+    /// Append a block from a [`BlockEncoder`] with this writer's model. Every
+    /// block but the last must hold 256 records, and no records pushed with
+    /// [`Writer::push`] may be pending.
+    pub fn push_encoded(&mut self, block: &EncodedBlock) -> Result<()> {
+        if self.sink.is_none() {
+            return Err(Error::WriterPoisoned);
+        }
+        if !Arc::ptr_eq(&block.model, &self.model) && block.model.to_bytes() != self.model.to_bytes() {
+            return Err(Error::InvalidModel("the block was encoded with a different model".into()));
+        }
+        if !self.pending.is_empty() {
+            return Err(Error::InvalidRecord("push_encoded called with pushed records pending".into()));
+        }
+        self.write_block(&block.payload, block.records)
+    }
+
     fn flush_block(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.payload.clear();
-        codec::encode_block(&self.model, &self.pending, &mut self.scratch, &mut self.payload);
+        let mut payload = std::mem::take(&mut self.payload);
+        payload.clear();
+        codec::encode_block(&self.model, &self.pending, &mut self.scratch, &mut payload);
+        let res = self.write_block(&payload, self.pending.len());
+        self.payload = payload;
+        self.pending.clear();
+        res
+    }
+
+    fn write_block(&mut self, payload: &[u8], records: usize) -> Result<()> {
+        if self.short_written {
+            return Err(Error::InvalidRecord("only the last block may hold fewer than 256 records".into()));
+        }
         let sink = self.sink.as_mut().ok_or(Error::WriterPoisoned)?;
-        if let Err(e) = sink.write_all(&self.payload) {
+        if let Err(e) = sink.write_all(payload) {
             self.sink = None;
             return Err(e.into());
         }
         self.offsets.push(self.offset);
-        self.offset += self.payload.len() as u64;
-        self.records += self.pending.len() as u64;
-        self.pending.clear();
+        self.offset += payload.len() as u64;
+        self.records += records as u64;
+        self.short_written = records < BLOCK_RECORDS;
         Ok(())
     }
 
