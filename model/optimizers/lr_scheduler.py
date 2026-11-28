@@ -12,13 +12,13 @@ class LRSchedulerConfig:
     one_cycle_steps: int = 0
     """Number of steps for the One Cycle LR scheduler. If set to a positive value, One Cycle LR scheduler will be used. If set to 0 or a negative value, StepLR with step_size=1 will be used."""
 
-    one_cycle_warmup_pct: float = 0.2
+    one_cycle_warmup_pct: float = 0.05
     """Fraction of the cycle to spend increasing the learning rate in the One Cycle LR scheduler."""
 
     one_cycle_start_div: float = 25
     """Initial lr div factor when using One Cycle LR scheduler."""
 
-    one_cycle_final_div: float = 50
+    one_cycle_final_div: float = 1e3
     """Final lr div factor when using One Cycle LR scheduler."""
 
 

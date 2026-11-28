@@ -5,19 +5,28 @@ from model.config import LossParams
 from model.lambda_utils import LambdaController
 
 
+def _plain_params() -> LossParams:
+    """Loss params without the default lambda cycle delta and jitter."""
+    lp = LossParams()
+    lp.lambda_config.lambda_cycle_delta = 0.0
+    lp.lambda_config.jitter_lambda_sample = 0.0
+    lp.lambda_config.jitter_lambda_batch = 0.0
+    return lp
+
+
 def test_config_defaults():
     lp = LossParams()
     assert lp.lambda_config.lambda_ == 1.0
     assert lp.lambda_config.start_lambda == 1.0
     assert lp.lambda_config.end_lambda == 1.0
     assert lp.lambda_config.lambda_schedule_steps == -1
-    assert lp.lambda_config.lambda_cycle_warmup_pct == 0.3
-    assert lp.lambda_config.lambda_cycle_delta == 0.0
-    assert lp.lambda_config.lambda_cycle_jitter is False
+    assert lp.lambda_config.lambda_cycle_warmup_pct == 0.25
+    assert lp.lambda_config.lambda_cycle_delta == -0.3
+    assert lp.lambda_config.lambda_cycle_jitter is True
 
 
 def test_linear_schedule():
-    lp = LossParams()
+    lp = _plain_params()
     lp.lambda_config.start_lambda = 0.2
     lp.lambda_config.end_lambda = 0.8
 
@@ -67,7 +76,7 @@ def test_linear_schedule():
 
 
 def test_linear_schedule_with_cycle_steps():
-    lp = LossParams()
+    lp = _plain_params()
     lp.lambda_config.start_lambda = 0.2
     lp.lambda_config.end_lambda = 0.8
     lp.lambda_config.lambda_schedule_steps = 50
@@ -118,7 +127,7 @@ def test_linear_schedule_with_cycle_steps():
 
 
 def test_cosine_cycle():
-    lp = LossParams()
+    lp = _plain_params()
     lp.lambda_config.start_lambda = 0.5
     lp.lambda_config.end_lambda = 0.5
     lp.lambda_config.lambda_schedule_steps = 100
@@ -213,7 +222,7 @@ def test_cosine_cycle():
 
 
 def test_jitter_scaling():
-    lp = LossParams()
+    lp = _plain_params()
     lp.lambda_config.start_lambda = 0.5
     lp.lambda_config.end_lambda = 0.5
     lp.lambda_config.lambda_schedule_steps = 100

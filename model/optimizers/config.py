@@ -16,31 +16,29 @@ OPTIMIZER_WRAPPERS = {
 
 @dataclass(kw_only=True)
 class OptimizerConfig(RangerLiteConfig, ScheduleFreeConfig, AdamWConfig):
-    optimizer_name: Literal["schedulefree", "ranger21", "rangerlite", "adamw"] = (
-        "rangerlite"
-    )
+    optimizer_name: Literal["schedulefree", "ranger21", "rangerlite", "adamw"] = "adamw"
     """Which optimizer to use. Note that ranger21 is a specific configuration of rangerlite emulating ranger21 behaviour with legacy_mode=True."""
 
-    ft_weight_decay: float = 0.0
+    ft_weight_decay: float = 0.02
     """Weight decay to apply to the feature transformer parameters."""
 
-    virtual_ft_weight_decay: float = 0.0
+    virtual_ft_weight_decay: float = 0.02
     """Weight decay to apply to the virtual feature transformer parameters."""
 
     dense_weight_decay: float = 0.0
     """Weight decay to apply to the dense layer parameters."""
 
-    factorized_weight_decay: float = 0.0
+    factorized_weight_decay: float = 4.0e-5
     """Weight decay to apply to the factorized dense layer parameters."""
 
-    lr: float = 8.75e-4
+    lr: float = 4.0e-4
     """Initial learning rate."""
 
-    ft_bucket_lr_mult: float = 1.0
+    ft_bucket_lr_mult: float = 0.25
     """Learning-rate multiplier for the bucketed rows of factorized feature transformer inputs
     (e.g. K32H3's king-bucket rows); their shared virtual rows keep the FT rate."""
 
-    threat_lr_mult: float = 1.0
+    threat_lr_mult: float = 0.5
     """Learning-rate multiplier for the Full_Threats rows."""
 
     def get_optimizer_wrapper(self):

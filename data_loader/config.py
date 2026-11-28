@@ -11,43 +11,43 @@ class DataloaderSkipConfig:
     """If disabled, no smart fen skipping will be done."""
     wld_filtered: bool = True
     """If disabled, no WLD-based fen skipping will be done."""
-    random_fen_skipping: int = 0
+    random_fen_skipping: int = 3
     """Skip a random fraction of positions. 0 = disabled."""
-    early_fen_skipping: int = -1
+    early_fen_skipping: int = 18
     """Skip positions from the start of the game. -1 = disabled."""
-    soft_early_fen_skipping: int = 20
+    soft_early_fen_skipping: int = 32
     """Apply soft probability filter up to this ply. <= 0 = disabled. When active parameters `ply_*` control the skip probability for early positions (linear interpolation)."""
     simple_eval_skipping: int = -1
     """Skip positions based on simple eval. -1 = disabled."""
     param_index: int = 0
     """Indexing for parameter scans."""
-    pc_y0: float = 0.0
+    pc_y0: float = -0.2
     """Piece count spline y0 parameter (x=0). Parameters `pc_y*` control the desired relative frequency of positions with certain piececounts x. Uses spline interpolation inbetween."""
-    pc_y1: float = 0.4
+    pc_y1: float = 0.45
     """Piece count spline y1 parameter (x=8)."""
     pc_y2: float = 1.0
     """Piece count spline y2 parameter (x=16)."""
-    pc_y3: float = 1.0
+    pc_y3: float = 0.95
     """Piece count spline y3 parameter (x=24)."""
     pc_y4: float = 0.75
     """Piece count spline y4 parameter (x=32)."""
     ply_x1: float = 0.0
     """Ply soft filter control point x1."""
-    ply_y1: float = 0.1
+    ply_y1: float = 0.025
     """Ply soft filter control point y1."""
-    ply_x2: float = 6.0
+    ply_x2: float = 22.0
     """Ply soft filter control point x2."""
-    ply_y2: float = 0.15
+    ply_y2: float = 0.05
     """Ply soft filter control point y2."""
-    ply_x3: float = 10.0
+    ply_x3: float = 25.5
     """Ply soft filter control point x3."""
-    ply_y3: float = 0.25
+    ply_y3: float = 0.2
     """Ply soft filter control point y3."""
-    ply_x4: float = 18.0
+    ply_x4: float = 29.5
     """Ply soft filter control point x4."""
-    ply_y4: float = 0.75
+    ply_y4: float = 0.8
     """Ply soft filter control point y4."""
-    tree_sample_accept: float = 1.0
+    tree_sample_accept: float = 0.12
     """Acceptance probability for search-tree samples (ply 9999), which skip the other filters."""
     decided_score: int = 1000
     """Positions whose |score| is at least this are kept with probability `decided_accept`. 0 = disabled."""

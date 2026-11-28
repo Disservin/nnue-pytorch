@@ -58,7 +58,7 @@ class TrainingConfig:
     num_workers: int = 1
     """Number of worker threads to use for data loading. Currently only works well for binpack."""
 
-    batch_size: int = 16384
+    batch_size: int = 131072
     """Number of positions per batch / per iteration."""
 
     threads: int = -1
@@ -97,7 +97,7 @@ class TrainingConfig:
     newer one, so last.ckpt always holds the newest fully-written
     epoch."""
 
-    epoch_size: int = 100_000_000
+    epoch_size: int = 1_073_741_824
     """Number of positions per epoch."""
 
     input_clipping_interval: int = 0

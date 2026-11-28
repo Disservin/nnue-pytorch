@@ -44,21 +44,21 @@ class LambdaConfig:
     """lambda to use at first epoch."""
     end_lambda: float | None = None
     """lambda to use at last epoch."""
-    jitter_lambda_sample: float = 0.0
-    """std of normal distributed per sample jitter to add to lambda (default=0.0, no jitter)."""
-    jitter_lambda_batch: float = 0.0
-    """std of normal distributed per batch jitter to add to lambda (default=0.0, no jitter)."""
-    jitter_decay_lambda_batch: float = 0.0
+    jitter_lambda_sample: float = 0.0035
+    """std of normal distributed per sample jitter to add to lambda (0.0 = no jitter)."""
+    jitter_lambda_batch: float = 0.007
+    """std of normal distributed per batch jitter to add to lambda (0.0 = no jitter)."""
+    jitter_decay_lambda_batch: float = 0.999
     """decay of batch jitter (0.0 means full decay -> independent jitter per batch. 1.0 = no decay, not allowed)."""
     lambda_: Annotated[float, tyro.conf.arg(name="lambda")] = 1.0
     """1.0=train on evaluations, 0.0=train on game results, interpolates between (default=1.0)."""
     lambda_schedule_steps: int = -1
     """Number of steps for the lambda schedule (default=-1, disabled/fallback to max_steps)."""
-    lambda_cycle_warmup_pct: float = 0.3
+    lambda_cycle_warmup_pct: float = 0.25
     """Warmup percentage of the cycle steps."""
-    lambda_cycle_delta: float = 0.0
+    lambda_cycle_delta: float = -0.3
     """The maximum delta added to the linear lambda change during the peak of the cycle."""
-    lambda_cycle_jitter: bool = False
+    lambda_cycle_jitter: bool = True
     """If True, the lambda jitter (both batch and sample) will be scaled by the cosine factor (0 to 1) of the cycle."""
 
     def __post_init__(self):
@@ -94,20 +94,20 @@ class LambdaConfig:
 # parameters needed for the definition of the loss
 @dataclass(kw_only=True)
 class LossParams:
-    in_offset: float = 270
-    """offset for conversion to win on input (default=270.0)"""
-    out_offset: float = 270
-    """offset for conversion to win on output (default=270.0)"""
-    in_scaling: float = 340
-    """scaling for conversion to win on input (default=340.0)"""
-    out_scaling: float = 380
-    """scaling for conversion to win on output (default=380.0)"""
+    in_offset: float = 285.2706341467852
+    """offset for conversion to win on input"""
+    out_offset: float = 289.1258344152218
+    """offset for conversion to win on output"""
+    in_scaling: float = 295.6539508488627
+    """scaling for conversion to win on input"""
+    out_scaling: float = 379.98724077106635
+    """scaling for conversion to win on output"""
     lambda_config: OmitArgPrefixes[LambdaConfig] = field(default_factory=LambdaConfig)
     """lambda configuration parameters"""
-    pow_exp: float = 2.5
-    """exponent of the power law used for the mean error (default=2.5)"""
-    qp_asymmetry: float = 0.0
-    """Adjust loss if q (prediction) > p (reference) (default=0.0)"""
+    pow_exp: float = 2.4340402395048404
+    """exponent of the power law used for the mean error"""
+    qp_asymmetry: float = 0.22866886710086187
+    """Adjust loss if q (prediction) > p (reference)"""
     w1: float = 0.0
     """weight boost parameter 1 (default=0.0)"""
     w2: float = 0.5
