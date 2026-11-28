@@ -9,6 +9,7 @@ license = "GPL-3.0"
 four-square = { path = "../../four-square" }
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
+ctrlc = "3"
 
 [profile.release]
 opt-level = 3

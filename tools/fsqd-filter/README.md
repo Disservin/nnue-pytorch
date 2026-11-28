@@ -19,6 +19,9 @@ cargo build --release
 - Outputs that already exist are skipped, so an interrupted run continues with
   the same command. Leftover `.tmp` files are overwritten. `--force` redoes
   everything and retrains the model.
+- Ctrl-C stops all workers, deletes the unfinished `.tmp` outputs and exits
+  with status 130; finished outputs stay. A second Ctrl-C exits at once and
+  may leave `.tmp` files behind.
 - `--list` prints the input → output mapping and exits. `--exclude TEXT`
   drops files whose path contains `TEXT`.
 - Filter options have the same names and defaults as `train.py`.

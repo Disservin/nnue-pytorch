@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +26,27 @@ use four_square::{BlockEncoder, Dataset, EncodedBlock, Model, Record, Writer, BL
 
 /// Records per encoder job: 64 full blocks.
 const BATCH: usize = 64 * BLOCK_RECORDS;
+
+/// Set by the first Ctrl-C: stop, remove unfinished outputs and exit.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+fn stopped() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+/// First Ctrl-C asks for a clean stop; a second one exits at once.
+fn install_ctrl_c() {
+    let res = ctrlc::set_handler(|| {
+        if STOP.swap(true, Ordering::SeqCst) {
+            eprintln!("\nsecond Ctrl-C: exiting now; unfinished .tmp files may remain");
+            std::process::exit(130);
+        }
+        eprintln!("\nCtrl-C: stopping and removing unfinished outputs (Ctrl-C again to exit at once)");
+    });
+    if let Err(e) = res {
+        eprintln!("warning: cannot install the Ctrl-C handler: {e}");
+    }
+}
 
 /// Join FSQD files into one FSQD file in random record order.
 #[derive(Parser, Debug)]
@@ -67,8 +88,8 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     readers: usize,
 
-    /// Encoder threads.
-    #[arg(long, default_value_t = 8)]
+    /// Encoder threads. Encoding costs about twice as much as decoding.
+    #[arg(long, default_value_t = 16)]
     encoders: usize,
 }
 
@@ -205,7 +226,7 @@ fn reader(inputs: &[Input], runs: &[Run], next: &AtomicUsize, window: &Window, t
     let mut worker = four_square::Worker::default();
     loop {
         let i = next.fetch_add(1, Ordering::Relaxed);
-        if i >= runs.len() {
+        if i >= runs.len() || stopped() {
             return;
         }
         window.wait_for(i as u64);
@@ -317,6 +338,9 @@ impl Shuffler {
     }
 
     fn flush(&mut self) -> Result<(), String> {
+        if stopped() {
+            return Err("interrupted".into());
+        }
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -351,7 +375,12 @@ fn prefetch<T>(p: &T) {
 
 fn main() {
     let cli = Cli::parse();
+    install_ctrl_c();
     if let Err(e) = run(&cli) {
+        if stopped() {
+            eprintln!("interrupted: the unfinished output was removed");
+            std::process::exit(130);
+        }
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -427,6 +456,9 @@ fn run(cli: &Cli) -> Result<(), String> {
         cli.seed
     );
 
+    if stopped() {
+        return Err("interrupted".into());
+    }
     let tmp = tmp_path(&cli.output);
     let file = File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let w = Writer::new(BufWriter::with_capacity(8 << 20, file), model.clone())
@@ -475,6 +507,9 @@ fn run(cli: &Cli) -> Result<(), String> {
             let mut read = 0u64;
             let mut last = Instant::now();
             for (i, recs) in read_rx {
+                if stopped() {
+                    return Err("interrupted".into());
+                }
                 pending.insert(i, recs?);
                 while let Some(recs) = pending.remove(&next) {
                     shuffler.push_all(&recs)?;
@@ -497,6 +532,9 @@ fn run(cli: &Cli) -> Result<(), String> {
                         gb(bytes.load(Ordering::Relaxed)),
                     );
                 }
+            }
+            if stopped() {
+                return Err("interrupted".into());
             }
             if next != runs.len() as u64 {
                 return Err("a reader stopped early".into());

@@ -10,6 +10,7 @@ build = "build.rs"
 four-square = { path = "../../four-square" }
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
+ctrlc = "3"
 
 [build-dependencies]
 cc = "1"

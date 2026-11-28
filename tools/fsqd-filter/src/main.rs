@@ -21,6 +21,27 @@ use four_square::{BoardState, Labels, Model, Outcome, Record, Writer};
 
 const MODEL_FILE: &str = "fsqd-model.bin";
 
+/// Set by the first Ctrl-C: stop, remove unfinished outputs and exit.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+fn stopped() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+/// First Ctrl-C asks for a clean stop; a second one exits at once.
+fn install_ctrl_c() {
+    let res = ctrlc::set_handler(|| {
+        if STOP.swap(true, Ordering::SeqCst) {
+            eprintln!("\nsecond Ctrl-C: exiting now; unfinished .tmp files may remain");
+            std::process::exit(130);
+        }
+        eprintln!("\nCtrl-C: stopping and removing unfinished outputs (Ctrl-C again to exit at once)");
+    });
+    if let Err(e) = res {
+        eprintln!("warning: cannot install the Ctrl-C handler: {e}");
+    }
+}
+
 // ---------------------------------------------------------------- C ABI
 
 /// Mirror of `DataloaderSkipConfig` in data_loader/cpp/training_data_loader_structs.h.
@@ -382,15 +403,21 @@ fn load_or_train_model(cli: &Cli, jobs: &[Job], config: SkipConfig) -> Result<Ar
     let errors = Mutex::new(Vec::new());
     for_each(jobs.len(), cli.threads, |i| {
         let mut local = Vec::new();
+        if stopped() {
+            return;
+        }
         let res = scan(&jobs[i].input, config, per_file, |batch, _| {
             local.extend(batch.iter().filter_map(to_record));
-            true
+            !stopped()
         });
         match res {
             Ok(_) => *samples[i].lock().unwrap() = local,
             Err(e) => errors.lock().unwrap().push(format!("{}: {e}", jobs[i].input.display())),
         }
     });
+    if stopped() {
+        return Err("interrupted while training the model; nothing was written".into());
+    }
     let errors = errors.into_inner().unwrap();
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -470,11 +497,11 @@ fn convert_one(job: &Job, config: SkipConfig, model: &Arc<Model>, progress: &Pro
                 None => invalid += 1,
             }
         }
-        true
+        !stopped()
     });
     let stats = match (res, write_err) {
         (_, Some(e)) | (Err(e), None) => return fail(e),
-        (Ok((_, false)), None) => return fail("scan stopped".into()),
+        (Ok((_, false)), None) => return fail("interrupted".into()),
         (Ok((stats, true)), None) => stats,
     };
     progress.read.fetch_add(stats.read - last_read, Ordering::Relaxed);
@@ -497,12 +524,14 @@ fn convert_one(job: &Job, config: SkipConfig, model: &Arc<Model>, progress: &Pro
 
 fn main() {
     let cli = Cli::parse();
+    install_ctrl_c();
     match run(&cli) {
         Ok(true) => {}
+        Ok(false) if stopped() => std::process::exit(130),
         Ok(false) => std::process::exit(1),
         Err(e) => {
             eprintln!("error: {e}");
-            std::process::exit(1);
+            std::process::exit(if stopped() { 130 } else { 1 });
         }
     }
 }
@@ -582,8 +611,15 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
         for_each(todo.len(), cli.threads, |i| {
             let job = todo[i];
+            if stopped() {
+                return;
+            }
             let t = Instant::now();
             let res = convert_one(job, config, &model, &progress);
+            if res.is_err() && stopped() {
+                eprintln!("stopped {} (unfinished output removed)", job.input.display());
+                return;
+            }
             let n = progress.files_done.fetch_add(1, Ordering::Relaxed) + 1;
             progress.bytes_done.fetch_add(job.size, Ordering::Relaxed);
             match res {
@@ -626,6 +662,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     let t = totals.into_inner().unwrap();
     let failures = failures.into_inner().unwrap();
+    if stopped() {
+        eprintln!(
+            "interrupted after {:.0}s: finished files are complete, unfinished ones were removed; \
+             rerun the same command to continue",
+            start.elapsed().as_secs_f64()
+        );
+        return Ok(false);
+    }
     eprintln!(
         "done in {:.0}s: read {} positions, wrote {} ({:.2}%) into {} files, {:.2} GB, {:.2} B/pos",
         start.elapsed().as_secs_f64(),
