@@ -145,6 +145,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "rng.h"
 #include "thread_safe_types.h"
 #include "binpack.h"
+#include "fsqd.h"
 #include "training_data_entry.h"
 #include "unique_counter.h"
 #include "compressed_hash.h"
@@ -353,18 +354,114 @@ namespace binpack
         bool m_stopped = false;
     };
 
+    // Skip predicates per input format. FSQD files hold positions that
+    // already passed the binpack filter, so they get their own predicate.
+    // A single predicate converts to one used for both formats.
+    struct SkipPredicates
+    {
+        std::function<bool(const TrainingDataEntry&)> binpack;
+        std::function<bool(const TrainingDataEntry&)> prefiltered;
+
+        SkipPredicates() = default;
+        SkipPredicates(std::nullptr_t) {}
+        SkipPredicates(std::function<bool(const TrainingDataEntry&)> both) :
+            binpack(both),
+            prefiltered(std::move(both))
+        {
+        }
+        template <typename F>
+        requires std::is_invocable_r_v<bool, F&, const TrainingDataEntry&>
+        SkipPredicates(F f) :
+            SkipPredicates(std::function<bool(const TrainingDataEntry&)>(std::move(f)))
+        {
+        }
+        SkipPredicates(std::function<bool(const TrainingDataEntry&)> binpack_,
+                       std::function<bool(const TrainingDataEntry&)> prefiltered_) :
+            binpack(std::move(binpack_)),
+            prefiltered(std::move(prefiltered_))
+        {
+        }
+    };
+
+    // An input file of either format, read chunk by chunk. FSQD chunks carry
+    // their model; binpack chunks have none.
+    class TrainingInputFile
+    {
+    public:
+        TrainingInputFile(const std::string& path, std::ios_base::openmode om, fsqd::ModelCache& models)
+        {
+            if (fsqd::has_extension(path))
+                m_fsqd.emplace(path, models);
+            else
+                m_binpack.emplace(path, om);
+        }
+
+        [[nodiscard]] bool hasNextChunk() { return m_fsqd ? m_fsqd->hasNextChunk() : m_binpack->hasNextChunk(); }
+
+        void seek_to_start()
+        {
+            if (m_fsqd)
+                m_fsqd->seek_to_start();
+            else
+                m_binpack->seek_to_start();
+        }
+
+        [[nodiscard]] bool skipChunks(std::size_t n, std::size_t* skipped = nullptr)
+        {
+            return m_fsqd ? m_fsqd->skipChunks(n, skipped) : m_binpack->skipChunks(n, skipped);
+        }
+
+        void readNextChunkInto(fsqd::Chunk& chunk)
+        {
+            if (m_fsqd)
+            {
+                m_fsqd->readNextChunkInto(chunk);
+            }
+            else
+            {
+                chunk.model = nullptr;
+                m_binpack->readNextChunkInto(chunk.data);
+            }
+        }
+
+        [[nodiscard]] std::size_t sizeBytes() const { return m_fsqd ? m_fsqd->sizeBytes() : m_binpack->sizeBytes(); }
+        [[nodiscard]] std::string path() const { return m_fsqd ? m_fsqd->path() : m_binpack->path(); }
+
+    private:
+        std::optional<CompressedTrainingDataFile> m_binpack;
+        std::optional<fsqd::File> m_fsqd;
+    };
+
+    // Entries of one chunk of either format.
+    struct AnyChunkReader
+    {
+        [[nodiscard]] bool hasNext(const fsqd::Chunk& chunk)
+        {
+            return chunk.model ? m_fsqd.hasNext(chunk) : m_binpack.hasNext(chunk.data);
+        }
+
+        [[nodiscard]] TrainingDataEntry next(fsqd::Chunk& chunk)
+        {
+            return chunk.model ? m_fsqd.next(chunk) : m_binpack.next(chunk.data);
+        }
+
+    private:
+        ChunkReader m_binpack;
+        fsqd::ChunkReader m_fsqd;
+    };
+
     struct CompressedTrainingDataEntryParallelReader
     {
         static constexpr std::size_t chunkSize = suggestedChunkSize;
         static constexpr std::size_t sharedChunkQueueCapacity = 256;
-        using FileChunk = std::vector<unsigned char>;
+        using FileChunk = fsqd::Chunk;
 
         CompressedTrainingDataEntryParallelReader(
             int concurrency,
             std::vector<std::string> paths,
             std::ios_base::openmode om = std::ios_base::app,
             bool cyclic = false,
-            std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr,
+            SkipPredicates skipPredicates = nullptr,
             nnue::UniquePositionCounter* counter = nullptr,
             int rank = 0,
             int world_size = 1,
@@ -374,15 +471,16 @@ namespace binpack
             m_concurrency(concurrency),
             m_numRunningWorkers(concurrency),
             m_cyclic(cyclic),
-            m_skipPredicate(std::move(skipPredicate)),
+            m_skipPredicates(std::move(skipPredicates)),
             m_counter(counter),
             m_rank(rank),
             m_world_size(world_size)
         {
             std::vector<std::uint64_t> sizes;
+            fsqd::ModelCache models;
             for (const auto& path : paths)
             {
-                auto& file = m_inputFiles.emplace_back(path, om | std::ios_base::in);
+                auto& file = m_inputFiles.emplace_back(path, om | std::ios_base::in, models);
 
                 if (!file.hasNextChunk()) [[unlikely]]
                 {
@@ -619,7 +717,8 @@ namespace binpack
                     const auto t0 = std::chrono::steady_clock::now();
                     if (simDelayMs)
                         std::this_thread::sleep_for(std::chrono::milliseconds(simDelayMs));
-                    std::vector<unsigned char> chunk = inputFile.readNextChunk();
+                    FileChunk chunk;
+                    inputFile.readNextChunkInto(chunk);
                     const auto readNs = static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0)
@@ -629,7 +728,7 @@ namespace binpack
                     {
                         auto& st = m_ioStats[fileId];
                         st.chunks.fetch_add(1, std::memory_order_relaxed);
-                        st.bytes.fetch_add(chunk.size(), std::memory_order_relaxed);
+                        st.bytes.fetch_add(chunk.data.size(), std::memory_order_relaxed);
                         st.nsTotal.fetch_add(readNs, std::memory_order_relaxed);
                         st.lastNs.store(readNs, std::memory_order_relaxed);
                         std::uint64_t prevMax = st.nsMax.load(std::memory_order_relaxed);
@@ -650,7 +749,7 @@ namespace binpack
 
                     // Record the read in the balance window before releasing
                     // the claim so concurrent pickers see fresh priorities.
-                    recordRead(fileId, static_cast<std::uint32_t>(chunk.size()));
+                    recordRead(fileId, static_cast<std::uint32_t>(chunk.data.size()));
 
                     releaseClaim(fileId);
                     claimGuard.active = false;
@@ -682,8 +781,8 @@ namespace binpack
 
             auto worker = [this]()
             {
-                std::vector<unsigned char> m_chunk{};
-                ChunkReader m_chunkReader{};
+                FileChunk m_chunk{};
+                AnyChunkReader m_chunkReader{};
                 // Small decode scratch; filtered entries are appended to
                 // the shared shuffle window pool in bulk.
                 std::vector<TrainingDataEntry> scratch;
@@ -728,6 +827,7 @@ namespace binpack
 
                 while(!isEnd && !m_stopFlag.load())
                 {
+                    const auto& skip = m_chunk.model ? m_skipPredicates.prefiltered : m_skipPredicates.binpack;
                     const auto e = m_chunkReader.next(m_chunk);
                     if (m_counter) ++preskip_count;
 
@@ -736,7 +836,7 @@ namespace binpack
                         isEnd = fetchNextChunkFromSharedQueue(m_chunkReader, m_chunk);
                     }
 
-                    if (!m_skipPredicate || !m_skipPredicate(e))
+                    if (!skip || !skip(e))
                     {
                         scratch.emplace_back(e);
                         if (m_counter)
@@ -887,7 +987,7 @@ namespace binpack
     private:
         int m_concurrency;
         std::atomic_int m_numRunningWorkers;
-        std::vector<CompressedTrainingDataFile> m_inputFiles;
+        std::vector<TrainingInputFile> m_inputFiles;
         bool m_cyclic;
 
         static constexpr int threadBufferSize = 256 * 256 * 16;
@@ -911,7 +1011,7 @@ namespace binpack
 
         // Per File Lock
         std::vector<std::unique_ptr<std::timed_mutex>> m_fileMutexes;
-        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        SkipPredicates m_skipPredicates;
         nnue::UniquePositionCounter* m_counter = nullptr;
 
         // ---- Read balancing: sliding window + per-file claims ----
@@ -971,7 +1071,7 @@ namespace binpack
 
         thread_safe_types::ThreadLocalRegistry<LocalBuffer> m_bufferRegistry;
 
-        bool fetchNextChunkFromSharedQueue(ChunkReader& m_chunkReader, std::vector<unsigned char>& m_chunk)
+        bool fetchNextChunkFromSharedQueue(AnyChunkReader& m_chunkReader, FileChunk& m_chunk)
         {
             if (!m_chunkReader.hasNext(m_chunk))
             {
@@ -1000,7 +1100,7 @@ namespace binpack
 
                 if (success)
                 {
-                    m_chunkReader = ChunkReader{};
+                    m_chunkReader = AnyChunkReader{};
                     return false;
                 }
                 return true;

@@ -206,13 +206,13 @@ namespace training_data {
         static constexpr auto openmode = std::ios::in | std::ios::binary;
         static inline const std::string extension = "binpack";
 
-        BinpackSfenInputParallelStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1, DataloaderIOConfig io_config = {}, int num_consumer_threads = 4) :
-            m_stream(std::make_unique<binpack::CompressedTrainingDataEntryParallelReader>(concurrency, filenames, openmode, cyclic, skipPredicate, counter, rank, world_size, io_config, num_consumer_threads)),
+        // Reads .binpack and .fsqd files (mixed freely).
+        BinpackSfenInputParallelStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, binpack::SkipPredicates skipPredicates, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1, DataloaderIOConfig io_config = {}, int num_consumer_threads = 4) :
+            m_stream(std::make_unique<binpack::CompressedTrainingDataEntryParallelReader>(concurrency, filenames, openmode, cyclic, std::move(skipPredicates), counter, rank, world_size, io_config, num_consumer_threads)),
             m_filenames(filenames),
             m_eof(false),
             m_concurrency(concurrency),
-            m_cyclic(cyclic),
-            m_skipPredicate(skipPredicate)
+            m_cyclic(cyclic)
         {
         }
 
@@ -261,7 +261,6 @@ namespace training_data {
         std::atomic<bool> m_eof;
         int m_concurrency;
         bool m_cyclic;
-        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
     };
 
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, nnue::UniquePositionCounter* counter = nullptr)
@@ -274,13 +273,15 @@ namespace training_data {
         return nullptr;
     }
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1, DataloaderIOConfig io_config = {}, int num_consumer_threads = 4)
+    // .bin reads only the first file. .binpack and .fsqd files can be mixed.
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, binpack::SkipPredicates skipPredicates = nullptr, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1, DataloaderIOConfig io_config = {}, int num_consumer_threads = 4)
     {
         // TODO (low priority): optimize and parallelize .bin reading.
         if (has_extension(filenames[0], BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filenames[0], cyclic, std::move(skipPredicate), counter);
-        else if (has_extension(filenames[0], BinpackSfenInputParallelStream::extension))
-            return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), counter, rank, world_size, io_config, num_consumer_threads);
+            return std::make_unique<BinSfenInputStream>(filenames[0], cyclic, std::move(skipPredicates.binpack), counter);
+
+        else if (has_extension(filenames[0], BinpackSfenInputParallelStream::extension) || fsqd::has_extension(filenames[0]))
+            return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicates), counter, rank, world_size, io_config, num_consumer_threads);
 
         return nullptr;
     }

@@ -47,11 +47,12 @@ NNUE_API FenBatchStream* NNUE_CDECL create_fen_batch_stream(int                 
                                                             DataloaderHllConfig  hll_config,
                                                             DataloaderIOConfig   io_config) {
     (void) hll_config;
-    auto skipPredicate = make_skip_predicate(config);
-    auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
+    auto skipPredicates = make_skip_predicates(config);
+    auto filenames_vec  = std::vector<std::string>(filenames, filenames + num_files);
 
-    return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic, skipPredicate,
-                              ddp_config.rank, ddp_config.world_size, nullptr, io_config);
+    return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic,
+                              std::move(skipPredicates), ddp_config.rank, ddp_config.world_size,
+                              nullptr, io_config);
 }
 
 NNUE_API NNUE_COLD void NNUE_CDECL destroy_fen_batch_stream(FenBatchStream* stream) {
@@ -69,8 +70,8 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
                                                                   DataloaderDDPConfig  ddp_config,
                                                                   DataloaderHllConfig  hll_config,
                                                                   DataloaderIOConfig   io_config) {
-    auto skipPredicate = make_skip_predicate(config);
-    auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
+    auto skipPredicates = make_skip_predicates(config);
+    auto filenames_vec  = std::vector<std::string>(filenames, filenames + num_files);
 
     auto feature = get_feature(feature_set_c);
     auto ls_keys = get_layer_stack_keys(ls_keys_c);
@@ -81,9 +82,10 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char*   
       hll_config.initial_hll, hll_config.initial_hll_size, hll_config.initial_total,
       hll_config.initial_preskip);
 
-    auto stream = new FeaturedBatchStream(
-      std::move(feature), std::move(*ls_keys), concurrency, filenames_vec, batch_size, cyclic,
-      skipPredicate, ddp_config.rank, ddp_config.world_size, counter.release(), io_config);
+    auto stream =
+      new FeaturedBatchStream(std::move(feature), std::move(*ls_keys), concurrency, filenames_vec,
+                              batch_size, cyclic, std::move(skipPredicates), ddp_config.rank,
+                              ddp_config.world_size, counter.release(), io_config);
     return reinterpret_cast<SparseBatchStream*>(stream);
 }
 

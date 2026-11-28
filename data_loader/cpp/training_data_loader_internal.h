@@ -49,6 +49,11 @@ std::optional<LayerStackKeys> get_layer_stack_keys(std::string_view names);
 std::function<bool(const struct binpack::TrainingDataEntry&)>
 make_skip_predicate(DataloaderSkipConfig config);
 
+// Binpack entries get make_skip_predicate. FSQD files hold positions that
+// already passed it with random FEN skipping off (tools/fsqd-filter), so their
+// entries only get random FEN skipping.
+binpack::SkipPredicates make_skip_predicates(DataloaderSkipConfig config);
+
 // Keep large batch buffers resident between batches. Returning ~300 MiB to
 // the system allocator on every batch can stall the Python prefetch thread.
 // Each stream owns a bounded cache; outstanding batches share its lifetime.
@@ -122,19 +127,19 @@ template<typename StorageT>
 struct Stream: AnyStream {
     using StorageType = StorageT;
 
-    Stream(int                                                           concurrency,
-           const std::vector<std::string>&                               filenames,
-           bool                                                          cyclic,
-           std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
-           nnue::UniquePositionCounter*                                  counter    = nullptr,
-           int                                                           rank       = 0,
-           int                                                           world_size = 1,
-           DataloaderIOConfig                                            io_config  = {},
-           int                                                           num_consumer_threads = 4) :
+    Stream(int                             concurrency,
+           const std::vector<std::string>& filenames,
+           bool                            cyclic,
+           binpack::SkipPredicates         skipPredicates,
+           nnue::UniquePositionCounter*    counter              = nullptr,
+           int                             rank                 = 0,
+           int                             world_size           = 1,
+           DataloaderIOConfig              io_config            = {},
+           int                             num_consumer_threads = 4) :
         m_stream(training_data::open_sfen_input_file_parallel(concurrency,
                                                               filenames,
                                                               cyclic,
-                                                              skipPredicate,
+                                                              std::move(skipPredicates),
                                                               counter,
                                                               rank,
                                                               world_size,
@@ -171,17 +176,17 @@ struct FeaturedBatchStream final: Stream<SparseBatch> {
         return 0.5 - 0.25 * t;
     }
 
-    FeaturedBatchStream(std::shared_ptr<IFeatureExtractor>                            feature_set,
-                        LayerStackKeys                                                ls_keys,
-                        int                                                           concurrency,
-                        const std::vector<std::string>&                               filenames,
-                        int                                                           batch_size,
-                        bool                                                          cyclic,
-                        std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
-                        int                                                           rank = 0,
-                        int                          world_size                            = 1,
-                        nnue::UniquePositionCounter* counter         = nullptr,
-                        DataloaderIOConfig           io_config       = {});
+    FeaturedBatchStream(std::shared_ptr<IFeatureExtractor> feature_set,
+                        LayerStackKeys                     ls_keys,
+                        int                                concurrency,
+                        const std::vector<std::string>&    filenames,
+                        int                                batch_size,
+                        bool                               cyclic,
+                        binpack::SkipPredicates            skipPredicates,
+                        int                                rank       = 0,
+                        int                                world_size = 1,
+                        nnue::UniquePositionCounter*       counter    = nullptr,
+                        DataloaderIOConfig                 io_config  = {});
     ~FeaturedBatchStream() final;
 
     SparseBatch* next() override;
@@ -233,15 +238,15 @@ struct FenBatchStream final: Stream<FenBatch> {
     using BaseType                              = Stream<FenBatch>;
     static constexpr double worker_thread_ratio = 0.5;
 
-    FenBatchStream(int                                                           concurrency,
-                   const std::vector<std::string>&                               filenames,
-                   int                                                           batch_size,
-                   bool                                                          cyclic,
-                   std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
-                   int                                                           rank       = 0,
-                   int                                                           world_size = 1,
-                   nnue::UniquePositionCounter*                                  counter = nullptr,
-                   DataloaderIOConfig                                            io_config = {});
+    FenBatchStream(int                             concurrency,
+                   const std::vector<std::string>& filenames,
+                   int                             batch_size,
+                   bool                            cyclic,
+                   binpack::SkipPredicates         skipPredicates,
+                   int                             rank       = 0,
+                   int                             world_size = 1,
+                   nnue::UniquePositionCounter*    counter    = nullptr,
+                   DataloaderIOConfig              io_config  = {});
     ~FenBatchStream() final;
 
     FenBatch* next() override;

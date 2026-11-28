@@ -678,22 +678,21 @@ int FeaturedBatchStream::calculate_num_worker_threads(int concurrency, int batch
     return std::max(1, static_cast<int>(std::floor(concurrency * ratio)));
 }
 
-FeaturedBatchStream::FeaturedBatchStream(
-  std::shared_ptr<IFeatureExtractor>            feature_set,
-  LayerStackKeys                                ls_keys,
-  int                                           concurrency,
-  const std::vector<std::string>&               filenames,
-  int                                           batch_size,
-  bool                                          cyclic,
-  std::function<bool(const TrainingDataEntry&)> skipPredicate,
-  int                                           rank,
-  int                                           world_size,
-  nnue::UniquePositionCounter*                  counter,
-  DataloaderIOConfig                            io_config) :
+FeaturedBatchStream::FeaturedBatchStream(std::shared_ptr<IFeatureExtractor> feature_set,
+                                         LayerStackKeys                     ls_keys,
+                                         int                                concurrency,
+                                         const std::vector<std::string>&    filenames,
+                                         int                                batch_size,
+                                         bool                               cyclic,
+                                         binpack::SkipPredicates            skipPredicates,
+                                         int                                rank,
+                                         int                                world_size,
+                                         nnue::UniquePositionCounter*       counter,
+                                         DataloaderIOConfig                 io_config) :
     BaseType(calculate_num_reader_threads(concurrency, batch_size),
              filenames,
              cyclic,
-             skipPredicate,
+             std::move(skipPredicates),
              counter,
              rank,
              world_size,
@@ -821,19 +820,19 @@ int FenBatchStream::calculate_num_worker_threads(int concurrency) {
     return std::max(1, static_cast<int>(std::floor(concurrency * worker_thread_ratio)));
 }
 
-FenBatchStream::FenBatchStream(int                                           concurrency,
-                               const std::vector<std::string>&               filenames,
-                               int                                           batch_size,
-                               bool                                          cyclic,
-                               std::function<bool(const TrainingDataEntry&)> skipPredicate,
-                               int                                           rank,
-                               int                                           world_size,
-                               nnue::UniquePositionCounter*                  counter,
-                               DataloaderIOConfig                            io_config) :
+FenBatchStream::FenBatchStream(int                             concurrency,
+                               const std::vector<std::string>& filenames,
+                               int                             batch_size,
+                               bool                            cyclic,
+                               binpack::SkipPredicates         skipPredicates,
+                               int                             rank,
+                               int                             world_size,
+                               nnue::UniquePositionCounter*    counter,
+                               DataloaderIOConfig              io_config) :
     BaseType(calculate_num_reader_threads(concurrency),
              filenames,
              cyclic,
-             skipPredicate,
+             std::move(skipPredicates),
              counter,
              rank,
              world_size,
@@ -1177,4 +1176,18 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(DataloaderSkip
 
         return false;
     };
+}
+
+binpack::SkipPredicates make_skip_predicates(DataloaderSkipConfig config) {
+    std::function<bool(const TrainingDataEntry&)> prefiltered;
+    if (config.random_fen_skipping > 0)
+    {
+        const double skip_prob =
+          double(config.random_fen_skipping) / (config.random_fen_skipping + 1);
+        const auto threshold = static_cast<uint64_t>(skip_prob * static_cast<double>(~0ULL));
+        prefiltered          = [threshold](const TrainingDataEntry&) {
+            return rng::get_thread_local_rng()() < threshold;
+        };
+    }
+    return {make_skip_predicate(config), std::move(prefiltered)};
 }
