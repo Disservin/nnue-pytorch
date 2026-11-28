@@ -1,0 +1,22 @@
+[package]
+name = "four-square"
+version = "0.1.0"
+edition = "2021"
+description = "FSQD: an indexed, entropy-coded container for independent chess training positions"
+license = "GPL-3.0"
+
+[lib]
+name = "four_square"
+path = "src/lib.rs"
+
+[dependencies]
+sfbinpack = "0.6.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"
